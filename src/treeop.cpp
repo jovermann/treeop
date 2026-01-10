@@ -17,6 +17,8 @@
 #include <stdexcept>
 #include <utility>
 #include <vector>
+#include <unordered_map>
+#include <bit>
 #include <span>
 #include <list>
 #include <map>
@@ -356,6 +358,265 @@ public:
         }
     }
 
+    void printIntersectStats(const fs::path& rootA, const fs::path& rootB, bool listA, bool listB, bool listBoth) const
+    {
+        struct ContentKey
+        {
+            uint64_t size;
+            uint64_t hashLo;
+            uint64_t hashHi;
+            bool operator<(const ContentKey& other) const
+            {
+                if (size != other.size)
+                {
+                    return size < other.size;
+                }
+                if (hashLo != other.hashLo)
+                {
+                    return hashLo < other.hashLo;
+                }
+                return hashHi < other.hashHi;
+            }
+        };
+
+        struct FileRef
+        {
+            std::string path;
+            uint64_t size{};
+            uint64_t hashLo{};
+            uint64_t hashHi{};
+        };
+
+        std::map<ContentKey, std::vector<FileRef>> filesA;
+        std::map<ContentKey, std::vector<FileRef>> filesB;
+
+        for (const auto& dir : dirs)
+        {
+            if (isPathWithin(rootA, dir.path))
+            {
+                for (const auto& file : dir.files)
+                {
+                    ContentKey key{file.size, file.hashLo, file.hashHi};
+                    filesA[key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hashLo, file.hashHi});
+                }
+            }
+            if (isPathWithin(rootB, dir.path))
+            {
+                for (const auto& file : dir.files)
+                {
+                    ContentKey key{file.size, file.hashLo, file.hashHi};
+                    filesB[key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hashLo, file.hashHi});
+                }
+            }
+        }
+
+        struct BucketStats
+        {
+            uint64_t files{};
+            uint64_t bytes{};
+        };
+        BucketStats onlyA;
+        BucketStats bothA;
+        BucketStats bothB;
+        BucketStats onlyB;
+
+        for (const auto& [key, listARefs] : filesA)
+        {
+            uint64_t countA = listARefs.size();
+            uint64_t countB = 0;
+            auto itB = filesB.find(key);
+            if (itB != filesB.end())
+            {
+                countB = itB->second.size();
+            }
+            if (countB > 0)
+            {
+                bothA.files += countA;
+                bothA.bytes += countA * key.size;
+            }
+            else if (countA > 0)
+            {
+                onlyA.files += countA;
+                onlyA.bytes += countA * key.size;
+            }
+        }
+
+        for (const auto& [key, listBRefs] : filesB)
+        {
+            uint64_t countB = listBRefs.size();
+            uint64_t countA = 0;
+            auto itA = filesA.find(key);
+            if (itA != filesA.end())
+            {
+                countA = itA->second.size();
+            }
+            if (countA > 0)
+            {
+                bothB.files += countB;
+                bothB.bytes += countB * key.size;
+            }
+            else if (countB > 0)
+            {
+                onlyB.files += countB;
+                onlyB.bytes += countB * key.size;
+            }
+        }
+
+        std::string onlyAFilesStr = formatCountInt(onlyA.files);
+        std::string onlyASizeStr = formatSizeFixed(onlyA.bytes);
+        std::string bothAFilesStr = formatCountInt(bothA.files);
+        std::string bothASizeStr = formatSizeFixed(bothA.bytes);
+        std::string bothBFilesStr = formatCountInt(bothB.files);
+        std::string bothBSizeStr = formatSizeFixed(bothB.bytes);
+        std::string onlyBFilesStr = formatCountInt(onlyB.files);
+        std::string onlyBSizeStr = formatSizeFixed(onlyB.bytes);
+
+        std::vector<std::pair<std::string, std::string>> stats = {
+            {"only-A-files:", onlyAFilesStr},
+            {"only-A-size:", onlyASizeStr},
+            {"both-A-files:", bothAFilesStr},
+            {"both-A-size:", bothASizeStr},
+            {"both-B-files:", bothBFilesStr},
+            {"both-B-size:", bothBSizeStr},
+            {"only-B-files:", onlyBFilesStr},
+            {"only-B-size:", onlyBSizeStr}
+        };
+        size_t labelWidth = getLabelWidth(stats);
+        size_t decimalCol = getAlignedDecimalColumn(stats, labelWidth);
+
+        std::cout << "A: " << rootA.string() << "\n"
+                  << "B: " << rootB.string() << "\n"
+                  << formatAlignedStatLine("only-A-files:", onlyAFilesStr, labelWidth, decimalCol) << "\n"
+                  << formatAlignedStatLine("only-A-size:", onlyASizeStr, labelWidth, decimalCol) << "\n"
+                  << formatAlignedStatLine("both-A-files:", bothAFilesStr, labelWidth, decimalCol) << "\n"
+                  << formatAlignedStatLine("both-A-size:", bothASizeStr, labelWidth, decimalCol) << "\n"
+                  << formatAlignedStatLine("both-B-files:", bothBFilesStr, labelWidth, decimalCol) << "\n"
+                  << formatAlignedStatLine("both-B-size:", bothBSizeStr, labelWidth, decimalCol) << "\n"
+                  << formatAlignedStatLine("only-B-files:", onlyBFilesStr, labelWidth, decimalCol) << "\n"
+                  << formatAlignedStatLine("only-B-size:", onlyBSizeStr, labelWidth, decimalCol) << "\n";
+
+        if (listA)
+        {
+            std::cout << "only-in-A:\n";
+            for (const auto& [key, listARefs] : filesA)
+            {
+                if (filesB.find(key) != filesB.end())
+                {
+                    continue;
+                }
+                for (const auto& ref : listARefs)
+                {
+                    std::cout << ref.path << "\n";
+                }
+            }
+        }
+
+        if (listB)
+        {
+            std::cout << "only-in-B:\n";
+            for (const auto& [key, listBRefs] : filesB)
+            {
+                if (filesA.find(key) != filesA.end())
+                {
+                    continue;
+                }
+                for (const auto& ref : listBRefs)
+                {
+                    std::cout << ref.path << "\n";
+                }
+            }
+        }
+
+        if (listBoth)
+        {
+            std::cout << "in-both-A:\n";
+            for (const auto& [key, listARefs] : filesA)
+            {
+                auto itB = filesB.find(key);
+                if (itB == filesB.end())
+                {
+                    continue;
+                }
+                for (const auto& ref : listARefs)
+                {
+                    std::cout << ref.path << "\n";
+                }
+            }
+            std::cout << "in-both-B:\n";
+            for (const auto& [key, listBRefs] : filesB)
+            {
+                if (filesA.find(key) == filesA.end())
+                {
+                    continue;
+                }
+                for (const auto& ref : listBRefs)
+                {
+                    std::cout << ref.path << "\n";
+                }
+            }
+        }
+    }
+
+    void printUniqueHashLen() const
+    {
+        struct Hash128
+        {
+            uint64_t hi;
+            uint64_t lo;
+            bool operator<(const Hash128& other) const
+            {
+                if (hi != other.hi)
+                {
+                    return hi < other.hi;
+                }
+                return lo < other.lo;
+            }
+            bool operator==(const Hash128& other) const
+            {
+                return hi == other.hi && lo == other.lo;
+            }
+        };
+
+        std::vector<Hash128> hashes;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                hashes.push_back(Hash128{file.hashHi, file.hashLo});
+            }
+        }
+
+        std::sort(hashes.begin(), hashes.end());
+        hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+        size_t minBits = 0;
+        if (hashes.size() > 1)
+        {
+            // After sorting, the longest common prefix between any two distinct hashes
+            // must occur between neighboring entries, so only adjacent pairs are needed.
+            size_t maxCommonPrefix = 0;
+            for (size_t i = 1; i < hashes.size(); i++)
+            {
+                uint64_t hiXor = hashes[i].hi ^ hashes[i - 1].hi;
+                size_t common = 0;
+                if (hiXor == 0)
+                {
+                    uint64_t loXor = hashes[i].lo ^ hashes[i - 1].lo;
+                    common = 64 + std::countl_zero(loXor);
+                }
+                else
+                {
+                    common = std::countl_zero(hiXor);
+                }
+                if (common > maxCommonPrefix)
+                {
+                    maxCommonPrefix = common;
+                }
+            }
+            minBits = std::min<size_t>(128, maxCommonPrefix + 1);
+        }
+        std::cout << "unique-hash-len: " << minBits << "\n";
+    }
+
 private:
     static bool isPathWithin(const fs::path& root, const fs::path& path)
     {
@@ -387,13 +648,22 @@ private:
         }
         double value = static_cast<double>(bytes);
         size_t unitIndex = 0;
-        while (value >= 1024.0 && unitIndex + 1 < std::size(units))
+        uint64_t whole = bytes;
+        while (whole >= 1024 && unitIndex + 1 < std::size(units))
         {
+            whole >>= 10;
             value /= 1024.0;
             unitIndex++;
         }
         std::ostringstream os;
-        os << std::fixed << std::setprecision(3) << value << " " << units[unitIndex];
+        if (unitIndex == 0)
+        {
+            os << bytes << " " << units[unitIndex];
+        }
+        else
+        {
+            os << std::fixed << std::setprecision(3) << value << " " << units[unitIndex];
+        }
         return os.str();
     }
 
@@ -899,7 +1169,33 @@ static DirDbData readDirDb(const fs::path& dirPath)
     return dirData;
 }
 
-static DirDbData createDirDb(const fs::path& dirPath)
+struct HashReuseKey
+{
+    uint64_t inode{};
+    uint64_t size{};
+    uint64_t date{};
+
+    bool operator==(const HashReuseKey& other) const
+    {
+        return inode == other.inode && size == other.size && date == other.date;
+    }
+};
+
+struct HashReuseKeyHasher
+{
+    size_t operator()(const HashReuseKey& key) const
+    {
+        size_t h1 = std::hash<uint64_t>{}(key.inode);
+        size_t h2 = std::hash<uint64_t>{}(key.size);
+        size_t h3 = std::hash<uint64_t>{}(key.date);
+        size_t h = h1;
+        h ^= h2 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        h ^= h3 + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<HashReuseKey, DirDbFileEntry, HashReuseKeyHasher>* cache)
 {
     if (clVerbose > 0)
     {
@@ -934,15 +1230,36 @@ static DirDbData createDirDb(const fs::path& dirPath)
             continue;
         }
         uint64_t size = entry.file_size();
-        auto hashPair = hashFile128(entry.path());
         ut1::StatInfo statInfo = ut1::getStat(entry, false);
+        uint64_t date = fileTimeFromTimespec(statInfo.getMTimeSpec());
+        uint64_t hashLo = 0;
+        uint64_t hashHi = 0;
+        bool reusedHash = false;
+        if (cache)
+        {
+            HashReuseKey key{static_cast<uint64_t>(statInfo.getIno()), size, date};
+            auto it = cache->find(key);
+            if (it != cache->end())
+            {
+                const auto& cached = it->second;
+                hashLo = cached.hashLo;
+                hashHi = cached.hashHi;
+                reusedHash = true;
+            }
+        }
+        if (!reusedHash)
+        {
+            auto hashPair = hashFile128(entry.path());
+            hashLo = hashPair.first;
+            hashHi = hashPair.second;
+        }
         ScanEntry scan;
         scan.name = entry.path().filename().string();
         scan.size = size;
-        scan.hashLo = hashPair.first;
-        scan.hashHi = hashPair.second;
+        scan.hashLo = hashLo;
+        scan.hashHi = hashHi;
         scan.inodeNumber = static_cast<uint64_t>(statInfo.getIno());
-        scan.date = fileTimeFromTimespec(statInfo.getMTimeSpec());
+        scan.date = date;
         scan.numLinks = static_cast<uint64_t>(statInfo.statData.st_nlink);
         entries.push_back(std::move(scan));
     }
@@ -1046,9 +1363,34 @@ static DirDbData createDirDb(const fs::path& dirPath)
     return dirData;
 }
 
-static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate)
+static DirDbData createDirDb(const fs::path& dirPath)
+{
+    return buildDirDb(dirPath, nullptr);
+}
+
+static DirDbData updateDirDb(const fs::path& dirPath)
+{
+    DirDbData existing = readDirDb(dirPath);
+    std::unordered_map<HashReuseKey, DirDbFileEntry, HashReuseKeyHasher> cache;
+    for (const auto& entry : existing.files)
+    {
+        HashReuseKey key{entry.inodeNumber, entry.size, entry.date};
+        cache.emplace(std::move(key), entry);
+    }
+    return buildDirDb(dirPath, &cache);
+}
+
+static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update)
 {
     fs::path dbPath = dirPath / ".dirdb";
+    if (update)
+    {
+        if (ut1::fsExists(dbPath))
+        {
+            return updateDirDb(dirPath);
+        }
+        return createDirDb(dirPath);
+    }
     if (!forceCreate && ut1::fsExists(dbPath))
     {
         return readDirDb(dirPath);
@@ -1056,9 +1398,9 @@ static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate)
     return createDirDb(dirPath);
 }
 
-static void processDirTree(const fs::path& root, MainDb& db, bool forceCreate)
+static void processDirTree(const fs::path& root, MainDb& db, bool forceCreate, bool update)
 {
-    db.addDir(loadOrCreateDirDb(root, forceCreate));
+    db.addDir(loadOrCreateDirDb(root, forceCreate, update));
 
     std::error_code ec;
     fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
@@ -1080,7 +1422,7 @@ static void processDirTree(const fs::path& root, MainDb& db, bool forceCreate)
         }
         if (ut1::getFileType(*it, false) == ut1::FT_DIR)
         {
-            db.addDir(loadOrCreateDirDb(it->path(), forceCreate));
+            db.addDir(loadOrCreateDirDb(it->path(), forceCreate, update));
         }
         it.increment(ec);
     }
@@ -1145,12 +1487,18 @@ int main(int argc, char *argv[])
         "0.0.1");
 
     cl.addHeader("\nOptions:\n");
+    cl.addOption(' ', "intersect", "Determine the intersection of dir A and dir B. Exactly two dirs must be specified when this option is specified. Print statistics (bytes/files) for files contained only in A, in both A and B or only in B.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
-    cl.addOption('n', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
-    cl.addOption('r', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
-    cl.addOption('H', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
-    cl.addOption('M', "max-size", "Maximum file size to include in size histogram.", "N", "0");
+    cl.addOption(' ', "list-a", "List files only in A when used with --intersect.");
+    cl.addOption(' ', "list-b", "List files only in B when used with --intersect.");
+    cl.addOption(' ', "list-both", "List files in both A and B when used with --intersect.");
+    cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
+    cl.addOption('u', "update-dirdb", "Update .dirdb files, reusing hashes when name/size/mtime match.");
+    cl.addOption(' ', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
+    cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
+    cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
+    cl.addOption(' ', "max-size", "Maximum file size to include in size histogram.", "N", "0");
     cl.addOption('v', "verbose", "Increase verbosity. Specify multiple times to be more verbose.");
 
     // Parse command line options.
@@ -1158,7 +1506,7 @@ int main(int argc, char *argv[])
     clVerbose = cl.getCount("verbose");
 
     // Implicit options.
-    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb")))
+    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -1176,6 +1524,15 @@ int main(int argc, char *argv[])
             {
                 cl.error("Path '" + path + "' is not a directory.");
             }
+        }
+
+        if (cl("new-dirdb") && cl("update-dirdb"))
+        {
+            cl.error("Cannot combine --new-dirdb with --update-dirdb.");
+        }
+        if ((cl("list-a") || cl("list-b") || cl("list-both")) && !cl("intersect"))
+        {
+            cl.error("--list-a/--list-b/--list-both require --intersect.");
         }
 
         if (cl("remove-dirdb"))
@@ -1197,25 +1554,40 @@ int main(int argc, char *argv[])
             // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.
             for (size_t i = 0; i < cl.getArgs().size(); i++)
             {
-                processDirTree(normalizedRoots[i], mainDb, cl("new-dirdb"));
+                processDirTree(normalizedRoots[i], mainDb, cl("new-dirdb"), cl("update-dirdb"));
             }
 
-            if (cl("stats"))
+            if (cl("intersect"))
             {
-                mainDb.printStats();
+                if (normalizedRoots.size() != 2)
+                {
+                    cl.error("--intersect requires exactly two directories.");
+                }
+                mainDb.printIntersectStats(normalizedRoots[0], normalizedRoots[1], cl("list-a"), cl("list-b"), cl("list-both"));
             }
-
-            if (cl("size-histogram"))
+            else
             {
-                uint64_t batchSize = ut1::strToU64(cl.getStr("size-histogram"));
-                uint64_t maxSize = ut1::strToU64(cl.getStr("max-size"));
-                bool hasMaxSize = cl.getStr("max-size") != "0";
-                mainDb.printSizeHistogram(batchSize, maxSize, hasMaxSize);
-            }
+                if (cl("stats"))
+                {
+                    mainDb.printStats();
+                }
 
-            if (cl("list-files"))
-            {
-                mainDb.listFiles();
+                if (cl("size-histogram"))
+                {
+                    uint64_t batchSize = ut1::strToU64(cl.getStr("size-histogram"));
+                    uint64_t maxSize = ut1::strToU64(cl.getStr("max-size"));
+                    bool hasMaxSize = cl.getStr("max-size") != "0";
+                    mainDb.printSizeHistogram(batchSize, maxSize, hasMaxSize);
+                }
+
+                if (cl("list-files"))
+                {
+                    mainDb.listFiles();
+                }
+                if (cl("get-unique-hash-len"))
+                {
+                    mainDb.printUniqueHashLen();
+                }
             }
         }
 
