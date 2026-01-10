@@ -16,7 +16,7 @@ SOURCES = $(wildcard src/*.cpp)
 OBJECTS = $(SOURCES:%.cpp=$(BUILDDIR)/%.o)
 DEPENDS := $(SOURCES:%.cpp=$(BUILDDIR)/%.d)
 
-TARGET = hardshrink
+TARGET = treeop
 default: $(TARGET)
 
 $(TARGET): $(OBJECTS)

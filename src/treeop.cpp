@@ -11,10 +11,19 @@
 #include "HashSha3.hpp"
 #include <exception>
 #include <iomanip>
+#include <iostream>
+#include <ctime>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
 #include <vector>
 #include <span>
 #include <list>
 #include <map>
+#include <filesystem>
+#include <fstream>
+#include <algorithm>
+#include <cstdint>
 
 static unsigned clVerbose = 0;
 
@@ -22,6 +31,10 @@ using FileSize = uint64_t;
 using NumFiles = size_t;
 using DirIndex = size_t;
 using FileIndex = size_t;
+namespace fs = std::filesystem;
+
+static constexpr uint64_t kDirDbVersion = 1;
+static constexpr uint64_t kWindowsToUnixEpoch = 11644473600ULL; // seconds
 
 
 /// DirDB file format (.dirdb): There is one such file in each directory, representing all files in this directory (excluding the .dirdb file).
@@ -62,10 +75,1060 @@ using FileIndex = size_t;
 /// uint64_t date; // In FILETIME format, 100ns since January 1, 1601, UTC, unsigned (Range until around year 30828).
 /// uint64_t numLinks; // Number of hardlinks.
 
-
-void printStats()
+struct DirDbFileEntry
 {
+    std::string name;
+    FileSize size{};
+    uint64_t hashLo{};
+    uint64_t hashHi{};
+    uint64_t inodeNumber{};
+    uint64_t date{};
+    uint64_t numLinks{};
+};
 
+struct DirDbData
+{
+    fs::path path;
+    std::vector<DirDbFileEntry> files;
+    uint64_t dbSize{};
+};
+
+class MainDb
+{
+public:
+    explicit MainDb(std::vector<fs::path> rootDirs): roots(std::move(rootDirs)) {}
+
+    void addDir(DirDbData dir)
+    {
+        dirs.push_back(std::move(dir));
+    }
+
+    void printStats() const
+    {
+        for (const auto& root : roots)
+        {
+            size_t dirCount = 0;
+            NumFiles fileCount = 0;
+            FileSize totalSize = 0;
+            uint64_t totalDbSize = 0;
+            for (const auto& dir : dirs)
+            {
+                if (!isPathWithin(root, dir.path))
+                {
+                    continue;
+                }
+                dirCount++;
+                fileCount += dir.files.size();
+                for (const auto& file : dir.files)
+                {
+                    totalSize += file.size;
+                }
+                totalDbSize += dir.dbSize;
+            }
+
+            std::string fileCountStr = formatCountInt(fileCount);
+            std::string dirCountStr = formatCountInt(dirCount);
+            std::string totalSizeStr = formatSizeFixed(totalSize);
+            std::string dbSizeStr = formatSizeFixed(totalDbSize);
+            std::string percentStr = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * totalDbSize / totalSize));
+            std::vector<std::pair<std::string, std::string>> stats = {
+                {"files:", fileCountStr},
+                {"dirs:", dirCountStr},
+                {"total-size:", totalSizeStr},
+                {"dirdb-size:", dbSizeStr}
+            };
+            size_t labelWidth = getLabelWidth(stats);
+            size_t decimalCol = getAlignedDecimalColumn(stats, labelWidth);
+
+            std::cout << root.string() << "\n"
+                      << formatAlignedStatLine("files:", fileCountStr, labelWidth, decimalCol) << "\n"
+                      << formatAlignedStatLine("dirs:", dirCountStr, labelWidth, decimalCol) << "\n"
+                      << formatAlignedStatLine("total-size:", totalSizeStr, labelWidth, decimalCol) << "\n"
+                      << formatAlignedStatLine("dirdb-size:", dbSizeStr, labelWidth, decimalCol) << " (" << percentStr << ")\n";
+        }
+    }
+
+    void listFiles() const
+    {
+        struct Row
+        {
+            std::string size;
+            std::string hash;
+            std::string inode;
+            std::string date;
+            std::string numLinks;
+            std::string name;
+        };
+
+        std::vector<Row> rows;
+        size_t widthSize = 0;
+        size_t widthHash = 0;
+        size_t widthInode = 0;
+        size_t widthDate = 0;
+        size_t widthLinks = 0;
+        bool showInodeLinks = clVerbose > 0;
+
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                Row row;
+                row.size = ut1::toStr(file.size);
+                row.hash = formatHex(file.hashLo) + formatHex(file.hashHi);
+                row.inode = ut1::toStr(file.inodeNumber);
+                row.date = formatFileTime(file.date);
+                row.numLinks = ut1::toStr(file.numLinks);
+                row.name = (dir.path / file.name).string();
+
+                widthSize = std::max(widthSize, row.size.size());
+                widthHash = std::max(widthHash, row.hash.size());
+                if (showInodeLinks)
+                {
+                    widthInode = std::max(widthInode, row.inode.size());
+                    widthLinks = std::max(widthLinks, row.numLinks.size());
+                }
+                widthDate = std::max(widthDate, row.date.size());
+
+                rows.push_back(std::move(row));
+            }
+        }
+
+        for (const auto& row : rows)
+        {
+            std::cout << std::setw(static_cast<int>(widthSize)) << row.size << " "
+                      << std::setw(static_cast<int>(widthHash)) << row.hash << " ";
+            if (showInodeLinks)
+            {
+                std::cout << std::setw(static_cast<int>(widthInode)) << row.inode << " ";
+            }
+            std::cout << std::setw(static_cast<int>(widthDate)) << row.date << " ";
+            if (showInodeLinks)
+            {
+                std::cout << std::setw(static_cast<int>(widthLinks)) << row.numLinks << " ";
+            }
+            std::cout
+                      << row.name << "\n";
+        }
+    }
+
+    void printSizeHistogram(uint64_t batchSize, uint64_t maxSizeLimit, bool hasMaxSize) const
+    {
+        if (batchSize == 0)
+        {
+            throw std::runtime_error("size-histogram batch size must be greater than 0.");
+        }
+
+        struct Bucket
+        {
+            uint64_t count{};
+            uint64_t totalSize{};
+        };
+
+        std::map<uint64_t, Bucket> buckets;
+        uint64_t maxSize = 0;
+        bool hasFiles = false;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                if (hasMaxSize && file.size > maxSizeLimit)
+                {
+                    continue;
+                }
+                uint64_t start = (file.size / batchSize) * batchSize;
+                Bucket& bucket = buckets[start];
+                bucket.count++;
+                bucket.totalSize += file.size;
+                if (!hasFiles || file.size > maxSize)
+                {
+                    maxSize = file.size;
+                    hasFiles = true;
+                }
+            }
+        }
+
+        size_t widthStart = 0;
+        size_t widthEnd = 0;
+        size_t widthCount = 0;
+        size_t widthTotal = 0;
+        size_t totalDecimalPos = 0;
+        size_t totalSuffixWidth = 0;
+        std::vector<std::string> bucketTotalStrings;
+        std::vector<uint64_t> bucketTotals;
+        uint64_t maxBucketTotal = 0;
+        bool showEnd = clVerbose > 0;
+        size_t widthStartNum = 0;
+        size_t widthEndNum = 0;
+        HistogramUnit unit = getHistogramUnit(batchSize);
+
+        uint64_t maxStart = hasFiles ? (maxSize / batchSize) * batchSize : 0;
+        for (uint64_t start = 0; start <= maxStart; start += batchSize)
+        {
+            std::string startNum = ut1::toStr(start / unit.factor);
+            std::string endNum = ut1::toStr((start + batchSize) / unit.factor);
+            widthStartNum = std::max(widthStartNum, startNum.size());
+            if (showEnd)
+            {
+                widthEndNum = std::max(widthEndNum, endNum.size());
+            }
+        }
+
+        std::string unitSuffix = std::string(" ") + unit.label;
+        widthStart = widthStartNum + unitSuffix.size();
+        if (showEnd)
+        {
+            widthEnd = widthEndNum + unitSuffix.size();
+        }
+
+        for (uint64_t start = 0; start <= maxStart; start += batchSize)
+        {
+            const auto it = buckets.find(start);
+            const Bucket empty{};
+            const Bucket& bucket = (it == buckets.end()) ? empty : it->second;
+            widthCount = std::max(widthCount, ut1::toStr(bucket.count).size());
+            std::string totalStr = formatSizeFixed(bucket.totalSize);
+            auto [numberStr, suffixStr] = splitSizeStr(totalStr);
+            totalDecimalPos = std::max(totalDecimalPos, getDecimalPos(numberStr));
+            totalSuffixWidth = std::max(totalSuffixWidth, suffixStr.size());
+            bucketTotalStrings.push_back(std::move(totalStr));
+            bucketTotals.push_back(bucket.totalSize);
+            maxBucketTotal = std::max(maxBucketTotal, bucket.totalSize);
+        }
+
+        for (const auto& totalStr : bucketTotalStrings)
+        {
+            auto [numberStr, suffixStr] = splitSizeStr(totalStr);
+            size_t numberWidth = numberStr.size() + (totalDecimalPos > getDecimalPos(numberStr)
+                ? (totalDecimalPos - getDecimalPos(numberStr))
+                : 0);
+            size_t totalWidth = numberWidth + 1 + totalSuffixWidth;
+            widthTotal = std::max(widthTotal, totalWidth);
+        }
+
+        size_t rangeWidth = showEnd ? (widthStart + 2 + widthEnd + 1) : (widthStart + 1);
+        size_t baseWidth = rangeWidth + 1 + widthCount + 1 + widthTotal;
+        bool showBar = clVerbose > 1;
+        size_t barAvailable = (showBar && baseWidth + 1 < 79) ? (79 - baseWidth - 1) : 0;
+        size_t bucketIndex = 0;
+        for (uint64_t start = 0; start <= maxStart; start += batchSize)
+        {
+            const auto it = buckets.find(start);
+            const Bucket empty{};
+            const Bucket& bucket = (it == buckets.end()) ? empty : it->second;
+            std::string startStr = formatHistogramBoundary(start, unit, widthStartNum);
+            std::string totalStr = (bucketIndex < bucketTotalStrings.size())
+                ? bucketTotalStrings[bucketIndex]
+                : formatSizeFixed(bucket.totalSize);
+            totalStr = formatSizeAligned(totalStr, totalDecimalPos, totalSuffixWidth);
+            if (totalStr.size() < widthTotal)
+            {
+                totalStr = padRight(totalStr, widthTotal);
+            }
+            std::string rangeLabel;
+            if (showEnd)
+            {
+                std::string endStr = formatHistogramBoundary(start + batchSize, unit, widthEndNum);
+                rangeLabel = padRight(startStr, widthStart) + ".." + padRight(endStr, widthEnd) + ":";
+            }
+            else
+            {
+                rangeLabel = padRight(startStr, widthStart) + ":";
+            }
+            std::cout << padRight(rangeLabel, rangeWidth) << " "
+                      << std::setw(static_cast<int>(widthCount)) << bucket.count << " "
+                      << totalStr;
+            if (showBar && barAvailable > 0)
+            {
+                uint64_t total = (bucketIndex < bucketTotals.size()) ? bucketTotals[bucketIndex] : bucket.totalSize;
+                size_t barLen = 0;
+                if (maxBucketTotal > 0)
+                {
+                    barLen = static_cast<size_t>((total * barAvailable) / maxBucketTotal);
+                    if (total > 0 && barLen == 0)
+                    {
+                        barLen = 1;
+                    }
+                }
+                std::cout << " " << std::string(barLen, '#');
+            }
+            std::cout << "\n";
+            bucketIndex++;
+        }
+    }
+
+private:
+    static bool isPathWithin(const fs::path& root, const fs::path& path)
+    {
+        auto rootIt = root.begin();
+        auto pathIt = path.begin();
+        for (; rootIt != root.end() && pathIt != path.end(); ++rootIt, ++pathIt)
+        {
+            if (*rootIt != *pathIt)
+            {
+                return false;
+            }
+        }
+        return rootIt == root.end();
+    }
+
+    static std::string formatHex(uint64_t value)
+    {
+        std::ostringstream os;
+        os << std::hex << std::setw(16) << std::setfill('0') << value;
+        return os.str();
+    }
+
+    static std::string formatSizeFixed(uint64_t bytes)
+    {
+        static constexpr const char* units[] = {"B", "kB", "MB", "GB", "TB", "PB", "EB"};
+        if (bytes == 0)
+        {
+            return "0";
+        }
+        double value = static_cast<double>(bytes);
+        size_t unitIndex = 0;
+        while (value >= 1024.0 && unitIndex + 1 < std::size(units))
+        {
+            value /= 1024.0;
+            unitIndex++;
+        }
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(3) << value << " " << units[unitIndex];
+        return os.str();
+    }
+
+    static std::string formatPercentFixed(double percent)
+    {
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(3) << percent << " %";
+        return os.str();
+    }
+
+    static std::string formatCountInt(uint64_t count)
+    {
+        return ut1::toStr(count);
+    }
+
+    static size_t getDecimalPos(const std::string& value)
+    {
+        size_t pos = value.find('.');
+        if (pos == std::string::npos)
+        {
+            return value.size();
+        }
+        return pos;
+    }
+
+    static size_t getLabelWidth(const std::vector<std::pair<std::string, std::string>>& labeledValues)
+    {
+        size_t width = 0;
+        for (const auto& [label, value] : labeledValues)
+        {
+            width = std::max(width, label.size());
+        }
+        return width;
+    }
+
+    static size_t getAlignedDecimalColumn(const std::vector<std::pair<std::string, std::string>>& labeledValues, size_t labelWidth)
+    {
+        size_t maxCol = 0;
+        for (const auto& [label, value] : labeledValues)
+        {
+            size_t decimalPos = getDecimalPos(value);
+            size_t col = labelWidth + 1 + decimalPos;
+            if (col > maxCol)
+            {
+                maxCol = col;
+            }
+        }
+        return maxCol;
+    }
+
+    static std::string formatAlignedStatLine(const std::string& label, const std::string& value, size_t labelWidth, size_t decimalCol)
+    {
+        size_t decimalPos = getDecimalPos(value);
+        size_t currentCol = labelWidth + 1 + decimalPos;
+        size_t padding = (decimalCol > currentCol) ? (decimalCol - currentCol) : 0;
+        return label + std::string(labelWidth - label.size(), ' ') + " " + std::string(padding, ' ') + value;
+    }
+
+    static std::string padRight(const std::string& value, size_t width)
+    {
+        if (value.size() >= width)
+        {
+            return value;
+        }
+        return value + std::string(width - value.size(), ' ');
+    }
+
+    static std::string padLeft(const std::string& value, size_t width)
+    {
+        if (value.size() >= width)
+        {
+            return value;
+        }
+        return std::string(width - value.size(), ' ') + value;
+    }
+
+    static std::string alignDecimalTo(const std::string& value, size_t decimalPos)
+    {
+        size_t pos = getDecimalPos(value);
+        if (pos >= decimalPos)
+        {
+            return value;
+        }
+        return std::string(decimalPos - pos, ' ') + value;
+    }
+
+    static std::pair<std::string, std::string> splitSizeStr(const std::string& value)
+    {
+        size_t sep = value.rfind(' ');
+        if (sep == std::string::npos)
+        {
+            return {value, std::string()};
+        }
+        return {value.substr(0, sep), value.substr(sep + 1)};
+    }
+
+    static std::string formatSizeAligned(const std::string& value, size_t decimalPos, size_t suffixWidth)
+    {
+        auto [numberStr, suffixStr] = splitSizeStr(value);
+        numberStr = alignDecimalTo(numberStr, decimalPos);
+        suffixStr = padRight(suffixStr, suffixWidth);
+        if (suffixWidth == 0)
+        {
+            return numberStr;
+        }
+        return numberStr + " " + suffixStr;
+    }
+
+    struct HistogramUnit
+    {
+        uint64_t factor;
+        const char* label;
+    };
+
+    static HistogramUnit getHistogramUnit(uint64_t batchSize)
+    {
+        static constexpr HistogramUnit units[] = {
+            {1ULL, "bytes"},
+            {1024ULL, "kB"},
+            {1024ULL * 1024ULL, "MB"},
+            {1024ULL * 1024ULL * 1024ULL, "GB"},
+            {1024ULL * 1024ULL * 1024ULL * 1024ULL, "TB"},
+            {1024ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL, "PB"},
+            {1024ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL, "EB"}
+        };
+        size_t index = 0;
+        uint64_t size = batchSize;
+        while (size >= 1024 && index + 1 < std::size(units))
+        {
+            size >>= 10;
+            index++;
+        }
+        return units[index];
+    }
+
+    static std::string formatHistogramBoundary(uint64_t value, const HistogramUnit& unit, size_t numberWidth)
+    {
+        std::string number = ut1::toStr(value / unit.factor);
+        return padLeft(number, numberWidth) + " " + unit.label;
+    }
+
+    static std::string formatFileTime(uint64_t fileTime)
+    {
+        if (fileTime == 0)
+        {
+            return "0000-00-00 00:00:00";
+        }
+        uint64_t seconds = fileTime / 10000000ULL;
+        if (seconds < kWindowsToUnixEpoch)
+        {
+            return "0000-00-00 00:00:00";
+        }
+        time_t unixSeconds = static_cast<time_t>(seconds - kWindowsToUnixEpoch);
+        std::tm tm{};
+#ifdef _WIN32
+        gmtime_s(&tm, &unixSeconds);
+#else
+        gmtime_r(&unixSeconds, &tm);
+#endif
+        std::ostringstream os;
+        os << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+        return os.str();
+    }
+
+    std::vector<fs::path> roots;
+    std::vector<DirDbData> dirs;
+};
+
+static fs::path normalizePath(const fs::path& path)
+{
+    std::error_code ec;
+    fs::path abs = fs::absolute(path, ec);
+    if (ec)
+    {
+        fs::path normalized = path.lexically_normal();
+        if (normalized.has_filename() == false && normalized != normalized.root_path())
+        {
+            normalized = normalized.parent_path();
+        }
+        return normalized;
+    }
+    fs::path normalized = abs.lexically_normal();
+    if (normalized.has_filename() == false && normalized != normalized.root_path())
+    {
+        normalized = normalized.parent_path();
+    }
+    return normalized;
+}
+
+static uint64_t makeTag(const char* tag)
+{
+    uint64_t value = 0;
+    for (size_t i = 0; i < 8 && tag[i]; i++)
+    {
+        value |= (static_cast<uint64_t>(static_cast<unsigned char>(tag[i])) << (8 * i));
+    }
+    return value;
+}
+
+static void appendU64Le(std::vector<uint8_t>& out, uint64_t value)
+{
+    for (size_t i = 0; i < 8; i++)
+    {
+        out.push_back(static_cast<uint8_t>(value & 0xff));
+        value >>= 8;
+    }
+}
+
+static uint64_t readU64Le(const uint8_t* data, size_t size, size_t& offset, const char* what)
+{
+    if (offset + 8 > size)
+    {
+        throw std::runtime_error(std::string("Unexpected end of .dirdb while reading ") + what);
+    }
+    uint64_t value = 0;
+    for (size_t i = 0; i < 8; i++)
+    {
+        value |= (static_cast<uint64_t>(data[offset + i]) << (8 * i));
+    }
+    offset += 8;
+    return value;
+}
+
+static void appendLengthString(std::vector<uint8_t>& out, const std::string& s)
+{
+    size_t len = s.size();
+    if (len <= 0xfc)
+    {
+        out.push_back(static_cast<uint8_t>(len));
+    }
+    else if (len <= 0xffff)
+    {
+        out.push_back(0xff);
+        out.push_back(static_cast<uint8_t>(len & 0xff));
+        out.push_back(static_cast<uint8_t>((len >> 8) & 0xff));
+    }
+    else if (len <= 0xffffffffULL)
+    {
+        out.push_back(0xfe);
+        for (size_t i = 0; i < 4; i++)
+        {
+            out.push_back(static_cast<uint8_t>((len >> (8 * i)) & 0xff));
+        }
+    }
+    else
+    {
+        out.push_back(0xfd);
+        for (size_t i = 0; i < 8; i++)
+        {
+            out.push_back(static_cast<uint8_t>((len >> (8 * i)) & 0xff));
+        }
+    }
+    out.insert(out.end(), s.begin(), s.end());
+}
+
+static std::string readLengthStringAt(const std::vector<uint8_t>& data, size_t offset)
+{
+    if (offset >= data.size())
+    {
+        throw std::runtime_error("Invalid string offset in .dirdb");
+    }
+    size_t pos = offset;
+    uint8_t prefix = data[pos++];
+    uint64_t len = 0;
+    if (prefix <= 0xfc)
+    {
+        len = prefix;
+    }
+    else if (prefix == 0xff)
+    {
+        if (pos + 2 > data.size())
+        {
+            throw std::runtime_error("Invalid 2-byte length in .dirdb");
+        }
+        len = data[pos] | (static_cast<uint64_t>(data[pos + 1]) << 8);
+        pos += 2;
+    }
+    else if (prefix == 0xfe)
+    {
+        if (pos + 4 > data.size())
+        {
+            throw std::runtime_error("Invalid 4-byte length in .dirdb");
+        }
+        len = 0;
+        for (size_t i = 0; i < 4; i++)
+        {
+            len |= (static_cast<uint64_t>(data[pos + i]) << (8 * i));
+        }
+        pos += 4;
+    }
+    else if (prefix == 0xfd)
+    {
+        if (pos + 8 > data.size())
+        {
+            throw std::runtime_error("Invalid 8-byte length in .dirdb");
+        }
+        len = 0;
+        for (size_t i = 0; i < 8; i++)
+        {
+            len |= (static_cast<uint64_t>(data[pos + i]) << (8 * i));
+        }
+        pos += 8;
+    }
+    else
+    {
+        throw std::runtime_error("Invalid string length prefix in .dirdb");
+    }
+
+    if (pos + len > data.size())
+    {
+        throw std::runtime_error("Invalid string length in .dirdb");
+    }
+    return std::string(reinterpret_cast<const char*>(data.data() + pos), static_cast<size_t>(len));
+}
+
+static uint64_t fileTimeFromTimespec(const timespec& ts)
+{
+    if (ts.tv_sec < 0)
+    {
+        return 0;
+    }
+    uint64_t sec = static_cast<uint64_t>(ts.tv_sec);
+    uint64_t ft = (sec + kWindowsToUnixEpoch) * 10000000ULL;
+    ft += static_cast<uint64_t>(ts.tv_nsec) / 100ULL;
+    return ft;
+}
+
+static std::pair<uint64_t, uint64_t> hashFile128(const fs::path& path)
+{
+    HashSha3_128 hasher;
+    std::ifstream is(path, std::ios::binary);
+    if (!is)
+    {
+        throw std::runtime_error("Error while opening file for hashing: " + path.string());
+    }
+    std::vector<uint8_t> buffer(1024 * 1024);
+    while (is)
+    {
+        is.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+        std::streamsize count = is.gcount();
+        if (count > 0)
+        {
+            hasher.update(buffer.data(), static_cast<size_t>(count));
+        }
+    }
+    std::vector<uint8_t> digest = hasher.finalize();
+    if (digest.size() < 16)
+    {
+        throw std::runtime_error("Unexpected hash size while hashing: " + path.string());
+    }
+    uint64_t lo = 0;
+    uint64_t hi = 0;
+    for (size_t i = 0; i < 8; i++)
+    {
+        lo |= (static_cast<uint64_t>(digest[i]) << (8 * i));
+        hi |= (static_cast<uint64_t>(digest[8 + i]) << (8 * i));
+    }
+    return {lo, hi};
+}
+
+static DirDbData readDirDb(const fs::path& dirPath)
+{
+    fs::path dbPath = dirPath / ".dirdb";
+    std::string raw = ut1::readFile(dbPath.string());
+    const uint8_t* data = reinterpret_cast<const uint8_t*>(raw.data());
+    size_t size = raw.size();
+    size_t pos = 0;
+
+    uint64_t tag = readU64Le(data, size, pos, "DirDB tag");
+    if (tag != makeTag("DirDB"))
+    {
+        throw std::runtime_error("Invalid .dirdb tag in " + dbPath.string());
+    }
+    uint64_t version = readU64Le(data, size, pos, "version");
+    if (version != kDirDbVersion)
+    {
+        throw std::runtime_error("Unsupported .dirdb version in " + dbPath.string());
+    }
+
+    tag = readU64Le(data, size, pos, "TOC tag");
+    if (tag != makeTag("TOC"))
+    {
+        throw std::runtime_error("Missing TOC tag in " + dbPath.string());
+    }
+    uint64_t tocCount = readU64Le(data, size, pos, "TOC count");
+    uint64_t tocEntrySize = readU64Le(data, size, pos, "TOC entry size");
+    if (tocEntrySize < 16)
+    {
+        throw std::runtime_error("Unsupported TOC entry size in " + dbPath.string());
+    }
+    struct TocEntry { uint64_t size; uint64_t fileIndex; };
+    std::vector<TocEntry> tocEntries;
+    for (uint64_t i = 0; i < tocCount; i++)
+    {
+        size_t entryStart = pos;
+        TocEntry entry{};
+        entry.size = readU64Le(data, size, pos, "TOC size");
+        entry.fileIndex = readU64Le(data, size, pos, "TOC fileIndex");
+        size_t expectedEnd = entryStart + static_cast<size_t>(tocEntrySize);
+        if (expectedEnd > size)
+        {
+            throw std::runtime_error("Unexpected end of TOC in " + dbPath.string());
+        }
+        pos = expectedEnd;
+        tocEntries.push_back(entry);
+    }
+
+    tag = readU64Le(data, size, pos, "FILES tag");
+    if (tag != makeTag("FILES"))
+    {
+        throw std::runtime_error("Missing FILES tag in " + dbPath.string());
+    }
+    uint64_t fileCount = readU64Le(data, size, pos, "file count");
+    uint64_t fileEntrySize = readU64Le(data, size, pos, "file entry size");
+    if (fileEntrySize < 48)
+    {
+        throw std::runtime_error("Unsupported file entry size in " + dbPath.string());
+    }
+    struct RawFileEntry
+    {
+        uint64_t nameIndex;
+        uint64_t hashLo;
+        uint64_t hashHi;
+        uint64_t inodeNumber;
+        uint64_t date;
+        uint64_t numLinks;
+    };
+    std::vector<RawFileEntry> rawEntries;
+    for (uint64_t i = 0; i < fileCount; i++)
+    {
+        size_t entryStart = pos;
+        RawFileEntry entry{};
+        entry.nameIndex = readU64Le(data, size, pos, "nameIndex");
+        entry.hashLo = readU64Le(data, size, pos, "hashLo");
+        entry.hashHi = readU64Le(data, size, pos, "hashHi");
+        entry.inodeNumber = readU64Le(data, size, pos, "inodeNumber");
+        entry.date = readU64Le(data, size, pos, "date");
+        entry.numLinks = readU64Le(data, size, pos, "numLinks");
+        size_t expectedEnd = entryStart + static_cast<size_t>(fileEntrySize);
+        if (expectedEnd > size)
+        {
+            throw std::runtime_error("Unexpected end of file entries in " + dbPath.string());
+        }
+        pos = expectedEnd;
+        rawEntries.push_back(entry);
+    }
+
+    tag = readU64Le(data, size, pos, "STRINGS tag");
+    if (tag != makeTag("STRINGS"))
+    {
+        throw std::runtime_error("Missing STRINGS tag in " + dbPath.string());
+    }
+    uint64_t stringsSize = readU64Le(data, size, pos, "strings size");
+    if (pos + stringsSize > size)
+    {
+        throw std::runtime_error("Invalid STRINGS size in " + dbPath.string());
+    }
+    std::vector<uint8_t> strings(data + pos, data + pos + stringsSize);
+    pos += stringsSize;
+
+    std::vector<FileSize> sizes(static_cast<size_t>(fileCount), 0);
+    if (!rawEntries.empty() && tocEntries.empty())
+    {
+        throw std::runtime_error("Missing TOC entries in " + dbPath.string());
+    }
+    for (size_t i = 0; i < tocEntries.size(); i++)
+    {
+        size_t start = static_cast<size_t>(tocEntries[i].fileIndex);
+        size_t end = (i + 1 < tocEntries.size())
+            ? static_cast<size_t>(tocEntries[i + 1].fileIndex)
+            : static_cast<size_t>(fileCount);
+        if (start > end || end > rawEntries.size())
+        {
+            throw std::runtime_error("Invalid TOC index in " + dbPath.string());
+        }
+        for (size_t j = start; j < end; j++)
+        {
+            sizes[j] = tocEntries[i].size;
+        }
+    }
+
+    DirDbData dirData;
+    dirData.path = normalizePath(dirPath);
+    dirData.dbSize = static_cast<uint64_t>(ut1::getFileSize(dbPath.string()));
+    for (size_t i = 0; i < rawEntries.size(); i++)
+    {
+        const auto& rawEntry = rawEntries[i];
+        if (rawEntry.nameIndex >= strings.size())
+        {
+            throw std::runtime_error("Invalid name index in " + dbPath.string());
+        }
+        DirDbFileEntry entry;
+        entry.name = readLengthStringAt(strings, static_cast<size_t>(rawEntry.nameIndex));
+        entry.size = sizes[i];
+        entry.hashLo = rawEntry.hashLo;
+        entry.hashHi = rawEntry.hashHi;
+        entry.inodeNumber = rawEntry.inodeNumber;
+        entry.date = rawEntry.date;
+        entry.numLinks = rawEntry.numLinks;
+        dirData.files.push_back(std::move(entry));
+    }
+
+    return dirData;
+}
+
+static DirDbData createDirDb(const fs::path& dirPath)
+{
+    if (clVerbose > 0)
+    {
+        std::cout << "Scanning " << dirPath.string() << "\n";
+    }
+
+    struct ScanEntry
+    {
+        std::string name;
+        FileSize size;
+        uint64_t hashLo;
+        uint64_t hashHi;
+        uint64_t inodeNumber;
+        uint64_t date;
+        uint64_t numLinks;
+    };
+
+    std::vector<ScanEntry> entries;
+    std::error_code ec;
+    for (const auto& entry : fs::directory_iterator(dirPath, fs::directory_options::skip_permission_denied, ec))
+    {
+        if (ec)
+        {
+            throw std::runtime_error("Error while scanning directory: " + dirPath.string());
+        }
+        if (entry.path().filename() == ".dirdb")
+        {
+            continue;
+        }
+        if (ut1::getFileType(entry, false) != ut1::FT_REGULAR)
+        {
+            continue;
+        }
+        uint64_t size = entry.file_size();
+        auto hashPair = hashFile128(entry.path());
+        ut1::StatInfo statInfo = ut1::getStat(entry, false);
+        ScanEntry scan;
+        scan.name = entry.path().filename().string();
+        scan.size = size;
+        scan.hashLo = hashPair.first;
+        scan.hashHi = hashPair.second;
+        scan.inodeNumber = static_cast<uint64_t>(statInfo.getIno());
+        scan.date = fileTimeFromTimespec(statInfo.getMTimeSpec());
+        scan.numLinks = static_cast<uint64_t>(statInfo.statData.st_nlink);
+        entries.push_back(std::move(scan));
+    }
+    if (ec)
+    {
+        throw std::runtime_error("Error while scanning directory: " + dirPath.string());
+    }
+
+    std::sort(entries.begin(), entries.end(), [](const ScanEntry& a, const ScanEntry& b)
+    {
+        if (a.size != b.size)
+        {
+            return a.size < b.size;
+        }
+        return a.name < b.name;
+    });
+
+    struct TocEntry { uint64_t size; uint64_t fileIndex; };
+    std::vector<TocEntry> tocEntries;
+    for (size_t i = 0; i < entries.size(); i++)
+    {
+        if (i == 0 || entries[i].size != entries[i - 1].size)
+        {
+            TocEntry tocEntry{};
+            tocEntry.size = entries[i].size;
+            tocEntry.fileIndex = i;
+            tocEntries.push_back(tocEntry);
+        }
+    }
+
+    std::vector<uint8_t> stringData;
+    struct RawFileEntry
+    {
+        uint64_t nameIndex;
+        uint64_t hashLo;
+        uint64_t hashHi;
+        uint64_t inodeNumber;
+        uint64_t date;
+        uint64_t numLinks;
+    };
+    std::vector<RawFileEntry> rawEntries;
+    for (const auto& entry : entries)
+    {
+        RawFileEntry raw{};
+        raw.nameIndex = stringData.size();
+        appendLengthString(stringData, entry.name);
+        raw.hashLo = entry.hashLo;
+        raw.hashHi = entry.hashHi;
+        raw.inodeNumber = entry.inodeNumber;
+        raw.date = entry.date;
+        raw.numLinks = entry.numLinks;
+        rawEntries.push_back(raw);
+    }
+
+    std::vector<uint8_t> out;
+    appendU64Le(out, makeTag("DirDB"));
+    appendU64Le(out, kDirDbVersion);
+    appendU64Le(out, makeTag("TOC"));
+    appendU64Le(out, tocEntries.size());
+    appendU64Le(out, 16);
+    for (const auto& toc : tocEntries)
+    {
+        appendU64Le(out, toc.size);
+        appendU64Le(out, toc.fileIndex);
+    }
+    appendU64Le(out, makeTag("FILES"));
+    appendU64Le(out, rawEntries.size());
+    appendU64Le(out, 48);
+    for (const auto& raw : rawEntries)
+    {
+        appendU64Le(out, raw.nameIndex);
+        appendU64Le(out, raw.hashLo);
+        appendU64Le(out, raw.hashHi);
+        appendU64Le(out, raw.inodeNumber);
+        appendU64Le(out, raw.date);
+        appendU64Le(out, raw.numLinks);
+    }
+    appendU64Le(out, makeTag("STRINGS"));
+    appendU64Le(out, stringData.size());
+    out.insert(out.end(), stringData.begin(), stringData.end());
+
+    fs::path dbPath = dirPath / ".dirdb";
+    std::string raw(reinterpret_cast<const char*>(out.data()), out.size());
+    ut1::writeFile(dbPath.string(), raw);
+
+    DirDbData dirData;
+    dirData.path = normalizePath(dirPath);
+    dirData.dbSize = static_cast<uint64_t>(ut1::getFileSize(dbPath.string()));
+    for (const auto& entry : entries)
+    {
+        DirDbFileEntry file;
+        file.name = entry.name;
+        file.size = entry.size;
+        file.hashLo = entry.hashLo;
+        file.hashHi = entry.hashHi;
+        file.inodeNumber = entry.inodeNumber;
+        file.date = entry.date;
+        file.numLinks = entry.numLinks;
+        dirData.files.push_back(std::move(file));
+    }
+    return dirData;
+}
+
+static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate)
+{
+    fs::path dbPath = dirPath / ".dirdb";
+    if (!forceCreate && ut1::fsExists(dbPath))
+    {
+        return readDirDb(dirPath);
+    }
+    return createDirDb(dirPath);
+}
+
+static void processDirTree(const fs::path& root, MainDb& db, bool forceCreate)
+{
+    db.addDir(loadOrCreateDirDb(root, forceCreate));
+
+    std::error_code ec;
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    fs::recursive_directory_iterator end;
+    while (it != end)
+    {
+        if (ec)
+        {
+            if (clVerbose)
+            {
+                if (it != end)
+                {
+                    std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+                }
+            }
+            ec.clear();
+            it.increment(ec);
+            continue;
+        }
+        if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+        {
+            db.addDir(loadOrCreateDirDb(it->path(), forceCreate));
+        }
+        it.increment(ec);
+    }
+}
+
+static void removeDirDbTree(const fs::path& root)
+{
+    auto removeIfExists = [](const fs::path& dirPath)
+    {
+        fs::path dbPath = dirPath / ".dirdb";
+        if (ut1::fsExists(dbPath))
+        {
+            std::error_code ec;
+            fs::remove(dbPath, ec);
+            if (ec)
+            {
+                throw std::runtime_error("Failed to remove " + dbPath.string());
+            }
+            if (clVerbose)
+            {
+                std::cout << "Removed " << dbPath.string() << "\n";
+            }
+        }
+    };
+
+    removeIfExists(root);
+
+    std::error_code ec;
+    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+    fs::recursive_directory_iterator end;
+    while (it != end)
+    {
+        if (ec)
+        {
+            if (clVerbose && it != end)
+            {
+                std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+            }
+            ec.clear();
+            it.increment(ec);
+            continue;
+        }
+        if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+        {
+            removeIfExists(it->path());
+        }
+        it.increment(ec);
+    }
 }
 
 /// Main.
@@ -83,7 +1146,11 @@ int main(int argc, char *argv[])
 
     cl.addHeader("\nOptions:\n");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
+    cl.addOption('l', "list-files", "List all files with stored meta-data.");
+    cl.addOption('n', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
+    cl.addOption('r', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
     cl.addOption('H', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
+    cl.addOption('M', "max-size", "Maximum file size to include in size histogram.", "N", "0");
     cl.addOption('v', "verbose", "Increase verbosity. Specify multiple times to be more verbose.");
 
     // Parse command line options.
@@ -91,7 +1158,7 @@ int main(int argc, char *argv[])
     clVerbose = cl.getCount("verbose");
 
     // Implicit options.
-    if (!(cl("stats")))
+    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb")))
     {
         cl.setOption("stats");
     }
@@ -111,15 +1178,45 @@ int main(int argc, char *argv[])
             }
         }
 
-        // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.
-        for (size_t i = 0; i < cl.getArgs().size(); i++)
+        if (cl("remove-dirdb"))
         {
-            // todo
+            for (const std::string& path : cl.getArgs())
+            {
+                removeDirDbTree(normalizePath(path));
+            }
         }
-
-        if (cl("stats"))
+        else
         {
-            printStats();
+            std::vector<fs::path> normalizedRoots;
+            for (const std::string& path : cl.getArgs())
+            {
+                normalizedRoots.push_back(normalizePath(path));
+            }
+            MainDb mainDb(normalizedRoots);
+
+            // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.
+            for (size_t i = 0; i < cl.getArgs().size(); i++)
+            {
+                processDirTree(normalizedRoots[i], mainDb, cl("new-dirdb"));
+            }
+
+            if (cl("stats"))
+            {
+                mainDb.printStats();
+            }
+
+            if (cl("size-histogram"))
+            {
+                uint64_t batchSize = ut1::strToU64(cl.getStr("size-histogram"));
+                uint64_t maxSize = ut1::strToU64(cl.getStr("max-size"));
+                bool hasMaxSize = cl.getStr("max-size") != "0";
+                mainDb.printSizeHistogram(batchSize, maxSize, hasMaxSize);
+            }
+
+            if (cl("list-files"))
+            {
+                mainDb.listFiles();
+            }
         }
 
         if (clVerbose)
