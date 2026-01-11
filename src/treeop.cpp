@@ -19,6 +19,7 @@
 #include <vector>
 #include <unordered_map>
 #include <bit>
+#include <optional>
 #include <span>
 #include <list>
 #include <map>
@@ -340,22 +341,9 @@ public:
         }
     }
 
-    void printIntersectStats(const fs::path& rootA, const fs::path& rootB, bool listA, bool listB, bool listBoth) const
+    void printIntersectStats(const fs::path& rootA, const fs::path& rootB, bool listA, bool listB, bool listBoth,
+        const fs::path* extractA, const fs::path* extractB) const
     {
-        struct ContentKey
-        {
-            uint64_t size;
-            Hash128 hash;
-            bool operator<(const ContentKey& other) const
-            {
-                if (size != other.size)
-                {
-                    return size < other.size;
-                }
-                return hash < other.hash;
-            }
-        };
-
         std::map<ContentKey, std::vector<FileRef>> filesA;
         std::map<ContentKey, std::vector<FileRef>> filesB;
 
@@ -429,6 +417,15 @@ public:
                 onlyB.files += countB;
                 onlyB.bytes += countB * key.size;
             }
+        }
+
+        if (extractA)
+        {
+            copyIntersectFiles(rootA, *extractA, filesA, filesB);
+        }
+        if (extractB)
+        {
+            copyIntersectFiles(rootB, *extractB, filesB, filesA);
         }
 
         std::string onlyAFilesStr = formatCountInt(onlyA.files);
@@ -609,6 +606,20 @@ private:
         uint64_t numLinks{};
     };
 
+    struct ContentKey
+    {
+        uint64_t size{};
+        Hash128 hash{};
+        bool operator<(const ContentKey& other) const
+        {
+            if (size != other.size)
+            {
+                return size < other.size;
+            }
+            return hash < other.hash;
+        }
+    };
+
     static void printListRows(const std::vector<FileRef>& refs, bool showInodeLinks, size_t hashLen)
     {
         struct Row
@@ -665,6 +676,42 @@ private:
                 std::cout << std::setw(static_cast<int>(widthLinks)) << row.numLinks << " ";
             }
             std::cout << row.name << "\n";
+        }
+    }
+
+    static void copyIntersectFiles(const fs::path& rootSrc, const fs::path& destRoot,
+        const std::map<ContentKey, std::vector<FileRef>>& filesSrc,
+        const std::map<ContentKey, std::vector<FileRef>>& filesOther)
+    {
+        if (fs::exists(destRoot))
+        {
+            throw std::runtime_error("Destination exists: " + destRoot.string());
+        }
+        fs::create_directories(destRoot);
+
+        for (const auto& [key, listRefs] : filesSrc)
+        {
+            if (filesOther.find(key) != filesOther.end())
+            {
+                continue;
+            }
+            for (const auto& ref : listRefs)
+            {
+                fs::path srcPath(ref.path);
+                std::error_code ec;
+                fs::path rel = fs::relative(srcPath, rootSrc, ec);
+                if (ec)
+                {
+                    throw std::runtime_error("Failed to compute relative path for " + srcPath.string());
+                }
+                fs::path destPath = destRoot / rel;
+                fs::create_directories(destPath.parent_path());
+                fs::copy_file(srcPath, destPath, fs::copy_options::none, ec);
+                if (ec)
+                {
+                    throw std::runtime_error("Failed to copy to " + destPath.string());
+                }
+            }
         }
     }
 
@@ -1578,14 +1625,16 @@ int main(int argc, char *argv[])
         "0.0.1");
 
     cl.addHeader("\nOptions:\n");
-    cl.addOption(' ', "intersect", "Determine the intersection of dir A and dir B. Exactly two dirs must be specified when this option is specified. Print statistics (bytes/files) for files contained only in A, in both A and B or only in B.");
+    cl.addOption('i', "intersect", "Determine the intersection of dir A and dir B. Exactly two dirs must be specified when this option is specified. Print statistics (bytes/files) for files contained only in A, in both A and B or only in B.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
     cl.addOption(' ', "list-a", "List files only in A when used with --intersect.");
     cl.addOption(' ', "list-b", "List files only in B when used with --intersect.");
     cl.addOption(' ', "list-both", "List files in both A and B when used with --intersect.");
+    cl.addOption(' ', "extract-a", "Extract files only in A into DIR when used with --intersect.", "DIR", "");
+    cl.addOption(' ', "extract-b", "Extract files only in B into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
-    cl.addOption('u', "update-dirdb", "Update .dirdb files, reusing hashes when name/size/mtime match.");
+    cl.addOption('u', "update-dirdb", "Update .dirdb files, reusing hashes when inode/size/mtime match.");
     cl.addOption(' ', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
     cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
@@ -1597,7 +1646,7 @@ int main(int argc, char *argv[])
     clVerbose = cl.getCount("verbose");
 
     // Implicit options.
-    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("get-unique-hash-len")))
+    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -1624,6 +1673,10 @@ int main(int argc, char *argv[])
         if ((cl("list-a") || cl("list-b") || cl("list-both")) && !cl("intersect"))
         {
             cl.error("--list-a/--list-b/--list-both require --intersect.");
+        }
+        if ((cl("extract-a") || cl("extract-b")) && !cl("intersect"))
+        {
+            cl.error("--extract-a/--extract-b require --intersect.");
         }
 
         if (cl("remove-dirdb"))
@@ -1654,7 +1707,24 @@ int main(int argc, char *argv[])
                 {
                     cl.error("--intersect requires exactly two directories.");
                 }
-                mainDb.printIntersectStats(normalizedRoots[0], normalizedRoots[1], cl("list-a"), cl("list-b"), cl("list-both"));
+                std::optional<fs::path> extractA;
+                std::optional<fs::path> extractB;
+                if (cl("extract-a"))
+                {
+                    extractA = normalizePath(cl.getStr("extract-a"));
+                }
+                if (cl("extract-b"))
+                {
+                    extractB = normalizePath(cl.getStr("extract-b"));
+                }
+                mainDb.printIntersectStats(
+                    normalizedRoots[0],
+                    normalizedRoots[1],
+                    cl("list-a"),
+                    cl("list-b"),
+                    cl("list-both"),
+                    extractA ? &*extractA : nullptr,
+                    extractB ? &*extractB : nullptr);
             }
             else
             {
