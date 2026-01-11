@@ -153,25 +153,16 @@ public:
                 totalDbSize += dir.dbSize;
             }
 
-            std::string fileCountStr = formatCountInt(fileCount);
-            std::string dirCountStr = formatCountInt(dirCount);
-            std::string totalSizeStr = formatSizeFixed(totalSize);
-            std::string dbSizeStr = formatSizeFixed(totalDbSize);
             std::string percentStr = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * totalDbSize / totalSize));
-            std::vector<std::pair<std::string, std::string>> stats = {
-                {"files:", fileCountStr},
-                {"dirs:", dirCountStr},
-                {"total-size:", totalSizeStr},
-                {"dirdb-size:", dbSizeStr}
+            std::vector<StatLine> stats = {
+                {"files:", formatCountInt(fileCount), std::string()},
+                {"dirs:", formatCountInt(dirCount), std::string()},
+                {"total-size:", formatSizeFixed(totalSize), std::string()},
+                {"dirdb-size:", formatSizeFixed(totalDbSize) + " (" + percentStr + ")", std::string()}
             };
-            size_t labelWidth = getLabelWidth(stats);
-            size_t decimalCol = getAlignedDecimalColumn(stats, labelWidth);
 
-            std::cout << root.string() << "\n"
-                      << formatAlignedStatLine("files:", fileCountStr, labelWidth, decimalCol) << "\n"
-                      << formatAlignedStatLine("dirs:", dirCountStr, labelWidth, decimalCol) << "\n"
-                      << formatAlignedStatLine("total-size:", totalSizeStr, labelWidth, decimalCol) << "\n"
-                      << formatAlignedStatLine("dirdb-size:", dbSizeStr, labelWidth, decimalCol) << " (" << percentStr << ")\n";
+            std::cout << root.string() << "\n";
+            printStatList(stats);
         }
     }
 
@@ -419,14 +410,10 @@ public:
             }
         }
 
-        if (extractA)
-        {
-            copyIntersectFiles(rootA, *extractA, filesA, filesB);
-        }
-        if (extractB)
-        {
-            copyIntersectFiles(rootB, *extractB, filesB, filesA);
-        }
+        uint64_t totalFilesA = onlyA.files + bothA.files;
+        uint64_t totalBytesA = onlyA.bytes + bothA.bytes;
+        uint64_t totalFilesB = onlyB.files + bothB.files;
+        uint64_t totalBytesB = onlyB.bytes + bothB.bytes;
 
         std::string onlyAFilesStr = formatCountInt(onlyA.files);
         std::string onlyASizeStr = formatSizeFixed(onlyA.bytes);
@@ -437,29 +424,38 @@ public:
         std::string onlyBFilesStr = formatCountInt(onlyB.files);
         std::string onlyBSizeStr = formatSizeFixed(onlyB.bytes);
 
-        std::vector<std::pair<std::string, std::string>> stats = {
-            {"only-A-files:", onlyAFilesStr},
-            {"only-A-size:", onlyASizeStr},
-            {"both-A-files:", bothAFilesStr},
-            {"both-A-size:", bothASizeStr},
-            {"both-B-files:", bothBFilesStr},
-            {"both-B-size:", bothBSizeStr},
-            {"only-B-files:", onlyBFilesStr},
-            {"only-B-size:", onlyBSizeStr}
+        std::string onlyAFilesPct = formatPercentFixed(totalFilesA == 0 ? 0.0 : (100.0 * onlyA.files / totalFilesA));
+        std::string onlyASizePct = formatPercentFixed(totalBytesA == 0 ? 0.0 : (100.0 * onlyA.bytes / totalBytesA));
+        std::string bothAFilesPct = formatPercentFixed(totalFilesA == 0 ? 0.0 : (100.0 * bothA.files / totalFilesA));
+        std::string bothASizePct = formatPercentFixed(totalBytesA == 0 ? 0.0 : (100.0 * bothA.bytes / totalBytesA));
+        std::string bothBFilesPct = formatPercentFixed(totalFilesB == 0 ? 0.0 : (100.0 * bothB.files / totalFilesB));
+        std::string bothBSizePct = formatPercentFixed(totalBytesB == 0 ? 0.0 : (100.0 * bothB.bytes / totalBytesB));
+        std::string onlyBFilesPct = formatPercentFixed(totalFilesB == 0 ? 0.0 : (100.0 * onlyB.files / totalFilesB));
+        std::string onlyBSizePct = formatPercentFixed(totalBytesB == 0 ? 0.0 : (100.0 * onlyB.bytes / totalBytesB));
+
+        if (extractA)
+        {
+            copyIntersectFiles(rootA, *extractA, filesA, filesB);
+        }
+        if (extractB)
+        {
+            copyIntersectFiles(rootB, *extractB, filesB, filesA);
+        }
+
+        std::vector<StatLine> stats = {
+            {"only-A-files:", onlyAFilesStr, "(" + onlyAFilesPct + " of A)"},
+            {"only-A-size:", onlyASizeStr, "(" + onlyASizePct + " of A)"},
+            {"both-A-files:", bothAFilesStr, "(" + bothAFilesPct + " of A)"},
+            {"both-A-size:", bothASizeStr, "(" + bothASizePct + " of A)"},
+            {"both-B-files:", bothBFilesStr, "(" + bothBFilesPct + " of B)"},
+            {"both-B-size:", bothBSizeStr, "(" + bothBSizePct + " of B)"},
+            {"only-B-files:", onlyBFilesStr, "(" + onlyBFilesPct + " of B)"},
+            {"only-B-size:", onlyBSizeStr, "(" + onlyBSizePct + " of B)"}
         };
-        size_t labelWidth = getLabelWidth(stats);
-        size_t decimalCol = getAlignedDecimalColumn(stats, labelWidth);
 
         std::cout << "A: " << rootA.string() << "\n"
-                  << "B: " << rootB.string() << "\n"
-                  << formatAlignedStatLine("only-A-files:", onlyAFilesStr, labelWidth, decimalCol) << "\n"
-                  << formatAlignedStatLine("only-A-size:", onlyASizeStr, labelWidth, decimalCol) << "\n"
-                  << formatAlignedStatLine("both-A-files:", bothAFilesStr, labelWidth, decimalCol) << "\n"
-                  << formatAlignedStatLine("both-A-size:", bothASizeStr, labelWidth, decimalCol) << "\n"
-                  << formatAlignedStatLine("both-B-files:", bothBFilesStr, labelWidth, decimalCol) << "\n"
-                  << formatAlignedStatLine("both-B-size:", bothBSizeStr, labelWidth, decimalCol) << "\n"
-                  << formatAlignedStatLine("only-B-files:", onlyBFilesStr, labelWidth, decimalCol) << "\n"
-                  << formatAlignedStatLine("only-B-size:", onlyBSizeStr, labelWidth, decimalCol) << "\n";
+                  << "B: " << rootB.string() << "\n";
+        printStatList(stats);
 
         size_t hashLen = 0;
         if (clVerbose > 0 && (listA || listB || listBoth))
@@ -620,6 +616,13 @@ private:
         }
     };
 
+    struct StatLine
+    {
+        std::string label;
+        std::string value;
+        std::string extra;
+    };
+
     static void printListRows(const std::vector<FileRef>& refs, bool showInodeLinks, size_t hashLen)
     {
         struct Row
@@ -676,6 +679,61 @@ private:
                 std::cout << std::setw(static_cast<int>(widthLinks)) << row.numLinks << " ";
             }
             std::cout << row.name << "\n";
+        }
+    }
+
+    static void printStatList(const std::vector<StatLine>& lines)
+    {
+        size_t labelWidth = 0;
+        size_t maxDecimalPos = 0;
+        size_t maxExtraDecimalPos = 0;
+        for (const auto& line : lines)
+        {
+            labelWidth = std::max(labelWidth, line.label.size());
+            maxDecimalPos = std::max(maxDecimalPos, getStatDecimalPos(line.value));
+            if (!line.extra.empty())
+            {
+                maxExtraDecimalPos = std::max(maxExtraDecimalPos, getStatDecimalPos(line.extra));
+            }
+        }
+        size_t decimalCol = labelWidth + 1 + maxDecimalPos;
+
+        size_t maxValueWidth = 0;
+        size_t maxExtraWidth = 0;
+        std::vector<std::string> alignedValues;
+        std::vector<std::string> alignedExtras;
+        alignedValues.reserve(lines.size());
+        alignedExtras.reserve(lines.size());
+        for (const auto& line : lines)
+        {
+            std::string valueAligned = formatAlignedStatValue(line.value, labelWidth, decimalCol);
+            maxValueWidth = std::max(maxValueWidth, valueAligned.size());
+            alignedValues.push_back(std::move(valueAligned));
+            if (!line.extra.empty())
+            {
+                size_t extraCol = labelWidth + 1 + maxExtraDecimalPos;
+                std::string extraAligned = formatAlignedStatValue(line.extra, labelWidth, extraCol);
+                maxExtraWidth = std::max(maxExtraWidth, extraAligned.size());
+                alignedExtras.push_back(std::move(extraAligned));
+            }
+            else
+            {
+                alignedExtras.emplace_back();
+            }
+        }
+
+        for (size_t i = 0; i < lines.size(); i++)
+        {
+            const auto& line = lines[i];
+            const std::string& valueAligned = alignedValues[i];
+            std::string lineOut = line.label + std::string(labelWidth - line.label.size(), ' ') + " " + valueAligned;
+            if (!line.extra.empty())
+            {
+                lineOut += std::string(maxValueWidth - valueAligned.size(), ' ');
+                const std::string& extraAligned = alignedExtras[i];
+                lineOut += " " + extraAligned;
+            }
+            std::cout << lineOut << "\n";
         }
     }
 
@@ -819,7 +877,7 @@ private:
     static std::string formatPercentFixed(double percent)
     {
         std::ostringstream os;
-        os << std::fixed << std::setprecision(3) << percent << " %";
+        os << std::fixed << std::setprecision(1) << percent << "%";
         return os.str();
     }
 
@@ -838,37 +896,22 @@ private:
         return pos;
     }
 
-    static size_t getLabelWidth(const std::vector<std::pair<std::string, std::string>>& labeledValues)
+    static size_t getStatDecimalPos(const std::string& value)
     {
-        size_t width = 0;
-        for (const auto& [label, value] : labeledValues)
-        {
-            width = std::max(width, label.size());
-        }
-        return width;
+        size_t end = value.find(' ');
+        std::string_view number = (end == std::string::npos)
+            ? std::string_view(value)
+            : std::string_view(value).substr(0, end);
+        size_t pos = number.find('.');
+        return (pos == std::string::npos) ? number.size() : pos;
     }
 
-    static size_t getAlignedDecimalColumn(const std::vector<std::pair<std::string, std::string>>& labeledValues, size_t labelWidth)
+    static std::string formatAlignedStatValue(const std::string& value, size_t labelWidth, size_t decimalCol)
     {
-        size_t maxCol = 0;
-        for (const auto& [label, value] : labeledValues)
-        {
-            size_t decimalPos = getDecimalPos(value);
-            size_t col = labelWidth + 1 + decimalPos;
-            if (col > maxCol)
-            {
-                maxCol = col;
-            }
-        }
-        return maxCol;
-    }
-
-    static std::string formatAlignedStatLine(const std::string& label, const std::string& value, size_t labelWidth, size_t decimalCol)
-    {
-        size_t decimalPos = getDecimalPos(value);
+        size_t decimalPos = getStatDecimalPos(value);
         size_t currentCol = labelWidth + 1 + decimalPos;
         size_t padding = (decimalCol > currentCol) ? (decimalCol - currentCol) : 0;
-        return label + std::string(labelWidth - label.size(), ' ') + " " + std::string(padding, ' ') + value;
+        return std::string(padding, ' ') + value;
     }
 
     static std::string padRight(const std::string& value, size_t width)
