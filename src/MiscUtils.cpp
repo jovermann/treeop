@@ -10,7 +10,9 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/ioctl.h>
-#include <sys/disk.h>
+#endif
+#ifdef __APPLE__
+#include <sys/disk.h> // for DKIOCGETBLOCKCOUNT and DKIOCGETBLOCKSIZE
 #endif
 #include "MiscUtils.hpp"
 #ifdef ENABLE_UNIT_TEST
@@ -985,6 +987,7 @@ size_t getFileSize(const std::string& filename)
     }
     else if (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)) // Block or character device (e.g., /dev/disk16).
     {
+#ifdef __APPLE__
         uint64_t blockCount = 0;
         uint32_t blockSize = 0;
 
@@ -1000,6 +1003,9 @@ size_t getFileSize(const std::string& filename)
         }
 
         size = size_t(blockCount * blockSize);
+#else
+        size = size_t(st.st_size);
+#endif
     }
     else
     {
