@@ -38,6 +38,31 @@ namespace fs = std::filesystem;
 static constexpr uint64_t kDirDbVersion = 1;
 static constexpr uint64_t kWindowsToUnixEpoch = 11644473600ULL; // seconds
 
+struct Hash128
+{
+    uint64_t hi{};
+    uint64_t lo{};
+    bool operator<(const Hash128& other) const
+    {
+        if (hi != other.hi)
+        {
+            return hi < other.hi;
+        }
+        return lo < other.lo;
+    }
+    bool operator==(const Hash128& other) const
+    {
+        return hi == other.hi && lo == other.lo;
+    }
+    std::string toHex() const
+    {
+        std::ostringstream os;
+        os << std::hex << std::setw(16) << std::setfill('0') << lo
+           << std::setw(16) << std::setfill('0') << hi;
+        return os.str();
+    }
+};
+
 
 /// DirDB file format (.dirdb): There is one such file in each directory, representing all files in this directory (excluding the .dirdb file).
 /// - All integer fields are stored little endian.
@@ -81,8 +106,7 @@ struct DirDbFileEntry
 {
     std::string name;
     FileSize size{};
-    uint64_t hashLo{};
-    uint64_t hashHi{};
+    Hash128 hash{};
     uint64_t inodeNumber{};
     uint64_t date{};
     uint64_t numLinks{};
@@ -152,65 +176,23 @@ public:
 
     void listFiles() const
     {
-        struct Row
-        {
-            std::string size;
-            std::string hash;
-            std::string inode;
-            std::string date;
-            std::string numLinks;
-            std::string name;
-        };
-
-        std::vector<Row> rows;
-        size_t widthSize = 0;
-        size_t widthHash = 0;
-        size_t widthInode = 0;
-        size_t widthDate = 0;
-        size_t widthLinks = 0;
-        bool showInodeLinks = clVerbose > 0;
-
+        size_t hashLen = getUniqueHashHexLen();
+        std::vector<FileRef> refs;
         for (const auto& dir : dirs)
         {
             for (const auto& file : dir.files)
             {
-                Row row;
-                row.size = ut1::toStr(file.size);
-                row.hash = formatHex(file.hashLo) + formatHex(file.hashHi);
-                row.inode = ut1::toStr(file.inodeNumber);
-                row.date = formatFileTime(file.date);
-                row.numLinks = ut1::toStr(file.numLinks);
-                row.name = (dir.path / file.name).string();
-
-                widthSize = std::max(widthSize, row.size.size());
-                widthHash = std::max(widthHash, row.hash.size());
-                if (showInodeLinks)
-                {
-                    widthInode = std::max(widthInode, row.inode.size());
-                    widthLinks = std::max(widthLinks, row.numLinks.size());
-                }
-                widthDate = std::max(widthDate, row.date.size());
-
-                rows.push_back(std::move(row));
+                refs.push_back(FileRef{
+                    (dir.path / file.name).string(),
+                    file.size,
+                    file.hash,
+                    file.inodeNumber,
+                    file.date,
+                    file.numLinks
+                });
             }
         }
-
-        for (const auto& row : rows)
-        {
-            std::cout << std::setw(static_cast<int>(widthSize)) << row.size << " "
-                      << std::setw(static_cast<int>(widthHash)) << row.hash << " ";
-            if (showInodeLinks)
-            {
-                std::cout << std::setw(static_cast<int>(widthInode)) << row.inode << " ";
-            }
-            std::cout << std::setw(static_cast<int>(widthDate)) << row.date << " ";
-            if (showInodeLinks)
-            {
-                std::cout << std::setw(static_cast<int>(widthLinks)) << row.numLinks << " ";
-            }
-            std::cout
-                      << row.name << "\n";
-        }
+        printListRows(refs, clVerbose > 1, hashLen);
     }
 
     void printSizeHistogram(uint64_t batchSize, uint64_t maxSizeLimit, bool hasMaxSize) const
@@ -363,28 +345,15 @@ public:
         struct ContentKey
         {
             uint64_t size;
-            uint64_t hashLo;
-            uint64_t hashHi;
+            Hash128 hash;
             bool operator<(const ContentKey& other) const
             {
                 if (size != other.size)
                 {
                     return size < other.size;
                 }
-                if (hashLo != other.hashLo)
-                {
-                    return hashLo < other.hashLo;
-                }
-                return hashHi < other.hashHi;
+                return hash < other.hash;
             }
-        };
-
-        struct FileRef
-        {
-            std::string path;
-            uint64_t size{};
-            uint64_t hashLo{};
-            uint64_t hashHi{};
         };
 
         std::map<ContentKey, std::vector<FileRef>> filesA;
@@ -396,16 +365,16 @@ public:
             {
                 for (const auto& file : dir.files)
                 {
-                    ContentKey key{file.size, file.hashLo, file.hashHi};
-                    filesA[key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hashLo, file.hashHi});
+                    ContentKey key{file.size, file.hash};
+                    filesA[key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hash, file.inodeNumber, file.date, file.numLinks});
                 }
             }
             if (isPathWithin(rootB, dir.path))
             {
                 for (const auto& file : dir.files)
                 {
-                    ContentKey key{file.size, file.hashLo, file.hashHi};
-                    filesB[key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hashLo, file.hashHi});
+                    ContentKey key{file.size, file.hash};
+                    filesB[key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hash, file.inodeNumber, file.date, file.numLinks});
                 }
             }
         }
@@ -495,18 +464,40 @@ public:
                   << formatAlignedStatLine("only-B-files:", onlyBFilesStr, labelWidth, decimalCol) << "\n"
                   << formatAlignedStatLine("only-B-size:", onlyBSizeStr, labelWidth, decimalCol) << "\n";
 
+        size_t hashLen = 0;
+        if (clVerbose > 0 && (listA || listB || listBoth))
+        {
+            hashLen = getUniqueHashHexLen();
+        }
+
         if (listA)
         {
             std::cout << "only-in-A:\n";
-            for (const auto& [key, listARefs] : filesA)
+            if (clVerbose > 0)
             {
-                if (filesB.find(key) != filesB.end())
+                std::vector<FileRef> refs;
+                for (const auto& [key, listARefs] : filesA)
                 {
-                    continue;
+                    if (filesB.find(key) != filesB.end())
+                    {
+                        continue;
+                    }
+                    refs.insert(refs.end(), listARefs.begin(), listARefs.end());
                 }
-                for (const auto& ref : listARefs)
+                printListRows(refs, clVerbose > 1, hashLen);
+            }
+            else
+            {
+                for (const auto& [key, listARefs] : filesA)
                 {
-                    std::cout << ref.path << "\n";
+                    if (filesB.find(key) != filesB.end())
+                    {
+                        continue;
+                    }
+                    for (const auto& ref : listARefs)
+                    {
+                        std::cout << ref.path << "\n";
+                    }
                 }
             }
         }
@@ -514,44 +505,80 @@ public:
         if (listB)
         {
             std::cout << "only-in-B:\n";
-            for (const auto& [key, listBRefs] : filesB)
+            if (clVerbose > 0)
             {
-                if (filesA.find(key) != filesA.end())
+                std::vector<FileRef> refs;
+                for (const auto& [key, listBRefs] : filesB)
                 {
-                    continue;
+                    if (filesA.find(key) != filesA.end())
+                    {
+                        continue;
+                    }
+                    refs.insert(refs.end(), listBRefs.begin(), listBRefs.end());
                 }
-                for (const auto& ref : listBRefs)
+                printListRows(refs, clVerbose > 1, hashLen);
+            }
+            else
+            {
+                for (const auto& [key, listBRefs] : filesB)
                 {
-                    std::cout << ref.path << "\n";
+                    if (filesA.find(key) != filesA.end())
+                    {
+                        continue;
+                    }
+                    for (const auto& ref : listBRefs)
+                    {
+                        std::cout << ref.path << "\n";
+                    }
                 }
             }
         }
 
         if (listBoth)
         {
-            std::cout << "in-both-A:\n";
-            for (const auto& [key, listARefs] : filesA)
+            std::cout << "in-both:\n";
+            if (clVerbose > 0)
             {
-                auto itB = filesB.find(key);
-                if (itB == filesB.end())
+                std::vector<FileRef> refs;
+                for (const auto& [key, listARefs] : filesA)
                 {
-                    continue;
+                    auto itB = filesB.find(key);
+                    if (itB == filesB.end())
+                    {
+                        continue;
+                    }
+                    for (const auto& ref : listARefs)
+                    {
+                        FileRef labeled = ref;
+                        labeled.path = "A: " + labeled.path;
+                        refs.push_back(std::move(labeled));
+                    }
+                    for (const auto& ref : itB->second)
+                    {
+                        FileRef labeled = ref;
+                        labeled.path = "B: " + labeled.path;
+                        refs.push_back(std::move(labeled));
+                    }
                 }
-                for (const auto& ref : listARefs)
-                {
-                    std::cout << ref.path << "\n";
-                }
+                printListRows(refs, clVerbose > 1, hashLen);
             }
-            std::cout << "in-both-B:\n";
-            for (const auto& [key, listBRefs] : filesB)
+            else
             {
-                if (filesA.find(key) == filesA.end())
+                for (const auto& [key, listARefs] : filesA)
                 {
-                    continue;
-                }
-                for (const auto& ref : listBRefs)
-                {
-                    std::cout << ref.path << "\n";
+                    auto itB = filesB.find(key);
+                    if (itB == filesB.end())
+                    {
+                        continue;
+                    }
+                    for (const auto& ref : listARefs)
+                    {
+                        std::cout << "A: " << ref.path << "\n";
+                    }
+                    for (const auto& ref : itB->second)
+                    {
+                        std::cout << "B: " << ref.path << "\n";
+                    }
                 }
             }
         }
@@ -559,65 +586,147 @@ public:
 
     void printUniqueHashLen() const
     {
-        struct Hash128
-        {
-            uint64_t hi;
-            uint64_t lo;
-            bool operator<(const Hash128& other) const
-            {
-                if (hi != other.hi)
-                {
-                    return hi < other.hi;
-                }
-                return lo < other.lo;
-            }
-            bool operator==(const Hash128& other) const
-            {
-                return hi == other.hi && lo == other.lo;
-            }
-        };
-
         std::vector<Hash128> hashes;
         for (const auto& dir : dirs)
         {
             for (const auto& file : dir.files)
             {
-                hashes.push_back(Hash128{file.hashHi, file.hashLo});
+                hashes.push_back(file.hash);
             }
         }
-
-        std::sort(hashes.begin(), hashes.end());
-        hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
-        size_t minBits = 0;
-        if (hashes.size() > 1)
-        {
-            // After sorting, the longest common prefix between any two distinct hashes
-            // must occur between neighboring entries, so only adjacent pairs are needed.
-            size_t maxCommonPrefix = 0;
-            for (size_t i = 1; i < hashes.size(); i++)
-            {
-                uint64_t hiXor = hashes[i].hi ^ hashes[i - 1].hi;
-                size_t common = 0;
-                if (hiXor == 0)
-                {
-                    uint64_t loXor = hashes[i].lo ^ hashes[i - 1].lo;
-                    common = 64 + std::countl_zero(loXor);
-                }
-                else
-                {
-                    common = std::countl_zero(hiXor);
-                }
-                if (common > maxCommonPrefix)
-                {
-                    maxCommonPrefix = common;
-                }
-            }
-            minBits = std::min<size_t>(128, maxCommonPrefix + 1);
-        }
+        size_t minBits = getMinUniqueHashBits(std::move(hashes));
         std::cout << "unique-hash-len: " << minBits << "\n";
     }
 
 private:
+    struct FileRef
+    {
+        std::string path;
+        uint64_t size{};
+        Hash128 hash{};
+        uint64_t inode{};
+        uint64_t date{};
+        uint64_t numLinks{};
+    };
+
+    static void printListRows(const std::vector<FileRef>& refs, bool showInodeLinks, size_t hashLen)
+    {
+        struct Row
+        {
+            std::string size;
+            std::string hash;
+            std::string inode;
+            std::string date;
+            std::string numLinks;
+            std::string name;
+        };
+
+        std::vector<Row> rows;
+        size_t widthSize = 0;
+        size_t widthHash = 0;
+        size_t widthInode = 0;
+        size_t widthDate = 0;
+        size_t widthLinks = 0;
+
+        for (const auto& ref : refs)
+        {
+            Row row;
+            row.size = ut1::toStr(ref.size);
+            std::string hex = ref.hash.toHex();
+            row.hash = hex.substr(0, std::min(hashLen, hex.size()));
+            row.inode = ut1::toStr(ref.inode);
+            row.date = formatFileTime(ref.date);
+            row.numLinks = ut1::toStr(ref.numLinks);
+            row.name = ref.path;
+
+            widthSize = std::max(widthSize, row.size.size());
+            widthHash = std::max(widthHash, row.hash.size());
+            if (showInodeLinks)
+            {
+                widthInode = std::max(widthInode, row.inode.size());
+                widthLinks = std::max(widthLinks, row.numLinks.size());
+            }
+            widthDate = std::max(widthDate, row.date.size());
+
+            rows.push_back(std::move(row));
+        }
+
+        for (const auto& row : rows)
+        {
+            std::cout << std::setw(static_cast<int>(widthSize)) << row.size << " "
+                      << std::setw(static_cast<int>(widthHash)) << row.hash << " ";
+            if (showInodeLinks)
+            {
+                std::cout << std::setw(static_cast<int>(widthInode)) << row.inode << " ";
+            }
+            std::cout << std::setw(static_cast<int>(widthDate)) << row.date << " ";
+            if (showInodeLinks)
+            {
+                std::cout << std::setw(static_cast<int>(widthLinks)) << row.numLinks << " ";
+            }
+            std::cout << row.name << "\n";
+        }
+    }
+
+    size_t getUniqueHashHexLen() const
+    {
+        std::vector<Hash128> hashes;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                hashes.push_back(file.hash);
+            }
+        }
+        size_t minBits = getMinUniqueHashBits(std::move(hashes));
+        size_t nibbles = (minBits + 3) / 4;
+        if (nibbles < 4)
+        {
+            nibbles = 4;
+        }
+        if (nibbles > 32)
+        {
+            nibbles = 32;
+        }
+        return nibbles;
+    }
+
+    static size_t getMinUniqueHashBits(std::vector<Hash128> hashes)
+    {
+        if (hashes.size() <= 1)
+        {
+            return 0;
+        }
+        std::sort(hashes.begin(), hashes.end());
+        hashes.erase(std::unique(hashes.begin(), hashes.end()), hashes.end());
+        if (hashes.size() <= 1)
+        {
+            return 0;
+        }
+        // After sorting, the longest common prefix between any two distinct hashes
+        // must occur between neighboring entries, so only adjacent pairs are needed.
+        size_t maxCommonPrefix = 0;
+        for (size_t i = 1; i < hashes.size(); i++)
+        {
+            uint64_t hiXor = hashes[i].hi ^ hashes[i - 1].hi;
+            size_t common = 0;
+            if (hiXor == 0)
+            {
+                uint64_t loXor = hashes[i].lo ^ hashes[i - 1].lo;
+                common = 64 + std::countl_zero(loXor);
+            }
+            else
+            {
+                common = std::countl_zero(hiXor);
+            }
+            if (common > maxCommonPrefix)
+            {
+                maxCommonPrefix = common;
+            }
+        }
+        return std::min<size_t>(128, maxCommonPrefix + 1);
+    }
+
     static bool isPathWithin(const fs::path& root, const fs::path& path)
     {
         auto rootIt = root.begin();
@@ -630,13 +739,6 @@ private:
             }
         }
         return rootIt == root.end();
-    }
-
-    static std::string formatHex(uint64_t value)
-    {
-        std::ostringstream os;
-        os << std::hex << std::setw(16) << std::setfill('0') << value;
-        return os.str();
     }
 
     static std::string formatSizeFixed(uint64_t bytes)
@@ -991,7 +1093,7 @@ static uint64_t fileTimeFromTimespec(const timespec& ts)
     return ft;
 }
 
-static std::pair<uint64_t, uint64_t> hashFile128(const fs::path& path)
+static Hash128 hashFile128(const fs::path& path)
 {
     HashSha3_128 hasher;
     std::ifstream is(path, std::ios::binary);
@@ -1021,7 +1123,7 @@ static std::pair<uint64_t, uint64_t> hashFile128(const fs::path& path)
         lo |= (static_cast<uint64_t>(digest[i]) << (8 * i));
         hi |= (static_cast<uint64_t>(digest[8 + i]) << (8 * i));
     }
-    return {lo, hi};
+    return Hash128{hi, lo};
 }
 
 static DirDbData readDirDb(const fs::path& dirPath)
@@ -1085,8 +1187,7 @@ static DirDbData readDirDb(const fs::path& dirPath)
     struct RawFileEntry
     {
         uint64_t nameIndex;
-        uint64_t hashLo;
-        uint64_t hashHi;
+        Hash128 hash;
         uint64_t inodeNumber;
         uint64_t date;
         uint64_t numLinks;
@@ -1097,8 +1198,8 @@ static DirDbData readDirDb(const fs::path& dirPath)
         size_t entryStart = pos;
         RawFileEntry entry{};
         entry.nameIndex = readU64Le(data, size, pos, "nameIndex");
-        entry.hashLo = readU64Le(data, size, pos, "hashLo");
-        entry.hashHi = readU64Le(data, size, pos, "hashHi");
+        entry.hash.lo = readU64Le(data, size, pos, "hashLo");
+        entry.hash.hi = readU64Le(data, size, pos, "hashHi");
         entry.inodeNumber = readU64Le(data, size, pos, "inodeNumber");
         entry.date = readU64Le(data, size, pos, "date");
         entry.numLinks = readU64Le(data, size, pos, "numLinks");
@@ -1158,8 +1259,7 @@ static DirDbData readDirDb(const fs::path& dirPath)
         DirDbFileEntry entry;
         entry.name = readLengthStringAt(strings, static_cast<size_t>(rawEntry.nameIndex));
         entry.size = sizes[i];
-        entry.hashLo = rawEntry.hashLo;
-        entry.hashHi = rawEntry.hashHi;
+        entry.hash = rawEntry.hash;
         entry.inodeNumber = rawEntry.inodeNumber;
         entry.date = rawEntry.date;
         entry.numLinks = rawEntry.numLinks;
@@ -1206,8 +1306,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     {
         std::string name;
         FileSize size;
-        uint64_t hashLo;
-        uint64_t hashHi;
+        Hash128 hash;
         uint64_t inodeNumber;
         uint64_t date;
         uint64_t numLinks;
@@ -1232,8 +1331,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         uint64_t size = entry.file_size();
         ut1::StatInfo statInfo = ut1::getStat(entry, false);
         uint64_t date = fileTimeFromTimespec(statInfo.getMTimeSpec());
-        uint64_t hashLo = 0;
-        uint64_t hashHi = 0;
+        Hash128 hash{};
         bool reusedHash = false;
         if (cache)
         {
@@ -1242,22 +1340,18 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
             if (it != cache->end())
             {
                 const auto& cached = it->second;
-                hashLo = cached.hashLo;
-                hashHi = cached.hashHi;
+                hash = cached.hash;
                 reusedHash = true;
             }
         }
         if (!reusedHash)
         {
-            auto hashPair = hashFile128(entry.path());
-            hashLo = hashPair.first;
-            hashHi = hashPair.second;
+            hash = hashFile128(entry.path());
         }
         ScanEntry scan;
         scan.name = entry.path().filename().string();
         scan.size = size;
-        scan.hashLo = hashLo;
-        scan.hashHi = hashHi;
+        scan.hash = hash;
         scan.inodeNumber = static_cast<uint64_t>(statInfo.getIno());
         scan.date = date;
         scan.numLinks = static_cast<uint64_t>(statInfo.statData.st_nlink);
@@ -1294,8 +1388,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     struct RawFileEntry
     {
         uint64_t nameIndex;
-        uint64_t hashLo;
-        uint64_t hashHi;
+        Hash128 hash;
         uint64_t inodeNumber;
         uint64_t date;
         uint64_t numLinks;
@@ -1306,8 +1399,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         RawFileEntry raw{};
         raw.nameIndex = stringData.size();
         appendLengthString(stringData, entry.name);
-        raw.hashLo = entry.hashLo;
-        raw.hashHi = entry.hashHi;
+        raw.hash = entry.hash;
         raw.inodeNumber = entry.inodeNumber;
         raw.date = entry.date;
         raw.numLinks = entry.numLinks;
@@ -1331,8 +1423,8 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     for (const auto& raw : rawEntries)
     {
         appendU64Le(out, raw.nameIndex);
-        appendU64Le(out, raw.hashLo);
-        appendU64Le(out, raw.hashHi);
+        appendU64Le(out, raw.hash.lo);
+        appendU64Le(out, raw.hash.hi);
         appendU64Le(out, raw.inodeNumber);
         appendU64Le(out, raw.date);
         appendU64Le(out, raw.numLinks);
@@ -1353,8 +1445,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         DirDbFileEntry file;
         file.name = entry.name;
         file.size = entry.size;
-        file.hashLo = entry.hashLo;
-        file.hashHi = entry.hashHi;
+        file.hash = entry.hash;
         file.inodeNumber = entry.inodeNumber;
         file.date = entry.date;
         file.numLinks = entry.numLinks;
