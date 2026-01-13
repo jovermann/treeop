@@ -605,7 +605,7 @@ public:
     }
 
     void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listA, bool listB, bool listBoth,
-        const fs::path* extractA, const fs::path* extractB) const
+        const fs::path* extractA, const fs::path* extractB, bool removeCopies, bool dryRun) const
     {
         std::vector<std::map<ContentKey, std::vector<FileRef>>> rootFiles(rootPaths.size());
         std::map<ContentKey, size_t> rootsWithKey;
@@ -642,6 +642,13 @@ public:
             }
         }
 
+        uint64_t removedFiles = 0;
+        uint64_t removedBytes = 0;
+        if (removeCopies)
+        {
+            std::tie(removedFiles, removedBytes) = removeCopyFiles(rootFiles, dryRun);
+        }
+
         for (size_t i = 0; i < rootFiles.size(); i++)
         {
             BucketStats uniqueStats;
@@ -676,17 +683,67 @@ public:
             printStatList(stats);
         }
 
+        BucketStats totalUnique;
+        BucketStats totalShared;
+        for (const auto& [key, rootCount] : rootsWithKey)
+        {
+            size_t totalFiles = 0;
+            for (const auto& perRoot : rootFiles)
+            {
+                auto it = perRoot.find(key);
+                if (it != perRoot.end())
+                {
+                    totalFiles += it->second.size();
+                }
+            }
+            if (rootCount > 1)
+            {
+                totalShared.files += totalFiles;
+                totalShared.bytes += totalFiles * key.size;
+            }
+            else
+            {
+                totalUnique.files += totalFiles;
+                totalUnique.bytes += totalFiles * key.size;
+            }
+        }
+
+        uint64_t totalFilesAll = totalUnique.files + totalShared.files;
+        uint64_t totalBytesAll = totalUnique.bytes + totalShared.bytes;
+        std::string totalUniqueFilesPct = formatPercentFixed(totalFilesAll == 0 ? 0.0 : (100.0 * totalUnique.files / totalFilesAll));
+        std::string totalUniqueBytesPct = formatPercentFixed(totalBytesAll == 0 ? 0.0 : (100.0 * totalUnique.bytes / totalBytesAll));
+        std::string totalSharedFilesPct = formatPercentFixed(totalFilesAll == 0 ? 0.0 : (100.0 * totalShared.files / totalFilesAll));
+        std::string totalSharedBytesPct = formatPercentFixed(totalBytesAll == 0 ? 0.0 : (100.0 * totalShared.bytes / totalBytesAll));
+        std::vector<StatLine> totalStats = {
+            {"total-files:", formatCountInt(totalFilesAll), std::string()},
+            {"total-size:", formatSizeFixed(totalBytesAll), std::string()},
+            {"unique-files:", formatCountInt(totalUnique.files), "(" + totalUniqueFilesPct + " of total)"},
+            {"unique-size:", formatSizeFixed(totalUnique.bytes), "(" + totalUniqueBytesPct + " of total)"},
+            {"shared-files:", formatCountInt(totalShared.files), "(" + totalSharedFilesPct + " of total)"},
+            {"shared-size:", formatSizeFixed(totalShared.bytes), "(" + totalSharedBytesPct + " of total)"}
+        };
+        if (removeCopies)
+        {
+            std::string removedFilesPct = formatPercentFixed(totalFilesAll == 0 ? 0.0 : (100.0 * removedFiles / totalFilesAll));
+            std::string removedBytesPct = formatPercentFixed(totalBytesAll == 0 ? 0.0 : (100.0 * removedBytes / totalBytesAll));
+            totalStats.push_back({"removed-files:", formatCountInt(removedFiles), "(" + removedFilesPct + " of total)"});
+            totalStats.push_back({"removed-bytes:", formatSizeFixed(removedBytes), "(" + removedBytesPct + " of total)"});
+        }
+
+        std::cout << "total:\n";
+        printStatList(totalStats);
+
         if (rootPaths.size() == 2)
         {
             auto& filesA = rootFiles[0];
             auto& filesB = rootFiles[1];
             if (extractA)
             {
-                copyIntersectFiles(rootPaths[0], *extractA, filesA, filesB);
+                copyIntersectFiles(rootPaths[0], *extractA, filesA, filesB, dryRun);
             }
             if (extractB)
             {
-                copyIntersectFiles(rootPaths[1], *extractB, filesB, filesA);
+                copyIntersectFiles(rootPaths[1], *extractB, filesB, filesA, dryRun);
             }
         }
 
@@ -972,13 +1029,17 @@ private:
 
     static void copyIntersectFiles(const fs::path& rootSrc, const fs::path& destRoot,
         const std::map<ContentKey, std::vector<FileRef>>& filesSrc,
-        const std::map<ContentKey, std::vector<FileRef>>& filesOther)
+        const std::map<ContentKey, std::vector<FileRef>>& filesOther,
+        bool dryRun)
     {
         if (fs::exists(destRoot))
         {
             throw std::runtime_error("Destination exists: " + destRoot.string());
         }
-        fs::create_directories(destRoot);
+        if (!dryRun)
+        {
+            fs::create_directories(destRoot);
+        }
 
         for (const auto& [key, listRefs] : filesSrc)
         {
@@ -996,6 +1057,11 @@ private:
                     throw std::runtime_error("Failed to compute relative path for " + srcPath.string());
                 }
                 fs::path destPath = destRoot / rel;
+                if (dryRun)
+                {
+                    std::cout << "Would copy " << srcPath.string() << " -> " << destPath.string() << "\n";
+                    continue;
+                }
                 fs::create_directories(destPath.parent_path());
                 fs::copy_file(srcPath, destPath, fs::copy_options::none, ec);
                 if (ec)
@@ -1004,6 +1070,52 @@ private:
                 }
             }
         }
+    }
+
+    static std::pair<uint64_t, uint64_t> removeCopyFiles(const std::vector<std::map<ContentKey, std::vector<FileRef>>>& rootFiles, bool dryRun)
+    {
+        std::map<ContentKey, size_t> firstRoot;
+        uint64_t removedFiles = 0;
+        uint64_t removedBytes = 0;
+        for (size_t i = 0; i < rootFiles.size(); i++)
+        {
+            for (const auto& [key, listRefs] : rootFiles[i])
+            {
+                if (listRefs.empty())
+                {
+                    continue;
+                }
+                auto it = firstRoot.find(key);
+                if (it == firstRoot.end())
+                {
+                    firstRoot.emplace(key, i);
+                    continue;
+                }
+                if (i > it->second)
+                {
+                    for (const auto& ref : listRefs)
+                    {
+                        if (dryRun || clVerbose)
+                        {
+                            std::cout << (dryRun ? "Would remove " : "Removed ") << ref.path << "\n";
+                        }
+                        removedFiles++;
+                        removedBytes += ref.size;
+                        if (dryRun)
+                        {
+                            continue;
+                        }
+                        std::error_code ec;
+                        fs::remove(ref.path, ec);
+                        if (ec)
+                        {
+                            throw std::runtime_error("Failed to remove " + ref.path);
+                        }
+                    }
+                }
+            }
+        }
+        return {removedFiles, removedBytes};
     }
 
     void processDirTree(const fs::path& root, bool forceCreate, bool update)
@@ -1913,27 +2025,31 @@ static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bo
     return createDirDb(dirPath);
 }
 
-static void removeDirDbTree(const fs::path& root)
+static void removeDirDbTree(const fs::path& root, bool dryRun)
 {
-    auto removeIfExists = [](const fs::path& dirPath)
+    auto removeIfExists = [](const fs::path& dirPath, bool dryRunFlag)
     {
         fs::path dbPath = dirPath / ".dirdb";
         if (ut1::fsExists(dbPath))
         {
+            if (dryRunFlag || clVerbose)
+            {
+                std::cout << (dryRunFlag ? "Would remove " : "Removed ") << dbPath.string() << "\n";
+            }
+            if (dryRunFlag)
+            {
+                return;
+            }
             std::error_code ec;
             fs::remove(dbPath, ec);
             if (ec)
             {
                 throw std::runtime_error("Failed to remove " + dbPath.string());
             }
-            if (clVerbose)
-            {
-                std::cout << "Removed " << dbPath.string() << "\n";
-            }
         }
     };
 
-    removeIfExists(root);
+    removeIfExists(root, dryRun);
 
     std::error_code ec;
     fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
@@ -1952,7 +2068,7 @@ static void removeDirDbTree(const fs::path& root)
         }
         if (ut1::getFileType(*it, false) == ut1::FT_DIR)
         {
-            removeIfExists(it->path());
+            removeIfExists(it->path(), dryRun);
         }
         it.increment(ec);
     }
@@ -1980,6 +2096,8 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "list-both", "List files in both A and B when used with --intersect.");
     cl.addOption(' ', "extract-a", "Extract files only in A into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "extract-b", "Extract files only in B into DIR when used with --intersect.", "DIR", "");
+    cl.addOption(' ', "remove-copies", "Delete files from later roots when content exists in earlier roots (with --intersect).");
+    cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
     cl.addOption('u', "update-dirdb", "Update .dirdb files, reusing hashes when inode/size/mtime match.");
     cl.addOption(' ', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
@@ -2001,7 +2119,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("get-unique-hash-len")))
+    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("dry-run") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2033,12 +2151,20 @@ int main(int argc, char *argv[])
         {
             cl.error("--extract-a/--extract-b require --intersect.");
         }
+        if (cl("remove-copies") && !cl("intersect"))
+        {
+            cl.error("--remove-copies requires --intersect.");
+        }
+        if (cl("dry-run") && !(cl("remove-copies") || cl("extract-a") || cl("extract-b") || cl("remove-dirdb")))
+        {
+            cl.error("--dry-run requires --remove-copies, --extract-a/--extract-b, or --remove-dirdb.");
+        }
 
         if (cl("remove-dirdb"))
         {
             for (const std::string& path : cl.getArgs())
             {
-                removeDirDbTree(normalizePath(path));
+                removeDirDbTree(normalizePath(path), cl("dry-run"));
             }
         }
         else
@@ -2083,7 +2209,9 @@ int main(int argc, char *argv[])
                     cl("list-b"),
                     cl("list-both"),
                     extractA ? &*extractA : nullptr,
-                    extractB ? &*extractB : nullptr);
+                    extractB ? &*extractB : nullptr,
+                    cl("remove-copies"),
+                    cl("dry-run"));
             }
             else
             {
