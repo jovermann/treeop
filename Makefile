@@ -35,7 +35,10 @@ clean:
 	rm -rf build $(TARGET) unit_test
 	find . -name '*~' -delete
 
-.PHONY: clean default
+test: $(TARGET)
+	pytest -v
+
+.PHONY: clean default test
 
 ifeq ($(findstring $(MAKECMDGOALS),clean),)
 -include $(DEPENDS)
