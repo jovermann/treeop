@@ -64,6 +64,213 @@ struct Hash128
     }
 };
 
+class ProgressTracker
+{
+public:
+    explicit ProgressTracker(size_t maxWidth_ = 199, bool linefeed_ = false)
+        : startTime(ut1::getTimeSec()), lastPrintTime(startTime), maxWidth(maxWidth_), linefeed(linefeed_) {}
+
+    void onDirStart(const fs::path& dirPath)
+    {
+        if (!hashing)
+        {
+            currentDir = dirPath.string();
+        }
+        tick();
+    }
+
+    void onDirDone()
+    {
+        dirs++;
+        tick();
+    }
+
+    void addDirSummary(uint64_t fileCount, uint64_t totalBytes)
+    {
+        dirs++;
+        this->files += fileCount;
+        this->bytes += totalBytes;
+        tick();
+    }
+
+    void onFileProcessed(uint64_t size)
+    {
+        files++;
+        bytes += size;
+        tick();
+    }
+
+    void onHashStart(const fs::path& filePath, uint64_t fileSize)
+    {
+        hashing = true;
+        currentFile = filePath.string();
+        currentFileSize = fileSize;
+        currentFileDone = 0;
+        tick();
+    }
+
+    void onHashProgress(uint64_t bytesRead)
+    {
+        hashedBytes += bytesRead;
+        currentFileDone += bytesRead;
+        tick();
+    }
+
+    void onHashEnd()
+    {
+        hashing = false;
+        currentFile.clear();
+        currentFileSize = 0;
+        currentFileDone = 0;
+        tick();
+    }
+
+    void finish()
+    {
+        if (lastLineLen > 0)
+        {
+            std::cout << "\r" << std::string(lastLineLen, ' ') << "\r" << std::flush;
+            std::cout << "\n";
+            lastLineLen = 0;
+        }
+    }
+
+private:
+    void tick()
+    {
+        double now = ut1::getTimeSec();
+        if (now - lastPrintTime < 1.0)
+        {
+            return;
+        }
+        lastPrintTime = now;
+        printLine(now);
+    }
+
+    void printLine(double now)
+    {
+        double elapsed = now - startTime;
+        double rate = (elapsed > 0.0) ? (double(hashedBytes) / elapsed) : 0.0;
+        std::string rateStr = formatRateMb(rate);
+        std::string sizeStr = formatCompactSize(bytes);
+        std::string prefix = "F:" + ut1::toStr(files) +
+            " D:" + ut1::toStr(dirs) +
+            " B:" + sizeStr +
+            " H:" + rateStr;
+
+        std::string suffix;
+        if (hashing && !currentFile.empty())
+        {
+            unsigned percent = 0;
+            if (currentFileSize > 0)
+            {
+                percent = unsigned((currentFileDone * 100) / currentFileSize);
+            }
+            std::string percentStr = ut1::toStr(percent) + "%";
+            size_t maxPath = availablePathLen(prefix.size(), percentStr.size());
+            suffix = percentStr + " " + abbreviatePath(currentFile, maxPath);
+        }
+        else if (!currentDir.empty())
+        {
+            size_t maxPath = availablePathLen(prefix.size(), 0);
+            suffix = abbreviatePath(currentDir, maxPath);
+        }
+
+        std::string line = prefix;
+        if (!suffix.empty())
+        {
+            line += " " + suffix;
+        }
+        if (line.size() > maxWidth)
+        {
+            line.resize(maxWidth);
+        }
+        if (linefeed)
+        {
+            std::cout << line << "\n" << std::flush;
+        }
+        else
+        {
+            size_t pad = (lastLineLen > line.size()) ? (lastLineLen - line.size()) : 0;
+            std::cout << "\r" << line << std::string(pad, ' ') << "\r" << std::flush;
+            lastLineLen = line.size();
+        }
+    }
+
+    size_t availablePathLen(size_t prefixLen, size_t extraLen) const
+    {
+        size_t used = prefixLen + 1;
+        if (extraLen > 0)
+        {
+            used += extraLen + 1;
+        }
+        if (used >= maxWidth)
+        {
+            return 0;
+        }
+        return maxWidth - used;
+    }
+
+    static std::string abbreviatePath(const std::string& path, size_t maxLen)
+    {
+        if (maxLen == 0)
+        {
+            return std::string();
+        }
+        if (path.size() <= maxLen)
+        {
+            return path;
+        }
+        if (maxLen <= 3)
+        {
+            return path.substr(path.size() - maxLen);
+        }
+        return "..." + path.substr(path.size() - (maxLen - 3));
+    }
+
+    static std::string formatRateMb(double bytesPerSec)
+    {
+        double mbPerSec = bytesPerSec / (1024.0 * 1024.0);
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(1) << mbPerSec << "MB/s";
+        return os.str();
+    }
+
+    static std::string formatCompactSize(uint64_t bytes)
+    {
+        static constexpr const char* units[] = {"bytes", "kB", "MB", "GB", "TB", "PB", "EB"};
+        double value = static_cast<double>(bytes);
+        size_t unitIndex = 0;
+        uint64_t whole = bytes;
+        while (whole >= 1024 && unitIndex + 1 < std::size(units))
+        {
+            whole >>= 10;
+            value /= 1024.0;
+            unitIndex++;
+        }
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(1) << value << " " << units[unitIndex];
+        return os.str();
+    }
+
+    uint64_t dirs = 0;
+    uint64_t files = 0;
+    uint64_t bytes = 0;
+    uint64_t hashedBytes = 0;
+    double startTime = 0.0;
+    double lastPrintTime = 0.0;
+    std::string currentDir;
+    std::string currentFile;
+    uint64_t currentFileSize = 0;
+    uint64_t currentFileDone = 0;
+    bool hashing = false;
+    size_t lastLineLen = 0;
+    size_t maxWidth = 199;
+    bool linefeed = false;
+};
+
+static ProgressTracker* gProgress = nullptr;
+
 
 /// DirDB file format (.dirdb): There is one such file in each directory, representing all files in this directory (excluding the .dirdb file).
 /// - All integer fields are stored little endian.
@@ -118,30 +325,58 @@ struct DirDbData
     fs::path path;
     std::vector<DirDbFileEntry> files;
     uint64_t dbSize{};
+    uint64_t hashedBytes{};
+    double hashSeconds{};
 };
 
 class MainDb
 {
 public:
-    explicit MainDb(std::vector<fs::path> rootDirs): roots(std::move(rootDirs)) {}
+    struct RootData
+    {
+        fs::path path;
+        double elapsedSeconds{};
+    };
+
+    explicit MainDb(std::vector<fs::path> rootDirs)
+    {
+        for (auto& path : rootDirs)
+        {
+            roots.push_back(RootData{std::move(path), 0.0});
+        }
+    }
 
     void addDir(DirDbData dir)
     {
         dirs.push_back(std::move(dir));
     }
 
+    void setRootElapsed(const fs::path& root, double seconds)
+    {
+        for (auto& data : roots)
+        {
+            if (data.path == root)
+            {
+                data.elapsedSeconds = seconds;
+                break;
+            }
+        }
+    }
+
     void printStats() const
     {
-        for (const auto& root : roots)
+        for (const auto& rootData : roots)
         {
             size_t dirCount = 0;
             NumFiles fileCount = 0;
             FileSize totalSize = 0;
             uint64_t totalDbSize = 0;
+            uint64_t totalHashedBytes = 0;
+            double totalHashSeconds = 0.0;
             std::map<ContentKey, uint64_t> contentCounts;
             for (const auto& dir : dirs)
             {
-                if (!isPathWithin(root, dir.path))
+                if (!isPathWithin(rootData.path, dir.path))
                 {
                     continue;
                 }
@@ -154,6 +389,8 @@ public:
                     contentCounts[key]++;
                 }
                 totalDbSize += dir.dbSize;
+                totalHashedBytes += dir.hashedBytes;
+                totalHashSeconds += dir.hashSeconds;
             }
 
             uint64_t redundantFiles = 0;
@@ -172,6 +409,11 @@ public:
             std::string redundantFilesPct = formatPercentFixed(fileCount == 0 ? 0.0 : (100.0 * redundantFiles / fileCount));
             std::string redundantSizePct = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * redundantSize / totalSize));
             double dirdbBytesPerFile = (fileCount == 0) ? 0.0 : (double(totalDbSize) / double(fileCount));
+            std::string elapsedStr;
+            if (rootData.elapsedSeconds > 0.0)
+            {
+                elapsedStr = ut1::secondsToString(rootData.elapsedSeconds);
+            }
             std::vector<StatLine> stats = {
                 {"files:", formatCountInt(fileCount), std::string()},
                 {"dirs:", formatCountInt(dirCount), std::string()},
@@ -181,8 +423,20 @@ public:
                 {"dirdb-size:", formatSizeFixed(totalDbSize), "(" + percentStr + ")"},
                 {"dirdb-bytes-per-file:", formatSizeFixed(dirdbBytesPerFile, 1), std::string()}
             };
+            if (totalHashedBytes > 0 && totalHashSeconds > 0.0)
+            {
+                double rateMb = (double(totalHashedBytes) / totalHashSeconds / (1024.0 * 1024.0));
+                std::ostringstream rateOs;
+                rateOs << std::fixed << std::setprecision(1) << rateMb << " MB/s";
+                stats.push_back({"hash-size:", formatSizeFixed(totalHashedBytes), std::string()});
+                stats.push_back({"hash-rate:", rateOs.str(), std::string()});
+            }
+            if (!elapsedStr.empty())
+            {
+                stats.push_back({"elapsed:", elapsedStr, std::string()});
+            }
 
-            std::cout << root.string() << "\n";
+            std::cout << rootData.path.string() << "\n";
             printStatList(stats);
         }
     }
@@ -1062,7 +1316,7 @@ private:
         return os.str();
     }
 
-    std::vector<fs::path> roots;
+    std::vector<RootData> roots;
     std::vector<DirDbData> dirs;
 };
 
@@ -1225,7 +1479,7 @@ static uint64_t fileTimeFromTimespec(const timespec& ts)
     return ft;
 }
 
-static Hash128 hashFile128(const fs::path& path)
+static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* secondsOut)
 {
     HashSha3_128 hasher;
     std::ifstream is(path, std::ios::binary);
@@ -1233,7 +1487,12 @@ static Hash128 hashFile128(const fs::path& path)
     {
         throw std::runtime_error("Error while opening file for hashing: " + path.string());
     }
+    if (gProgress)
+    {
+        gProgress->onHashStart(path, fileSize);
+    }
     std::vector<uint8_t> buffer(1024 * 1024);
+    double start = ut1::getTimeSec();
     while (is)
     {
         is.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
@@ -1241,7 +1500,20 @@ static Hash128 hashFile128(const fs::path& path)
         if (count > 0)
         {
             hasher.update(buffer.data(), static_cast<size_t>(count));
+            if (gProgress)
+            {
+                gProgress->onHashProgress(static_cast<uint64_t>(count));
+            }
         }
+    }
+    double end = ut1::getTimeSec();
+    if (secondsOut)
+    {
+        *secondsOut = end - start;
+    }
+    if (gProgress)
+    {
+        gProgress->onHashEnd();
     }
     std::vector<uint8_t> digest = hasher.finalize();
     if (digest.size() < 16)
@@ -1258,7 +1530,7 @@ static Hash128 hashFile128(const fs::path& path)
     return Hash128{hi, lo};
 }
 
-static DirDbData readDirDb(const fs::path& dirPath)
+static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true)
 {
     fs::path dbPath = dirPath / ".dirdb";
     std::string raw = ut1::readFile(dbPath.string());
@@ -1381,6 +1653,8 @@ static DirDbData readDirDb(const fs::path& dirPath)
     DirDbData dirData;
     dirData.path = normalizePath(dirPath);
     dirData.dbSize = static_cast<uint64_t>(ut1::getFileSize(dbPath.string()));
+    dirData.hashedBytes = 0;
+    dirData.hashSeconds = 0.0;
     for (size_t i = 0; i < rawEntries.size(); i++)
     {
         const auto& rawEntry = rawEntries[i];
@@ -1396,6 +1670,17 @@ static DirDbData readDirDb(const fs::path& dirPath)
         entry.date = rawEntry.date;
         entry.numLinks = rawEntry.numLinks;
         dirData.files.push_back(std::move(entry));
+    }
+
+    if (gProgress && reportProgress)
+    {
+        uint64_t totalBytes = 0;
+        for (const auto& file : dirData.files)
+        {
+            totalBytes += file.size;
+        }
+        gProgress->onDirStart(dirPath);
+        gProgress->addDirSummary(dirData.files.size(), totalBytes);
     }
 
     return dirData;
@@ -1433,6 +1718,10 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     {
         std::cout << "Scanning " << dirPath.string() << "\n";
     }
+    if (gProgress)
+    {
+        gProgress->onDirStart(dirPath);
+    }
 
     struct ScanEntry
     {
@@ -1445,6 +1734,8 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     };
 
     std::vector<ScanEntry> entries;
+    uint64_t hashedBytes = 0;
+    double hashSeconds = 0.0;
     std::error_code ec;
     for (const auto& entry : fs::directory_iterator(dirPath, fs::directory_options::skip_permission_denied, ec))
     {
@@ -1461,6 +1752,10 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
             continue;
         }
         uint64_t size = entry.file_size();
+        if (gProgress)
+        {
+            gProgress->onFileProcessed(size);
+        }
         ut1::StatInfo statInfo = ut1::getStat(entry, false);
         uint64_t date = fileTimeFromTimespec(statInfo.getMTimeSpec());
         Hash128 hash{};
@@ -1478,7 +1773,10 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         }
         if (!reusedHash)
         {
-            hash = hashFile128(entry.path());
+            double seconds = 0.0;
+            hash = hashFile128(entry.path(), size, &seconds);
+            hashedBytes += size;
+            hashSeconds += seconds;
         }
         ScanEntry scan;
         scan.name = entry.path().filename().string();
@@ -1492,6 +1790,10 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     if (ec)
     {
         throw std::runtime_error("Error while scanning directory: " + dirPath.string());
+    }
+    if (gProgress)
+    {
+        gProgress->onDirDone();
     }
 
     std::sort(entries.begin(), entries.end(), [](const ScanEntry& a, const ScanEntry& b)
@@ -1572,6 +1874,8 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     DirDbData dirData;
     dirData.path = normalizePath(dirPath);
     dirData.dbSize = static_cast<uint64_t>(ut1::getFileSize(dbPath.string()));
+    dirData.hashedBytes = hashedBytes;
+    dirData.hashSeconds = hashSeconds;
     for (const auto& entry : entries)
     {
         DirDbFileEntry file;
@@ -1593,7 +1897,7 @@ static DirDbData createDirDb(const fs::path& dirPath)
 
 static DirDbData updateDirDb(const fs::path& dirPath)
 {
-    DirDbData existing = readDirDb(dirPath);
+    DirDbData existing = readDirDb(dirPath, false);
     std::unordered_map<HashReuseKey, DirDbFileEntry, HashReuseKeyHasher> cache;
     for (const auto& entry : existing.files)
     {
@@ -1707,7 +2011,7 @@ int main(int argc, char *argv[])
                         "All sizes may be specified with kMGTPE suffixes indicating powers of 1024.";
     ut1::CommandLineParser cl("treeop", usage,
         "\n$programName version $version *** Copyright (c) 2026 Johannes Overmann *** https://github.com/jovermann/treeop",
-        "0.0.1");
+        "0.1.1");
 
     cl.addHeader("\nOptions:\n");
     cl.addOption('i', "intersect", "Determine the intersection of dir A and dir B. Exactly two dirs must be specified when this option is specified. Print statistics (bytes/files) for files contained only in A, in both A and B or only in B.");
@@ -1724,11 +2028,19 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
     cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
     cl.addOption(' ', "max-size", "Maximum file size to include in size histogram.", "N", "0");
+    cl.addOption('p', "progress", "Print progress once per second.");
+    cl.addOption('W', "width", "Max width for progress line.", "N", "199");
     cl.addOption('v', "verbose", "Increase verbosity. Specify multiple times to be more verbose.");
 
     // Parse command line options.
     cl.parse(argc, argv);
     clVerbose = cl.getCount("verbose");
+    unsigned progressCount = cl.getCount("progress");
+    ProgressTracker progress(cl.getUInt("width"), progressCount > 1);
+    if (progressCount > 0)
+    {
+        gProgress = &progress;
+    }
 
     // Implicit options.
     if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("get-unique-hash-len")))
@@ -1783,7 +2095,14 @@ int main(int argc, char *argv[])
             // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.
             for (size_t i = 0; i < cl.getArgs().size(); i++)
             {
+                double start = ut1::getTimeSec();
                 processDirTree(normalizedRoots[i], mainDb, cl("new-dirdb"), cl("update-dirdb"));
+                double end = ut1::getTimeSec();
+                mainDb.setRootElapsed(normalizedRoots[i], end - start);
+            }
+            if (gProgress)
+            {
+                gProgress->finish();
             }
 
             if (cl("intersect"))
