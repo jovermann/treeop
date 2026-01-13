@@ -153,10 +153,7 @@ private:
         double rate = (elapsed > 0.0) ? (double(hashedBytes) / elapsed) : 0.0;
         std::string rateStr = formatRateMb(rate);
         std::string sizeStr = formatCompactSize(bytes);
-        std::string prefix = "F:" + ut1::toStr(files) +
-            " D:" + ut1::toStr(dirs) +
-            " B:" + sizeStr +
-            " H:" + rateStr;
+        std::string prefix = ut1::toStr(files) + "f/" + ut1::toStr(dirs) + "d (" + sizeStr + ", " + rateStr + ")";
 
         std::string suffix;
         if (hashing && !currentFile.empty())
@@ -249,7 +246,7 @@ private:
             unitIndex++;
         }
         std::ostringstream os;
-        os << std::fixed << std::setprecision(1) << value << " " << units[unitIndex];
+        os << std::fixed << std::setprecision(1) << value << units[unitIndex];
         return os.str();
     }
 
@@ -329,6 +326,8 @@ struct DirDbData
     double hashSeconds{};
 };
 
+static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update);
+
 class MainDb
 {
 public:
@@ -351,15 +350,13 @@ public:
         dirs.push_back(std::move(dir));
     }
 
-    void setRootElapsed(const fs::path& root, double seconds)
+    void processRoots(bool forceCreate, bool update)
     {
-        for (auto& data : roots)
+        for (auto& rootData : roots)
         {
-            if (data.path == root)
-            {
-                data.elapsedSeconds = seconds;
-                break;
-            }
+            double start = ut1::getTimeSec();
+            processDirTree(rootData.path, forceCreate, update);
+            rootData.elapsedSeconds = ut1::getTimeSec() - start;
         }
     }
 
@@ -1045,6 +1042,36 @@ private:
                     throw std::runtime_error("Failed to copy to " + destPath.string());
                 }
             }
+        }
+    }
+
+    void processDirTree(const fs::path& root, bool forceCreate, bool update)
+    {
+        addDir(loadOrCreateDirDb(root, forceCreate, update));
+
+        std::error_code ec;
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+        fs::recursive_directory_iterator end;
+        while (it != end)
+        {
+            if (ec)
+            {
+                if (clVerbose)
+                {
+                    if (it != end)
+                    {
+                        std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+                    }
+                }
+                ec.clear();
+                it.increment(ec);
+                continue;
+            }
+            if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+            {
+                addDir(loadOrCreateDirDb(it->path(), forceCreate, update));
+            }
+            it.increment(ec);
         }
     }
 
@@ -1925,36 +1952,6 @@ static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bo
     return createDirDb(dirPath);
 }
 
-static void processDirTree(const fs::path& root, MainDb& db, bool forceCreate, bool update)
-{
-    db.addDir(loadOrCreateDirDb(root, forceCreate, update));
-
-    std::error_code ec;
-    fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
-    fs::recursive_directory_iterator end;
-    while (it != end)
-    {
-        if (ec)
-        {
-            if (clVerbose)
-            {
-                if (it != end)
-                {
-                    std::cerr << "Skipping entry due to error: " << it->path() << "\n";
-                }
-            }
-            ec.clear();
-            it.increment(ec);
-            continue;
-        }
-        if (ut1::getFileType(*it, false) == ut1::FT_DIR)
-        {
-            db.addDir(loadOrCreateDirDb(it->path(), forceCreate, update));
-        }
-        it.increment(ec);
-    }
-}
-
 static void removeDirDbTree(const fs::path& root)
 {
     auto removeIfExists = [](const fs::path& dirPath)
@@ -2093,13 +2090,7 @@ int main(int argc, char *argv[])
             MainDb mainDb(normalizedRoots);
 
             // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.
-            for (size_t i = 0; i < cl.getArgs().size(); i++)
-            {
-                double start = ut1::getTimeSec();
-                processDirTree(normalizedRoots[i], mainDb, cl("new-dirdb"), cl("update-dirdb"));
-                double end = ut1::getTimeSec();
-                mainDb.setRootElapsed(normalizedRoots[i], end - start);
-            }
+            mainDb.processRoots(cl("new-dirdb"), cl("update-dirdb"));
             if (gProgress)
             {
                 gProgress->finish();
