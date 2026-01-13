@@ -20,6 +20,7 @@
 #include <unordered_map>
 #include <bit>
 #include <optional>
+#include <set>
 #include <span>
 #include <list>
 #include <map>
@@ -327,6 +328,8 @@ struct DirDbData
 };
 
 static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update);
+static DirDbData createDirDb(const fs::path& dirPath);
+static DirDbData updateDirDb(const fs::path& dirPath);
 
 class MainDb
 {
@@ -1077,6 +1080,7 @@ private:
         std::map<ContentKey, size_t> firstRoot;
         uint64_t removedFiles = 0;
         uint64_t removedBytes = 0;
+        std::set<fs::path> touchedDirs;
         for (size_t i = 0; i < rootFiles.size(); i++)
         {
             for (const auto& [key, listRefs] : rootFiles[i])
@@ -1111,7 +1115,18 @@ private:
                         {
                             throw std::runtime_error("Failed to remove " + ref.path);
                         }
+                        touchedDirs.insert(fs::path(ref.path).parent_path());
                     }
+                }
+            }
+        }
+        if (!dryRun)
+        {
+            for (const auto& dirPath : touchedDirs)
+            {
+                if (ut1::fsExists(dirPath / ".dirdb"))
+                {
+                    updateDirDb(dirPath);
                 }
             }
         }
