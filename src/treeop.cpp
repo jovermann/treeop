@@ -604,28 +604,24 @@ public:
         }
     }
 
-    void printIntersectStats(const fs::path& rootA, const fs::path& rootB, bool listA, bool listB, bool listBoth,
+    void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listA, bool listB, bool listBoth,
         const fs::path* extractA, const fs::path* extractB) const
     {
-        std::map<ContentKey, std::vector<FileRef>> filesA;
-        std::map<ContentKey, std::vector<FileRef>> filesB;
+        std::vector<std::map<ContentKey, std::vector<FileRef>>> rootFiles(rootPaths.size());
+        std::map<ContentKey, size_t> rootsWithKey;
 
         for (const auto& dir : dirs)
         {
-            if (isPathWithin(rootA, dir.path))
+            for (size_t i = 0; i < rootPaths.size(); i++)
             {
-                for (const auto& file : dir.files)
+                if (!isPathWithin(rootPaths[i], dir.path))
                 {
-                    ContentKey key{file.size, file.hash};
-                    filesA[key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hash, file.inodeNumber, file.date, file.numLinks});
+                    continue;
                 }
-            }
-            if (isPathWithin(rootB, dir.path))
-            {
                 for (const auto& file : dir.files)
                 {
                     ContentKey key{file.size, file.hash};
-                    filesB[key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hash, file.inodeNumber, file.date, file.numLinks});
+                    rootFiles[i][key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hash, file.inodeNumber, file.date, file.numLinks});
                 }
             }
         }
@@ -635,99 +631,64 @@ public:
             uint64_t files{};
             uint64_t bytes{};
         };
-        BucketStats onlyA;
-        BucketStats bothA;
-        BucketStats bothB;
-        BucketStats onlyB;
-
-        for (const auto& [key, listARefs] : filesA)
+        for (size_t i = 0; i < rootFiles.size(); i++)
         {
-            uint64_t countA = listARefs.size();
-            uint64_t countB = 0;
-            auto itB = filesB.find(key);
-            if (itB != filesB.end())
+            for (const auto& [key, listRefs] : rootFiles[i])
             {
-                countB = itB->second.size();
-            }
-            if (countB > 0)
-            {
-                bothA.files += countA;
-                bothA.bytes += countA * key.size;
-            }
-            else if (countA > 0)
-            {
-                onlyA.files += countA;
-                onlyA.bytes += countA * key.size;
+                if (!listRefs.empty())
+                {
+                    rootsWithKey[key]++;
+                }
             }
         }
 
-        for (const auto& [key, listBRefs] : filesB)
+        for (size_t i = 0; i < rootFiles.size(); i++)
         {
-            uint64_t countB = listBRefs.size();
-            uint64_t countA = 0;
-            auto itA = filesA.find(key);
-            if (itA != filesA.end())
+            BucketStats uniqueStats;
+            BucketStats sharedStats;
+            for (const auto& [key, listRefs] : rootFiles[i])
             {
-                countA = itA->second.size();
+                uint64_t count = listRefs.size();
+                if (count == 0)
+                {
+                    continue;
+                }
+                if (rootsWithKey[key] > 1)
+                {
+                    sharedStats.files += count;
+                    sharedStats.bytes += count * key.size;
+                }
+                else
+                {
+                    uniqueStats.files += count;
+                    uniqueStats.bytes += count * key.size;
+                }
             }
-            if (countA > 0)
-            {
-                bothB.files += countB;
-                bothB.bytes += countB * key.size;
-            }
-            else if (countB > 0)
-            {
-                onlyB.files += countB;
-                onlyB.bytes += countB * key.size;
-            }
+
+            std::vector<StatLine> stats = {
+                {"unique-files:", formatCountInt(uniqueStats.files), std::string()},
+                {"unique-size:", formatSizeFixed(uniqueStats.bytes), std::string()},
+                {"shared-files:", formatCountInt(sharedStats.files), std::string()},
+                {"shared-size:", formatSizeFixed(sharedStats.bytes), std::string()}
+            };
+
+            std::cout << rootPaths[i].string() << ":\n";
+            printStatList(stats);
         }
 
-        uint64_t totalFilesA = onlyA.files + bothA.files;
-        uint64_t totalBytesA = onlyA.bytes + bothA.bytes;
-        uint64_t totalFilesB = onlyB.files + bothB.files;
-        uint64_t totalBytesB = onlyB.bytes + bothB.bytes;
-
-        std::string onlyAFilesStr = formatCountInt(onlyA.files);
-        std::string onlyASizeStr = formatSizeFixed(onlyA.bytes);
-        std::string bothAFilesStr = formatCountInt(bothA.files);
-        std::string bothASizeStr = formatSizeFixed(bothA.bytes);
-        std::string bothBFilesStr = formatCountInt(bothB.files);
-        std::string bothBSizeStr = formatSizeFixed(bothB.bytes);
-        std::string onlyBFilesStr = formatCountInt(onlyB.files);
-        std::string onlyBSizeStr = formatSizeFixed(onlyB.bytes);
-
-        std::string onlyAFilesPct = formatPercentFixed(totalFilesA == 0 ? 0.0 : (100.0 * onlyA.files / totalFilesA));
-        std::string onlyASizePct = formatPercentFixed(totalBytesA == 0 ? 0.0 : (100.0 * onlyA.bytes / totalBytesA));
-        std::string bothAFilesPct = formatPercentFixed(totalFilesA == 0 ? 0.0 : (100.0 * bothA.files / totalFilesA));
-        std::string bothASizePct = formatPercentFixed(totalBytesA == 0 ? 0.0 : (100.0 * bothA.bytes / totalBytesA));
-        std::string bothBFilesPct = formatPercentFixed(totalFilesB == 0 ? 0.0 : (100.0 * bothB.files / totalFilesB));
-        std::string bothBSizePct = formatPercentFixed(totalBytesB == 0 ? 0.0 : (100.0 * bothB.bytes / totalBytesB));
-        std::string onlyBFilesPct = formatPercentFixed(totalFilesB == 0 ? 0.0 : (100.0 * onlyB.files / totalFilesB));
-        std::string onlyBSizePct = formatPercentFixed(totalBytesB == 0 ? 0.0 : (100.0 * onlyB.bytes / totalBytesB));
-
-        if (extractA)
+        if (rootPaths.size() == 2)
         {
-            copyIntersectFiles(rootA, *extractA, filesA, filesB);
+            auto& filesA = rootFiles[0];
+            auto& filesB = rootFiles[1];
+            if (extractA)
+            {
+                copyIntersectFiles(rootPaths[0], *extractA, filesA, filesB);
+            }
+            if (extractB)
+            {
+                copyIntersectFiles(rootPaths[1], *extractB, filesB, filesA);
+            }
         }
-        if (extractB)
-        {
-            copyIntersectFiles(rootB, *extractB, filesB, filesA);
-        }
-
-        std::vector<StatLine> stats = {
-            {"only-A-files:", onlyAFilesStr, "(" + onlyAFilesPct + " of A)"},
-            {"only-A-size:", onlyASizeStr, "(" + onlyASizePct + " of A)"},
-            {"both-A-files:", bothAFilesStr, "(" + bothAFilesPct + " of A)"},
-            {"both-A-size:", bothASizeStr, "(" + bothASizePct + " of A)"},
-            {"both-B-files:", bothBFilesStr, "(" + bothBFilesPct + " of B)"},
-            {"both-B-size:", bothBSizeStr, "(" + bothBSizePct + " of B)"},
-            {"only-B-files:", onlyBFilesStr, "(" + onlyBFilesPct + " of B)"},
-            {"only-B-size:", onlyBSizeStr, "(" + onlyBSizePct + " of B)"}
-        };
-
-        std::cout << "A: " << rootA.string() << "\n"
-                  << "B: " << rootB.string() << "\n";
-        printStatList(stats);
 
         size_t hashLen = 0;
         if (clVerbose > 0 && (listA || listB || listBoth))
@@ -735,15 +696,15 @@ public:
             hashLen = getUniqueHashHexLen();
         }
 
-        if (listA)
+        if (listA && rootPaths.size() == 2)
         {
             std::cout << "only-in-A:\n";
             if (clVerbose > 0)
             {
                 std::vector<FileRef> refs;
-                for (const auto& [key, listARefs] : filesA)
+                for (const auto& [key, listARefs] : rootFiles[0])
                 {
-                    if (filesB.find(key) != filesB.end())
+                    if (rootFiles[1].find(key) != rootFiles[1].end())
                     {
                         continue;
                     }
@@ -753,9 +714,9 @@ public:
             }
             else
             {
-                for (const auto& [key, listARefs] : filesA)
+                for (const auto& [key, listARefs] : rootFiles[0])
                 {
-                    if (filesB.find(key) != filesB.end())
+                    if (rootFiles[1].find(key) != rootFiles[1].end())
                     {
                         continue;
                     }
@@ -767,15 +728,15 @@ public:
             }
         }
 
-        if (listB)
+        if (listB && rootPaths.size() == 2)
         {
             std::cout << "only-in-B:\n";
             if (clVerbose > 0)
             {
                 std::vector<FileRef> refs;
-                for (const auto& [key, listBRefs] : filesB)
+                for (const auto& [key, listBRefs] : rootFiles[1])
                 {
-                    if (filesA.find(key) != filesA.end())
+                    if (rootFiles[0].find(key) != rootFiles[0].end())
                     {
                         continue;
                     }
@@ -785,9 +746,9 @@ public:
             }
             else
             {
-                for (const auto& [key, listBRefs] : filesB)
+                for (const auto& [key, listBRefs] : rootFiles[1])
                 {
-                    if (filesA.find(key) != filesA.end())
+                    if (rootFiles[0].find(key) != rootFiles[0].end())
                     {
                         continue;
                     }
@@ -799,16 +760,16 @@ public:
             }
         }
 
-        if (listBoth)
+        if (listBoth && rootPaths.size() == 2)
         {
             std::cout << "in-both:\n";
             if (clVerbose > 0)
             {
                 std::vector<FileRef> refs;
-                for (const auto& [key, listARefs] : filesA)
+                for (const auto& [key, listARefs] : rootFiles[0])
                 {
-                    auto itB = filesB.find(key);
-                    if (itB == filesB.end())
+                    auto itB = rootFiles[1].find(key);
+                    if (itB == rootFiles[1].end())
                     {
                         continue;
                     }
@@ -829,10 +790,10 @@ public:
             }
             else
             {
-                for (const auto& [key, listARefs] : filesA)
+                for (const auto& [key, listARefs] : rootFiles[0])
                 {
-                    auto itB = filesB.find(key);
-                    if (itB == filesB.end())
+                    auto itB = rootFiles[1].find(key);
+                    if (itB == rootFiles[1].end())
                     {
                         continue;
                     }
@@ -2011,7 +1972,7 @@ int main(int argc, char *argv[])
         "0.1.1");
 
     cl.addHeader("\nOptions:\n");
-    cl.addOption('i', "intersect", "Determine the intersection of dir A and dir B. Exactly two dirs must be specified when this option is specified. Print statistics (bytes/files) for files contained only in A, in both A and B or only in B.");
+    cl.addOption('i', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
     cl.addOption(' ', "list-a", "List files only in A when used with --intersect.");
@@ -2098,9 +2059,13 @@ int main(int argc, char *argv[])
 
             if (cl("intersect"))
             {
-                if (normalizedRoots.size() != 2)
+                if (normalizedRoots.size() < 2)
                 {
-                    cl.error("--intersect requires exactly two directories.");
+                    cl.error("--intersect requires at least two directories.");
+                }
+                if ((cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b")) && normalizedRoots.size() != 2)
+                {
+                    cl.error("--list-a/--list-b/--list-both/--extract-a/--extract-b require exactly two directories.");
                 }
                 std::optional<fs::path> extractA;
                 std::optional<fs::path> extractB;
@@ -2113,8 +2078,7 @@ int main(int argc, char *argv[])
                     extractB = normalizePath(cl.getStr("extract-b"));
                 }
                 mainDb.printIntersectStats(
-                    normalizedRoots[0],
-                    normalizedRoots[1],
+                    normalizedRoots,
                     cl("list-a"),
                     cl("list-b"),
                     cl("list-both"),
