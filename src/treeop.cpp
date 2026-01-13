@@ -138,6 +138,7 @@ public:
             NumFiles fileCount = 0;
             FileSize totalSize = 0;
             uint64_t totalDbSize = 0;
+            std::map<ContentKey, uint64_t> contentCounts;
             for (const auto& dir : dirs)
             {
                 if (!isPathWithin(root, dir.path))
@@ -149,16 +150,36 @@ public:
                 for (const auto& file : dir.files)
                 {
                     totalSize += file.size;
+                    ContentKey key{file.size, file.hash};
+                    contentCounts[key]++;
                 }
                 totalDbSize += dir.dbSize;
             }
 
+            uint64_t redundantFiles = 0;
+            uint64_t redundantSize = 0;
+            for (const auto& [key, count] : contentCounts)
+            {
+                if (count > 1)
+                {
+                    uint64_t extra = count - 1;
+                    redundantFiles += extra;
+                    redundantSize += extra * key.size;
+                }
+            }
+
             std::string percentStr = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * totalDbSize / totalSize));
+            std::string redundantFilesPct = formatPercentFixed(fileCount == 0 ? 0.0 : (100.0 * redundantFiles / fileCount));
+            std::string redundantSizePct = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * redundantSize / totalSize));
+            double dirdbBytesPerFile = (fileCount == 0) ? 0.0 : (double(totalDbSize) / double(fileCount));
             std::vector<StatLine> stats = {
                 {"files:", formatCountInt(fileCount), std::string()},
                 {"dirs:", formatCountInt(dirCount), std::string()},
                 {"total-size:", formatSizeFixed(totalSize), std::string()},
-                {"dirdb-size:", formatSizeFixed(totalDbSize) + " (" + percentStr + ")", std::string()}
+                {"redundant-files:", formatCountInt(redundantFiles), "(" + redundantFilesPct + ")"},
+                {"redundant-size:", formatSizeFixed(redundantSize), "(" + redundantSizePct + ")"},
+                {"dirdb-size:", formatSizeFixed(totalDbSize), "(" + percentStr + ")"},
+                {"dirdb-bytes-per-file:", formatSizeFixed(dirdbBytesPerFile, 1), std::string()}
             };
 
             std::cout << root.string() << "\n";
@@ -846,9 +867,9 @@ private:
         return rootIt == root.end();
     }
 
-    static std::string formatSizeFixed(uint64_t bytes)
+    static std::string formatSizeFixed(uint64_t bytes, unsigned precision = 3)
     {
-        static constexpr const char* units[] = {"B", "kB", "MB", "GB", "TB", "PB", "EB"};
+        static constexpr const char* units[] = {"bytes", "kB", "MB", "GB", "TB", "PB", "EB"};
         if (bytes == 0)
         {
             return "0";
@@ -869,8 +890,29 @@ private:
         }
         else
         {
-            os << std::fixed << std::setprecision(3) << value << " " << units[unitIndex];
+            os << std::fixed << std::setprecision(precision) << value << " " << units[unitIndex];
         }
+        return os.str();
+    }
+
+    static std::string formatSizeFixed(double bytes, unsigned precision = 3)
+    {
+        if (bytes <= 0.0)
+        {
+            return "0";
+        }
+        uint64_t whole = static_cast<uint64_t>(bytes);
+        static constexpr const char* units[] = {"bytes", "kB", "MB", "GB", "TB", "PB", "EB"};
+        double value = bytes;
+        size_t unitIndex = 0;
+        while (whole >= 1024 && unitIndex + 1 < std::size(units))
+        {
+            whole >>= 10;
+            value /= 1024.0;
+            unitIndex++;
+        }
+        std::ostringstream os;
+        os << std::fixed << std::setprecision(precision) << value << " " << units[unitIndex];
         return os.str();
     }
 
