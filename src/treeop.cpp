@@ -300,12 +300,12 @@ static ProgressTracker* gProgress = nullptr;
 /// uint64_t date; // In FILETIME format, 100ns since January 1, 1601, UTC, unsigned (Range until around year 30828).
 /// uint64_t numLinks; // Number of hardlinks.
 
-struct DirDbFileEntry
+struct FileEntry
 {
-    std::string name;
+    std::string path;
     FileSize size{};
     Hash128 hash{};
-    uint64_t inodeNumber{};
+    uint64_t inode{};
     uint64_t date{}; // FILETIME ticks (100ns since 1601-01-01 UTC).
     uint64_t numLinks{};
 };
@@ -313,7 +313,7 @@ struct DirDbFileEntry
 struct DirDbData
 {
     fs::path path;
-    std::vector<DirDbFileEntry> files;
+    std::vector<FileEntry> files;
     uint64_t dbSize{};
     uint64_t hashedBytes{};
     double hashSeconds{};
@@ -441,16 +441,16 @@ public:
     void listFiles() const
     {
         size_t hashLen = getUniqueHashHexLen();
-        std::vector<FileRef> refs;
+        std::vector<FileEntry> refs;
         for (const auto& dir : dirs)
         {
             for (const auto& file : dir.files)
             {
-                refs.push_back(FileRef{
-                    (dir.path / file.name).string(),
+                refs.push_back(FileEntry{
+                    (dir.path / file.path).string(),
                     file.size,
                     file.hash,
-                    file.inodeNumber,
+                    file.inode,
                     file.date,
                     file.numLinks
                 });
@@ -610,7 +610,7 @@ public:
     void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listA, bool listB, bool listBoth,
         const fs::path* extractA, const fs::path* extractB, bool removeCopies, bool dryRun) const
     {
-        std::vector<std::map<ContentKey, std::vector<FileRef>>> rootFiles(rootPaths.size());
+        std::vector<std::map<ContentKey, std::vector<FileEntry>>> rootFiles(rootPaths.size());
         std::map<ContentKey, size_t> rootsWithKey;
 
         for (const auto& dir : dirs)
@@ -624,7 +624,7 @@ public:
                 for (const auto& file : dir.files)
                 {
                     ContentKey key{file.size, file.hash};
-                    rootFiles[i][key].push_back(FileRef{(dir.path / file.name).string(), file.size, file.hash, file.inodeNumber, file.date, file.numLinks});
+                    rootFiles[i][key].push_back(FileEntry{(dir.path / file.path).string(), file.size, file.hash, file.inode, file.date, file.numLinks});
                 }
             }
         }
@@ -761,7 +761,7 @@ public:
             std::cout << "only-in-A:\n";
             if (clVerbose > 0)
             {
-                std::vector<FileRef> refs;
+                std::vector<FileEntry> refs;
                 for (const auto& [key, listARefs] : rootFiles[0])
                 {
                     if (rootFiles[1].find(key) != rootFiles[1].end())
@@ -793,7 +793,7 @@ public:
             std::cout << "only-in-B:\n";
             if (clVerbose > 0)
             {
-                std::vector<FileRef> refs;
+                std::vector<FileEntry> refs;
                 for (const auto& [key, listBRefs] : rootFiles[1])
                 {
                     if (rootFiles[0].find(key) != rootFiles[0].end())
@@ -825,7 +825,7 @@ public:
             std::cout << "in-both:\n";
             if (clVerbose > 0)
             {
-                std::vector<FileRef> refs;
+                std::vector<FileEntry> refs;
                 for (const auto& [key, listARefs] : rootFiles[0])
                 {
                     auto itB = rootFiles[1].find(key);
@@ -835,13 +835,13 @@ public:
                     }
                     for (const auto& ref : listARefs)
                     {
-                        FileRef labeled = ref;
+                        FileEntry labeled = ref;
                         labeled.path = "A: " + labeled.path;
                         refs.push_back(std::move(labeled));
                     }
                     for (const auto& ref : itB->second)
                     {
-                        FileRef labeled = ref;
+                        FileEntry labeled = ref;
                         labeled.path = "B: " + labeled.path;
                         refs.push_back(std::move(labeled));
                     }
@@ -895,7 +895,7 @@ public:
     /// Replace duplicate files with hardlinks to the oldest file.
     HardlinkStats hardlinkCopies(uint64_t minSize, uint64_t maxHardlinks, bool dryRun) const
     {
-        std::map<ContentKey, std::vector<FileRef>> contentFiles;
+        std::map<ContentKey, std::vector<FileEntry>> contentFiles;
         for (const auto& dir : dirs)
         {
             for (const auto& file : dir.files)
@@ -905,11 +905,11 @@ public:
                     continue;
                 }
                 ContentKey key{file.size, file.hash};
-                contentFiles[key].push_back(FileRef{
-                    (dir.path / file.name).string(),
+                contentFiles[key].push_back(FileEntry{
+                    (dir.path / file.path).string(),
                     file.size,
                     file.hash,
-                    file.inodeNumber,
+                    file.inode,
                     file.date,
                     file.numLinks
                 });
@@ -925,7 +925,7 @@ public:
                 continue;
             }
             auto oldestIt = std::min_element(files.begin(), files.end(),
-                [](const FileRef& a, const FileRef& b)
+                [](const FileEntry& a, const FileEntry& b)
                 {
                     if (a.date != b.date)
                     {
@@ -937,7 +937,7 @@ public:
             {
                 continue;
             }
-            const FileRef& oldest = *oldestIt;
+            const FileEntry& oldest = *oldestIt;
             fs::path oldestPath(oldest.path);
             uint64_t linkCount = oldest.numLinks;
             if (!dryRun)
@@ -1022,16 +1022,6 @@ public:
     }
 
 private:
-    struct FileRef
-    {
-        std::string path;
-        uint64_t size{};
-        Hash128 hash{};
-        uint64_t inode{};
-        uint64_t date{}; // FILETIME ticks (100ns since 1601-01-01 UTC).
-        uint64_t numLinks{};
-    };
-
     struct ContentKey
     {
         uint64_t size{};
@@ -1055,7 +1045,7 @@ private:
     };
 
     /// Print rows for file listings with aligned columns.
-    static void printListRows(const std::vector<FileRef>& refs, bool showInodeLinks, size_t hashLen)
+    static void printListRows(const std::vector<FileEntry>& refs, bool showInodeLinks, size_t hashLen)
     {
         struct Row
         {
@@ -1172,8 +1162,8 @@ private:
 
     /// Copy files that exist only in the source root.
     static void copyIntersectFiles(const fs::path& rootSrc, const fs::path& destRoot,
-        const std::map<ContentKey, std::vector<FileRef>>& filesSrc,
-        const std::map<ContentKey, std::vector<FileRef>>& filesOther,
+        const std::map<ContentKey, std::vector<FileEntry>>& filesSrc,
+        const std::map<ContentKey, std::vector<FileEntry>>& filesOther,
         bool dryRun)
     {
         if (fs::exists(destRoot))
@@ -1217,7 +1207,7 @@ private:
     }
 
     /// Remove duplicate files from later roots, keeping earliest roots.
-    static std::pair<uint64_t, uint64_t> removeCopyFiles(const std::vector<std::map<ContentKey, std::vector<FileRef>>>& rootFiles, bool dryRun)
+    static std::pair<uint64_t, uint64_t> removeCopyFiles(const std::vector<std::map<ContentKey, std::vector<FileEntry>>>& rootFiles, bool dryRun)
     {
         std::map<ContentKey, size_t> firstRoot;
         uint64_t removedFiles = 0;
@@ -1859,7 +1849,7 @@ static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true)
     {
         uint64_t nameIndex;
         Hash128 hash;
-        uint64_t inodeNumber;
+        uint64_t inode;
         uint64_t date; // FILETIME ticks (100ns since 1601-01-01 UTC).
         uint64_t numLinks;
     };
@@ -1871,7 +1861,7 @@ static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true)
         entry.nameIndex = readU64Le(data, size, pos, "nameIndex");
         entry.hash.lo = readU64Le(data, size, pos, "hashLo");
         entry.hash.hi = readU64Le(data, size, pos, "hashHi");
-        entry.inodeNumber = readU64Le(data, size, pos, "inodeNumber");
+        entry.inode = readU64Le(data, size, pos, "inodeNumber");
         entry.date = readU64Le(data, size, pos, "date");
         entry.numLinks = readU64Le(data, size, pos, "numLinks");
         size_t expectedEnd = entryStart + static_cast<size_t>(fileEntrySize);
@@ -1929,11 +1919,11 @@ static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true)
         {
             throw std::runtime_error("Invalid name index in " + dbPath.string());
         }
-        DirDbFileEntry entry;
-        entry.name = readLengthStringAt(strings, static_cast<size_t>(rawEntry.nameIndex));
+        FileEntry entry;
+        entry.path = readLengthStringAt(strings, static_cast<size_t>(rawEntry.nameIndex));
         entry.size = sizes[i];
         entry.hash = rawEntry.hash;
-        entry.inodeNumber = rawEntry.inodeNumber;
+        entry.inode = rawEntry.inode;
         entry.date = rawEntry.date;
         entry.numLinks = rawEntry.numLinks;
         dirData.files.push_back(std::move(entry));
@@ -1982,7 +1972,7 @@ struct HashReuseKeyHasher
 };
 
 /// Scan a directory and build a new .dirdb file, reusing hashes when possible.
-static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<HashReuseKey, DirDbFileEntry, HashReuseKeyHasher>* cache)
+static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<HashReuseKey, FileEntry, HashReuseKeyHasher>* cache)
 {
     if (clVerbose > 0)
     {
@@ -1993,17 +1983,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         gProgress->onDirStart(dirPath);
     }
 
-    struct ScanEntry
-    {
-        std::string name;
-        FileSize size;
-        Hash128 hash;
-        uint64_t inodeNumber;
-        uint64_t date; // FILETIME ticks (100ns since 1601-01-01 UTC).
-        uint64_t numLinks;
-    };
-
-    std::vector<ScanEntry> entries;
+    std::vector<FileEntry> entries;
     uint64_t hashedBytes = 0;
     double hashSeconds = 0.0;
     std::error_code ec;
@@ -2048,11 +2028,11 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
             hashedBytes += size;
             hashSeconds += seconds;
         }
-        ScanEntry scan;
-        scan.name = entry.path().filename().string();
+        FileEntry scan;
+        scan.path = entry.path().filename().string();
         scan.size = size;
         scan.hash = hash;
-        scan.inodeNumber = static_cast<uint64_t>(statInfo.getIno());
+        scan.inode = static_cast<uint64_t>(statInfo.getIno());
         scan.date = date;
         scan.numLinks = static_cast<uint64_t>(statInfo.statData.st_nlink);
         entries.push_back(std::move(scan));
@@ -2066,13 +2046,13 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         gProgress->onDirDone();
     }
 
-    std::sort(entries.begin(), entries.end(), [](const ScanEntry& a, const ScanEntry& b)
+    std::sort(entries.begin(), entries.end(), [](const FileEntry& a, const FileEntry& b)
     {
         if (a.size != b.size)
         {
             return a.size < b.size;
         }
-        return a.name < b.name;
+        return a.path < b.path;
     });
 
     struct TocEntry { uint64_t size; uint64_t fileIndex; };
@@ -2093,7 +2073,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     {
         uint64_t nameIndex;
         Hash128 hash;
-        uint64_t inodeNumber;
+        uint64_t inode;
         uint64_t date; // FILETIME ticks (100ns since 1601-01-01 UTC).
         uint64_t numLinks;
     };
@@ -2102,9 +2082,9 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     {
         RawFileEntry raw{};
         raw.nameIndex = stringData.size();
-        appendLengthString(stringData, entry.name);
+        appendLengthString(stringData, entry.path);
         raw.hash = entry.hash;
-        raw.inodeNumber = entry.inodeNumber;
+        raw.inode = entry.inode;
         raw.date = entry.date;
         raw.numLinks = entry.numLinks;
         rawEntries.push_back(raw);
@@ -2129,7 +2109,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         appendU64Le(out, raw.nameIndex);
         appendU64Le(out, raw.hash.lo);
         appendU64Le(out, raw.hash.hi);
-        appendU64Le(out, raw.inodeNumber);
+        appendU64Le(out, raw.inode);
         appendU64Le(out, raw.date);
         appendU64Le(out, raw.numLinks);
     }
@@ -2148,11 +2128,11 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     dirData.hashSeconds = hashSeconds;
     for (const auto& entry : entries)
     {
-        DirDbFileEntry file;
-        file.name = entry.name;
+        FileEntry file;
+        file.path = entry.path;
         file.size = entry.size;
         file.hash = entry.hash;
-        file.inodeNumber = entry.inodeNumber;
+        file.inode = entry.inode;
         file.date = entry.date;
         file.numLinks = entry.numLinks;
         dirData.files.push_back(std::move(file));
@@ -2170,10 +2150,10 @@ static DirDbData createDirDb(const fs::path& dirPath)
 static DirDbData updateDirDb(const fs::path& dirPath)
 {
     DirDbData existing = readDirDb(dirPath, false);
-    std::unordered_map<HashReuseKey, DirDbFileEntry, HashReuseKeyHasher> cache;
+    std::unordered_map<HashReuseKey, FileEntry, HashReuseKeyHasher> cache;
     for (const auto& entry : existing.files)
     {
-        HashReuseKey key{entry.inodeNumber, entry.size, entry.date};
+        HashReuseKey key{entry.inode, entry.size, entry.date};
         cache.emplace(std::move(key), entry);
     }
     return buildDirDb(dirPath, &cache);
