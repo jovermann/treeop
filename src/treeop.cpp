@@ -6,6 +6,7 @@
 // (See accompanying file LICENSE or copy at https://www.boost.org/LICENSE_1_0.txt)
 
 #include "MiscUtils.hpp"
+#include "UnitTest.hpp"
 #include "CommandLineParser.hpp"
 #include "Hash.hpp"
 #include "HashSha3.hpp"
@@ -1992,6 +1993,9 @@ static void removeDirDbTree(const fs::path& root, bool dryRun)
 /// Main.
 int main(int argc, char *argv[])
 {
+    // Run unit tests and exit if enabled at compile time.
+    UNIT_TEST_RUN();
+
     // Command line options.
     const char *usage = "Operations on huge directory trees.\n"
                         "\n"
@@ -2041,6 +2045,11 @@ int main(int argc, char *argv[])
 
     try
     {
+        if (cl.getArgs().empty())
+        {
+            cl.error("Please specify at least one directory.");
+        }
+
         // Check all args to avoid late errors.
         for (const std::string& path : cl.getArgs())
         {

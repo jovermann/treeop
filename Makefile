@@ -35,10 +35,17 @@ clean:
 	rm -rf build $(TARGET) unit_test
 	find . -name '*~' -delete
 
+uint_test: clean
+unit_test: CPPFLAGS += -D ENABLE_UNIT_TEST
+unit_test: CXXFLAGS += -Wno-weak-vtables -Wno-missing-variable-declarations -Wno-exit-time-destructors -Wno-global-constructors
+unit_test: $(OBJECTS)
+	$(CXX) $^ -o $@
+	./unit_test
+
 test: $(TARGET)
 	pytest -v
 
-.PHONY: clean default test
+.PHONY: clean default unit_test test
 
 ifeq ($(findstring $(MAKECMDGOALS),clean),)
 -include $(DEPENDS)

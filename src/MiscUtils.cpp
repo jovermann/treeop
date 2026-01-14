@@ -15,12 +15,7 @@
 #include <sys/disk.h> // for DKIOCGETBLOCKCOUNT and DKIOCGETBLOCKSIZE
 #endif
 #include "MiscUtils.hpp"
-#ifdef ENABLE_UNIT_TEST
 #include "UnitTest.hpp"
-#else
-# define UNIT_TEST(name) class UnitTest_##name { void run(); }; inline void UnitTest_##name::run()
-# define ASSERT_EQ(a, b)
-#endif
 #include <iostream>
 #include <chrono>
 #include <format>
