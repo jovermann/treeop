@@ -45,6 +45,7 @@ struct Hash128
 {
     uint64_t hi{};
     uint64_t lo{};
+    /// Compare hashes for ordering.
     bool operator<(const Hash128& other) const
     {
         if (hi != other.hi)
@@ -53,10 +54,12 @@ struct Hash128
         }
         return lo < other.lo;
     }
+    /// Compare hashes for equality.
     bool operator==(const Hash128& other) const
     {
         return hi == other.hi && lo == other.lo;
     }
+    /// Format the hash as a hex string (low then high).
     std::string toHex() const
     {
         std::ostringstream os;
@@ -69,9 +72,11 @@ struct Hash128
 class ProgressTracker
 {
 public:
+    /// Initialize progress tracking with width and linefeed mode.
     explicit ProgressTracker(size_t maxWidth_ = 199, bool linefeed_ = false)
         : startTime(ut1::getTimeSec()), lastPrintTime(startTime), maxWidth(maxWidth_), linefeed(linefeed_) {}
 
+    /// Note that directory processing started.
     void onDirStart(const fs::path& dirPath)
     {
         if (!hashing)
@@ -81,12 +86,14 @@ public:
         tick();
     }
 
+    /// Note that one directory finished.
     void onDirDone()
     {
         dirs++;
         tick();
     }
 
+    /// Add a completed directory summary without per-file callbacks.
     void addDirSummary(uint64_t fileCount, uint64_t totalBytes)
     {
         dirs++;
@@ -95,6 +102,7 @@ public:
         tick();
     }
 
+    /// Note that a file was processed.
     void onFileProcessed(uint64_t size)
     {
         files++;
@@ -102,6 +110,7 @@ public:
         tick();
     }
 
+    /// Begin tracking hashing of a file.
     void onHashStart(const fs::path& filePath, uint64_t fileSize)
     {
         hashing = true;
@@ -111,6 +120,7 @@ public:
         tick();
     }
 
+    /// Update hashing progress for the current file.
     void onHashProgress(uint64_t bytesRead)
     {
         hashedBytes += bytesRead;
@@ -118,6 +128,7 @@ public:
         tick();
     }
 
+    /// End tracking hashing of a file.
     void onHashEnd()
     {
         hashing = false;
@@ -127,6 +138,7 @@ public:
         tick();
     }
 
+    /// Clear the progress line and finish output.
     void finish()
     {
         if (lastLineLen > 0)
@@ -138,6 +150,7 @@ public:
     }
 
 private:
+    /// Print an updated progress line once per second.
     void tick()
     {
         double now = ut1::getTimeSec();
@@ -149,6 +162,7 @@ private:
         printLine(now);
     }
 
+    /// Render one progress line based on current state.
     void printLine(double now)
     {
         double elapsed = now - startTime;
@@ -196,6 +210,7 @@ private:
         }
     }
 
+    /// Compute available path length for the progress line.
     size_t availablePathLen(size_t prefixLen, size_t extraLen) const
     {
         size_t used = prefixLen + 1;
@@ -210,6 +225,7 @@ private:
         return maxWidth - used;
     }
 
+    /// Abbreviate a path to fit within the given length.
     static std::string abbreviatePath(const std::string& path, size_t maxLen)
     {
         if (maxLen == 0)
@@ -290,7 +306,7 @@ struct DirDbFileEntry
     FileSize size{};
     Hash128 hash{};
     uint64_t inodeNumber{};
-    uint64_t date{};
+    uint64_t date{}; // FILETIME ticks (100ns since 1601-01-01 UTC).
     uint64_t numLinks{};
 };
 
@@ -316,6 +332,7 @@ public:
         double elapsedSeconds{};
     };
 
+    /// Initialize the database with a list of root directories.
     explicit MainDb(std::vector<fs::path> rootDirs)
     {
         for (auto& path : rootDirs)
@@ -324,11 +341,13 @@ public:
         }
     }
 
+    /// Add directory data to the main database.
     void addDir(DirDbData dir)
     {
         dirs.push_back(std::move(dir));
     }
 
+    /// Load or create .dirdb files for all roots and record elapsed time.
     void processRoots(bool forceCreate, bool update)
     {
         for (auto& rootData : roots)
@@ -339,6 +358,7 @@ public:
         }
     }
 
+    /// Print per-root statistics.
     void printStats() const
     {
         for (const auto& rootData : roots)
@@ -417,6 +437,7 @@ public:
         }
     }
 
+    /// List all files with stored metadata.
     void listFiles() const
     {
         size_t hashLen = getUniqueHashHexLen();
@@ -438,6 +459,7 @@ public:
         printListRows(refs, clVerbose > 1, hashLen);
     }
 
+    /// Print a size histogram over all files.
     void printSizeHistogram(uint64_t batchSize, uint64_t maxSizeLimit, bool hasMaxSize) const
     {
         if (batchSize == 0)
@@ -584,6 +606,7 @@ public:
         }
     }
 
+    /// Print intersect stats and optional file lists/extractions.
     void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listA, bool listB, bool listBoth,
         const fs::path* extractA, const fs::path* extractB, bool removeCopies, bool dryRun) const
     {
@@ -847,6 +870,7 @@ public:
         }
     }
 
+    /// Print the minimum hash length needed to distinguish distinct contents.
     void printUniqueHashLen() const
     {
         std::vector<Hash128> hashes;
@@ -861,6 +885,142 @@ public:
         std::cout << "unique-hash-len: " << minBits << "\n";
     }
 
+    struct HardlinkStats
+    {
+        uint64_t createdLinks{};
+        uint64_t removedFiles{};
+        uint64_t removedBytes{};
+    };
+
+    /// Replace duplicate files with hardlinks to the oldest file.
+    HardlinkStats hardlinkCopies(uint64_t minSize, uint64_t maxHardlinks, bool dryRun) const
+    {
+        std::map<ContentKey, std::vector<FileRef>> contentFiles;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                if (file.size < minSize)
+                {
+                    continue;
+                }
+                ContentKey key{file.size, file.hash};
+                contentFiles[key].push_back(FileRef{
+                    (dir.path / file.name).string(),
+                    file.size,
+                    file.hash,
+                    file.inodeNumber,
+                    file.date,
+                    file.numLinks
+                });
+            }
+        }
+
+        HardlinkStats stats;
+        std::set<fs::path> touchedDirs;
+        for (const auto& [key, files] : contentFiles)
+        {
+            if (files.size() < 2)
+            {
+                continue;
+            }
+            auto oldestIt = std::min_element(files.begin(), files.end(),
+                [](const FileRef& a, const FileRef& b)
+                {
+                    if (a.date != b.date)
+                    {
+                        return a.date < b.date;
+                    }
+                    return a.path < b.path;
+                });
+            if (oldestIt == files.end())
+            {
+                continue;
+            }
+            const FileRef& oldest = *oldestIt;
+            fs::path oldestPath(oldest.path);
+            uint64_t linkCount = oldest.numLinks;
+            if (!dryRun)
+            {
+                std::error_code ec;
+                uint64_t currentLinks = fs::hard_link_count(oldestPath, ec);
+                if (!ec)
+                {
+                    linkCount = currentLinks;
+                }
+                else if (clVerbose)
+                {
+                    std::cerr << "Warning: Failed to read hardlink count for " << oldestPath.string()
+                              << ": " << ec.message() << "\n";
+                }
+            }
+            if (linkCount >= maxHardlinks)
+            {
+                std::cerr << "Warning: " << oldestPath.string() << " has " << linkCount
+                          << " hardlinks (>= " << maxHardlinks << "), skipping.\n";
+                continue;
+            }
+
+            for (const auto& ref : files)
+            {
+                if (ref.path == oldest.path)
+                {
+                    continue;
+                }
+                if (ref.inode == oldest.inode)
+                {
+                    continue;
+                }
+                if (dryRun)
+                {
+                    std::cout << "Would hardlink " << ref.path << " -> " << oldest.path << "\n";
+                }
+                else
+                {
+                    std::string errorMsg;
+                    if (!replaceWithHardlink(oldestPath, fs::path(ref.path), &errorMsg))
+                    {
+                        std::cerr << "Warning: " << errorMsg << "\n";
+                        continue;
+                    }
+                    if (clVerbose)
+                    {
+                        std::cout << "Hardlinked " << ref.path << " -> " << oldest.path << "\n";
+                    }
+                    touchedDirs.insert(oldestPath.parent_path());
+                    touchedDirs.insert(fs::path(ref.path).parent_path());
+                }
+                stats.createdLinks++;
+                stats.removedFiles++;
+                stats.removedBytes += ref.size;
+            }
+        }
+
+        if (!dryRun)
+        {
+            for (const auto& dirPath : touchedDirs)
+            {
+                if (ut1::fsExists(dirPath / ".dirdb"))
+                {
+                    updateDirDb(dirPath);
+                }
+            }
+        }
+
+        return stats;
+    }
+
+    /// Print hardlink operation statistics.
+    void printHardlinkStats(const HardlinkStats& stats) const
+    {
+        std::vector<StatLine> lines = {
+            {"hardlinks-created:", formatCountInt(stats.createdLinks), std::string()},
+            {"removed-files:", formatCountInt(stats.removedFiles), std::string()},
+            {"removed-bytes:", ut1::getApproxSizeStr(stats.removedBytes, 3, true, false), std::string()}
+        };
+        printStatList(lines);
+    }
+
 private:
     struct FileRef
     {
@@ -868,7 +1028,7 @@ private:
         uint64_t size{};
         Hash128 hash{};
         uint64_t inode{};
-        uint64_t date{};
+        uint64_t date{}; // FILETIME ticks (100ns since 1601-01-01 UTC).
         uint64_t numLinks{};
     };
 
@@ -876,6 +1036,7 @@ private:
     {
         uint64_t size{};
         Hash128 hash{};
+        /// Order by size then hash.
         bool operator<(const ContentKey& other) const
         {
             if (size != other.size)
@@ -893,6 +1054,7 @@ private:
         std::string extra;
     };
 
+    /// Print rows for file listings with aligned columns.
     static void printListRows(const std::vector<FileRef>& refs, bool showInodeLinks, size_t hashLen)
     {
         struct Row
@@ -952,6 +1114,7 @@ private:
         }
     }
 
+    /// Print aligned statistics lines.
     static void printStatList(const std::vector<StatLine>& lines)
     {
         size_t labelWidth = 0;
@@ -1007,6 +1170,7 @@ private:
         }
     }
 
+    /// Copy files that exist only in the source root.
     static void copyIntersectFiles(const fs::path& rootSrc, const fs::path& destRoot,
         const std::map<ContentKey, std::vector<FileRef>>& filesSrc,
         const std::map<ContentKey, std::vector<FileRef>>& filesOther,
@@ -1052,6 +1216,7 @@ private:
         }
     }
 
+    /// Remove duplicate files from later roots, keeping earliest roots.
     static std::pair<uint64_t, uint64_t> removeCopyFiles(const std::vector<std::map<ContentKey, std::vector<FileRef>>>& rootFiles, bool dryRun)
     {
         std::map<ContentKey, size_t> firstRoot;
@@ -1110,6 +1275,64 @@ private:
         return {removedFiles, removedBytes};
     }
 
+    /// Replace a file with a hardlink to the source using a temporary path.
+    static bool replaceWithHardlink(const fs::path& source, const fs::path& target, std::string* errorMsg)
+    {
+        std::error_code ec;
+        fs::path temp;
+        for (int i = 0; i < 100; i++)
+        {
+            temp = target;
+            temp += ".treeop_link_tmp";
+            if (i > 0)
+            {
+                temp += ut1::toStr(i);
+            }
+            if (!fs::exists(temp, ec))
+            {
+                break;
+            }
+        }
+        if (fs::exists(temp, ec))
+        {
+            if (errorMsg)
+            {
+                *errorMsg = "No temporary path available for " + target.string();
+            }
+            return false;
+        }
+
+        fs::create_hard_link(source, temp, ec);
+        if (ec)
+        {
+            if (errorMsg)
+            {
+                *errorMsg = "Failed to create hardlink for " + target.string() + ": " + ec.message();
+            }
+            return false;
+        }
+
+        fs::rename(temp, target, ec);
+        if (ec)
+        {
+            std::error_code rmEc;
+            fs::remove(target, rmEc);
+            fs::rename(temp, target, ec);
+        }
+        if (ec)
+        {
+            std::error_code rmEc;
+            fs::remove(temp, rmEc);
+            if (errorMsg)
+            {
+                *errorMsg = "Failed to replace " + target.string() + ": " + ec.message();
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /// Walk a directory tree and load or create .dirdb files.
     void processDirTree(const fs::path& root, bool forceCreate, bool update)
     {
         addDir(loadOrCreateDirDb(root, forceCreate, update));
@@ -1140,6 +1363,7 @@ private:
         }
     }
 
+    /// Compute the minimal hex prefix length to distinguish all hashes.
     size_t getUniqueHashHexLen() const
     {
         std::vector<Hash128> hashes;
@@ -1163,6 +1387,7 @@ private:
         return nibbles;
     }
 
+    /// Compute the minimum number of hash bits needed to distinguish values.
     static size_t getMinUniqueHashBits(std::vector<Hash128> hashes)
     {
         if (hashes.size() <= 1)
@@ -1199,6 +1424,7 @@ private:
         return std::min<size_t>(128, maxCommonPrefix + 1);
     }
 
+    /// Check if a path is within a root path.
     static bool isPathWithin(const fs::path& root, const fs::path& path)
     {
         auto rootIt = root.begin();
@@ -1213,6 +1439,7 @@ private:
         return rootIt == root.end();
     }
 
+    /// Format a percentage with one decimal place.
     static std::string formatPercentFixed(double percent)
     {
         std::ostringstream os;
@@ -1220,11 +1447,13 @@ private:
         return os.str();
     }
 
+    /// Format an integer count as a string.
     static std::string formatCountInt(uint64_t count)
     {
         return ut1::toStr(count);
     }
 
+    /// Return the decimal point column within a numeric string.
     static size_t getDecimalPos(const std::string& value)
     {
         size_t pos = value.find('.');
@@ -1235,6 +1464,7 @@ private:
         return pos;
     }
 
+    /// Return decimal position for stat values with optional suffix.
     static size_t getStatDecimalPos(const std::string& value)
     {
         size_t end = value.find(' ');
@@ -1245,6 +1475,7 @@ private:
         return (pos == std::string::npos) ? number.size() : pos;
     }
 
+    /// Align stat values on their decimal point.
     static std::string formatAlignedStatValue(const std::string& value, size_t labelWidth, size_t decimalCol)
     {
         size_t decimalPos = getStatDecimalPos(value);
@@ -1253,6 +1484,7 @@ private:
         return std::string(padding, ' ') + value;
     }
 
+    /// Pad a string on the right to a width.
     static std::string padRight(const std::string& value, size_t width)
     {
         if (value.size() >= width)
@@ -1262,6 +1494,7 @@ private:
         return value + std::string(width - value.size(), ' ');
     }
 
+    /// Pad a string on the left to a width.
     static std::string padLeft(const std::string& value, size_t width)
     {
         if (value.size() >= width)
@@ -1271,6 +1504,7 @@ private:
         return std::string(width - value.size(), ' ') + value;
     }
 
+    /// Align a numeric string to a given decimal column.
     static std::string alignDecimalTo(const std::string& value, size_t decimalPos)
     {
         size_t pos = getDecimalPos(value);
@@ -1281,6 +1515,7 @@ private:
         return std::string(decimalPos - pos, ' ') + value;
     }
 
+    /// Split a size string into number and suffix.
     static std::pair<std::string, std::string> splitSizeStr(const std::string& value)
     {
         size_t sep = value.rfind(' ');
@@ -1291,6 +1526,7 @@ private:
         return {value.substr(0, sep), value.substr(sep + 1)};
     }
 
+    /// Align a size string on its decimal and suffix columns.
     static std::string formatSizeAligned(const std::string& value, size_t decimalPos, size_t suffixWidth)
     {
         auto [numberStr, suffixStr] = splitSizeStr(value);
@@ -1303,12 +1539,14 @@ private:
         return numberStr + " " + suffixStr;
     }
 
+    /// Format one histogram boundary with the selected unit.
     static std::string formatHistogramBoundary(uint64_t value, uint64_t unitFactor, const std::string& unitLabel, size_t numberWidth)
     {
         std::string number = ut1::toStr(value / unitFactor);
         return padLeft(number, numberWidth) + " " + unitLabel;
     }
 
+    /// Format FILETIME ticks (100ns since 1601-01-01 UTC) into a UTC timestamp.
     static std::string formatFileTime(uint64_t fileTime)
     {
         if (fileTime == 0)
@@ -1329,6 +1567,11 @@ private:
 #endif
         std::ostringstream os;
         os << std::put_time(&tm, "%Y-%m-%d %H:%M:%S");
+        if (clVerbose >= 3)
+        {
+            uint64_t micro = (fileTime / 10ULL) % 1000000ULL;
+            os << "." << std::setw(6) << std::setfill('0') << micro;
+        }
         return os.str();
     }
 
@@ -1336,6 +1579,7 @@ private:
     std::vector<DirDbData> dirs;
 };
 
+/// Normalize a path for consistent comparisons.
 static fs::path normalizePath(const fs::path& path)
 {
     std::error_code ec;
@@ -1357,6 +1601,7 @@ static fs::path normalizePath(const fs::path& path)
     return normalized;
 }
 
+/// Create a little-endian 8-byte tag value.
 static uint64_t makeTag(const char* tag)
 {
     uint64_t value = 0;
@@ -1367,6 +1612,7 @@ static uint64_t makeTag(const char* tag)
     return value;
 }
 
+/// Append a uint64_t in little-endian order.
 static void appendU64Le(std::vector<uint8_t>& out, uint64_t value)
 {
     for (size_t i = 0; i < 8; i++)
@@ -1376,6 +1622,7 @@ static void appendU64Le(std::vector<uint8_t>& out, uint64_t value)
     }
 }
 
+/// Read a uint64_t from a byte buffer in little-endian order.
 static uint64_t readU64Le(const uint8_t* data, size_t size, size_t& offset, const char* what)
 {
     if (offset + 8 > size)
@@ -1391,6 +1638,7 @@ static uint64_t readU64Le(const uint8_t* data, size_t size, size_t& offset, cons
     return value;
 }
 
+/// Append a length-prefixed string to a byte buffer.
 static void appendLengthString(std::vector<uint8_t>& out, const std::string& s)
 {
     size_t len = s.size();
@@ -1423,6 +1671,7 @@ static void appendLengthString(std::vector<uint8_t>& out, const std::string& s)
     out.insert(out.end(), s.begin(), s.end());
 }
 
+/// Read a length-prefixed string from a byte buffer.
 static std::string readLengthStringAt(const std::vector<uint8_t>& data, size_t offset)
 {
     if (offset >= data.size())
@@ -1495,6 +1744,7 @@ static uint64_t fileTimeFromTimespec(const timespec& ts)
     return ft;
 }
 
+/// Hash a file into a 128-bit value and optionally report time spent.
 static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* secondsOut)
 {
     HashSha3_128 hasher;
@@ -1546,6 +1796,7 @@ static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* seco
     return Hash128{hi, lo};
 }
 
+/// Read a .dirdb file for a directory and return its contents.
 static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true)
 {
     fs::path dbPath = dirPath / ".dirdb";
@@ -1609,7 +1860,7 @@ static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true)
         uint64_t nameIndex;
         Hash128 hash;
         uint64_t inodeNumber;
-        uint64_t date;
+        uint64_t date; // FILETIME ticks (100ns since 1601-01-01 UTC).
         uint64_t numLinks;
     };
     std::vector<RawFileEntry> rawEntries;
@@ -1706,8 +1957,9 @@ struct HashReuseKey
 {
     uint64_t inode{};
     uint64_t size{};
-    uint64_t date{};
+    uint64_t date{}; // FILETIME ticks (100ns since 1601-01-01 UTC).
 
+    /// Compare cache keys for reuse.
     bool operator==(const HashReuseKey& other) const
     {
         return inode == other.inode && size == other.size && date == other.date;
@@ -1716,6 +1968,7 @@ struct HashReuseKey
 
 struct HashReuseKeyHasher
 {
+    /// Hash a cache key for unordered_map lookups.
     size_t operator()(const HashReuseKey& key) const
     {
         size_t h1 = std::hash<uint64_t>{}(key.inode);
@@ -1728,6 +1981,7 @@ struct HashReuseKeyHasher
     }
 };
 
+/// Scan a directory and build a new .dirdb file, reusing hashes when possible.
 static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<HashReuseKey, DirDbFileEntry, HashReuseKeyHasher>* cache)
 {
     if (clVerbose > 0)
@@ -1745,7 +1999,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         FileSize size;
         Hash128 hash;
         uint64_t inodeNumber;
-        uint64_t date;
+        uint64_t date; // FILETIME ticks (100ns since 1601-01-01 UTC).
         uint64_t numLinks;
     };
 
@@ -1840,7 +2094,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         uint64_t nameIndex;
         Hash128 hash;
         uint64_t inodeNumber;
-        uint64_t date;
+        uint64_t date; // FILETIME ticks (100ns since 1601-01-01 UTC).
         uint64_t numLinks;
     };
     std::vector<RawFileEntry> rawEntries;
@@ -1906,11 +2160,13 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
     return dirData;
 }
 
+/// Create a new .dirdb file for a directory.
 static DirDbData createDirDb(const fs::path& dirPath)
 {
     return buildDirDb(dirPath, nullptr);
 }
 
+/// Update an existing .dirdb by reusing cached hashes where possible.
 static DirDbData updateDirDb(const fs::path& dirPath)
 {
     DirDbData existing = readDirDb(dirPath, false);
@@ -1923,6 +2179,7 @@ static DirDbData updateDirDb(const fs::path& dirPath)
     return buildDirDb(dirPath, &cache);
 }
 
+/// Load, create, or update a .dirdb file depending on flags.
 static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update)
 {
     fs::path dbPath = dirPath / ".dirdb";
@@ -1941,6 +2198,7 @@ static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bo
     return createDirDb(dirPath);
 }
 
+/// Recursively remove .dirdb files under a root directory.
 static void removeDirDbTree(const fs::path& root, bool dryRun)
 {
     auto removeIfExists = [](const fs::path& dirPath, bool dryRunFlag)
@@ -1991,6 +2249,7 @@ static void removeDirDbTree(const fs::path& root, bool dryRun)
 }
 
 /// Main.
+/// Entry point for treeop.
 int main(int argc, char *argv[])
 {
     // Run unit tests and exit if enabled at compile time.
@@ -2016,6 +2275,9 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "extract-a", "Extract files only in A into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "extract-b", "Extract files only in B into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "remove-copies", "Delete files from later roots when content exists in earlier roots (with --intersect).");
+    cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
+    cl.addOption(' ', "min-size", "Minimum file size to hardlink when using --hardlink-copies.", "N", "0");
+    cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
     cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
     cl.addOption('u', "update-dirdb", "Update .dirdb files, reusing hashes when inode/size/mtime match.");
@@ -2038,7 +2300,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("dry-run") || cl("get-unique-hash-len")))
+    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies") || cl("dry-run") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2079,9 +2341,9 @@ int main(int argc, char *argv[])
         {
             cl.error("--remove-copies requires --intersect.");
         }
-        if (cl("dry-run") && !(cl("remove-copies") || cl("extract-a") || cl("extract-b") || cl("remove-dirdb")))
+        if (cl("dry-run") && !(cl("remove-copies") || cl("extract-a") || cl("extract-b") || cl("remove-dirdb") || cl("hardlink-copies")))
         {
-            cl.error("--dry-run requires --remove-copies, --extract-a/--extract-b, or --remove-dirdb.");
+            cl.error("--dry-run requires --remove-copies, --extract-a/--extract-b, --remove-dirdb, or --hardlink-copies.");
         }
 
         if (cl("remove-dirdb"))
@@ -2105,6 +2367,15 @@ int main(int argc, char *argv[])
             if (gProgress)
             {
                 gProgress->finish();
+            }
+
+            if (cl("hardlink-copies"))
+            {
+                uint64_t minSize = ut1::strToU64(cl.getStr("min-size"));
+                uint64_t maxHardlinks = ut1::strToU64(cl.getStr("max-hardlinks"));
+                auto stats = mainDb.hardlinkCopies(minSize, maxHardlinks, cl("dry-run"));
+                std::cout << "hardlink-copies:\n";
+                mainDb.printHardlinkStats(stats);
             }
 
             if (cl("intersect"))

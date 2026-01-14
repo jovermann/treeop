@@ -2,6 +2,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+import pytest
 
 
 def treeop_bin() -> Path:
@@ -95,3 +96,45 @@ def test_remove_copies_actual(tmp_path: Path):
     assert (dir_a / "same.txt").exists()
     assert not (dir_b / "same.txt").exists()
     assert re.search(r"removed-files:\s+1", out)
+
+
+def supports_hardlinks(tmp_path: Path) -> bool:
+    src = tmp_path / "hl_src"
+    dst = tmp_path / "hl_dst"
+    src.write_text("x", encoding="utf-8")
+    try:
+        os.link(src, dst)
+    except OSError:
+        return False
+    return True
+
+
+def test_hardlink_copies(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    file_a = dir_a / "same.txt"
+    file_b = dir_b / "same.txt"
+    write_file(file_a, "hello")
+    write_file(file_b, "hello")
+
+    out = run_treeop(["--hardlink-copies", "--min-size", "1", "--dry-run", str(dir_a), str(dir_b)], root)
+    assert file_a.exists()
+    assert file_b.exists()
+    assert "Would hardlink" in out
+
+    out = run_treeop(["--hardlink-copies", "--min-size", "1", str(dir_a), str(dir_b)], root)
+    st_a = file_a.stat()
+    st_b = file_b.stat()
+    assert st_a.st_ino == st_b.st_ino
+    assert re.search(r"hardlinks-created:\s+1", out)
