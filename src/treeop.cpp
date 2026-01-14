@@ -383,7 +383,8 @@ public:
                 for (const auto& file : dir.files)
                 {
                     totalSize += file.size;
-                    ContentKey key{file.size, file.hash, sameFilename ? keyNameForPath(file.path) : std::string()};
+                    Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
+                    ContentKey key{file.size, keyHash};
                     contentCounts[key]++;
                 }
                 totalDbSize += dir.dbSize;
@@ -625,7 +626,8 @@ public:
                 }
                 for (const auto& file : dir.files)
                 {
-                    ContentKey key{file.size, file.hash, sameFilename ? keyNameForPath(file.path) : std::string()};
+                    Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
+                    ContentKey key{file.size, keyHash};
                     rootFiles[i][key].push_back(FileEntry{(dir.path / file.path).string(), file.size, file.hash, file.inode, file.date, file.numLinks});
                 }
             }
@@ -906,7 +908,8 @@ public:
                 {
                     continue;
                 }
-                ContentKey key{file.size, file.hash, sameFilename ? keyNameForPath(file.path) : std::string()};
+                Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
+                ContentKey key{file.size, keyHash};
                 contentFiles[key].push_back(FileEntry{
                     (dir.path / file.path).string(),
                     file.size,
@@ -1030,11 +1033,42 @@ private:
         return fs::path(path).filename().string();
     }
 
+    /// Combine a content hash with a filename to form a single hash.
+    static Hash128 hashWithFilename(const Hash128& base, const std::string& name)
+    {
+        HashSha3_128 hasher;
+        uint8_t buffer[16]{};
+        uint64_t lo = base.lo;
+        uint64_t hi = base.hi;
+        for (size_t i = 0; i < 8; i++)
+        {
+            buffer[i] = static_cast<uint8_t>((lo >> (8 * i)) & 0xff);
+            buffer[8 + i] = static_cast<uint8_t>((hi >> (8 * i)) & 0xff);
+        }
+        hasher.update(buffer, sizeof(buffer));
+        if (!name.empty())
+        {
+            hasher.update(reinterpret_cast<const uint8_t*>(name.data()), name.size());
+        }
+        std::vector<uint8_t> digest = hasher.finalize();
+        if (digest.size() < 16)
+        {
+            return base;
+        }
+        uint64_t outLo = 0;
+        uint64_t outHi = 0;
+        for (size_t i = 0; i < 8; i++)
+        {
+            outLo |= (static_cast<uint64_t>(digest[i]) << (8 * i));
+            outHi |= (static_cast<uint64_t>(digest[8 + i]) << (8 * i));
+        }
+        return Hash128{outHi, outLo};
+    }
+
     struct ContentKey
     {
         uint64_t size{};
         Hash128 hash{};
-        std::string name;
         /// Order by size then hash.
         bool operator<(const ContentKey& other) const
         {
@@ -1042,15 +1076,7 @@ private:
             {
                 return size < other.size;
             }
-            if (hash < other.hash)
-            {
-                return true;
-            }
-            if (other.hash < hash)
-            {
-                return false;
-            }
-            return name < other.name;
+            return hash < other.hash;
         }
     };
 
