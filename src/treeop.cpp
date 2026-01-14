@@ -333,7 +333,9 @@ public:
     };
 
     /// Initialize the database with a list of root directories.
-    explicit MainDb(std::vector<fs::path> rootDirs)
+    /// Initialize the database with a list of root directories.
+    explicit MainDb(std::vector<fs::path> rootDirs, bool sameFilename_)
+        : sameFilename(sameFilename_)
     {
         for (auto& path : rootDirs)
         {
@@ -381,7 +383,7 @@ public:
                 for (const auto& file : dir.files)
                 {
                     totalSize += file.size;
-                    ContentKey key{file.size, file.hash};
+                    ContentKey key{file.size, file.hash, sameFilename ? keyNameForPath(file.path) : std::string()};
                     contentCounts[key]++;
                 }
                 totalDbSize += dir.dbSize;
@@ -623,7 +625,7 @@ public:
                 }
                 for (const auto& file : dir.files)
                 {
-                    ContentKey key{file.size, file.hash};
+                    ContentKey key{file.size, file.hash, sameFilename ? keyNameForPath(file.path) : std::string()};
                     rootFiles[i][key].push_back(FileEntry{(dir.path / file.path).string(), file.size, file.hash, file.inode, file.date, file.numLinks});
                 }
             }
@@ -904,7 +906,7 @@ public:
                 {
                     continue;
                 }
-                ContentKey key{file.size, file.hash};
+                ContentKey key{file.size, file.hash, sameFilename ? keyNameForPath(file.path) : std::string()};
                 contentFiles[key].push_back(FileEntry{
                     (dir.path / file.path).string(),
                     file.size,
@@ -1022,10 +1024,17 @@ public:
     }
 
 private:
+    /// Extract the basename used for same-filename matching.
+    static std::string keyNameForPath(const std::string& path)
+    {
+        return fs::path(path).filename().string();
+    }
+
     struct ContentKey
     {
         uint64_t size{};
         Hash128 hash{};
+        std::string name;
         /// Order by size then hash.
         bool operator<(const ContentKey& other) const
         {
@@ -1033,7 +1042,15 @@ private:
             {
                 return size < other.size;
             }
-            return hash < other.hash;
+            if (hash < other.hash)
+            {
+                return true;
+            }
+            if (other.hash < hash)
+            {
+                return false;
+            }
+            return name < other.name;
         }
     };
 
@@ -1567,6 +1584,7 @@ private:
 
     std::vector<RootData> roots;
     std::vector<DirDbData> dirs;
+    bool sameFilename{};
 };
 
 /// Normalize a path for consistent comparisons.
@@ -2255,6 +2273,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "extract-a", "Extract files only in A into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "extract-b", "Extract files only in B into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "remove-copies", "Delete files from later roots when content exists in earlier roots (with --intersect).");
+    cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
     cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
     cl.addOption(' ', "min-size", "Minimum file size to hardlink when using --hardlink-copies.", "N", "0");
     cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
@@ -2280,7 +2299,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies") || cl("dry-run") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2340,7 +2359,7 @@ int main(int argc, char *argv[])
             {
                 normalizedRoots.push_back(normalizePath(path));
             }
-            MainDb mainDb(normalizedRoots);
+            MainDb mainDb(normalizedRoots, cl("same-filename"));
 
             // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.
             mainDb.processRoots(cl("new-dirdb"), cl("update-dirdb"));

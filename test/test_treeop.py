@@ -1,6 +1,7 @@
 import os
 import re
 import subprocess
+import time
 from pathlib import Path
 import pytest
 
@@ -31,6 +32,14 @@ def write_file(path: Path, content: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
 
+
+def extract_hash(output: str, filename: str) -> str:
+    for line in output.splitlines():
+        if line.endswith(filename):
+            parts = line.split()
+            if len(parts) >= 2:
+                return parts[1]
+    raise AssertionError(f"hash not found for {filename} in output:\n{output}")
 
 def test_intersect_stats_two_roots(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
@@ -138,3 +147,139 @@ def test_hardlink_copies(tmp_path: Path):
     st_b = file_b.stat()
     assert st_a.st_ino == st_b.st_ino
     assert re.search(r"hardlinks-created:\s+1", out)
+
+
+def test_same_filename_intersect(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "one.txt", "same")
+    write_file(dir_b / "two.txt", "same")
+
+    out = run_treeop(["--intersect", str(dir_a), str(dir_b)], root)
+    assert re.search(r"shared-files:\s+2", out)
+
+    out = run_treeop(["--intersect", "--same-filename", str(dir_a), str(dir_b)], root)
+    assert re.search(r"shared-files:\s+0", out)
+
+
+def test_same_filename_hardlink(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    file_a = dir_a / "one.txt"
+    file_b = dir_b / "two.txt"
+    write_file(file_a, "same")
+    write_file(file_b, "same")
+
+    run_treeop(["--hardlink-copies", "--same-filename", str(dir_a), str(dir_b)], root)
+    st_a = file_a.stat()
+    st_b = file_b.stat()
+    assert st_a.st_ino != st_b.st_ino
+
+
+def test_same_filename_remove_copies(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "one.txt", "same")
+    write_file(dir_b / "two.txt", "same")
+
+    run_treeop(["--intersect", "--remove-copies", "--same-filename", str(dir_a), str(dir_b)], root)
+    assert (dir_a / "one.txt").exists()
+    assert (dir_b / "two.txt").exists()
+
+
+def test_update_dirdb(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "one")
+
+    run_treeop([str(dir_a)], root)
+    db_path = dir_a / ".dirdb"
+    assert db_path.exists()
+    out = run_treeop(["--list-files", str(dir_a)], root)
+    first_hash = extract_hash(out, "file.txt")
+
+    time.sleep(1.1)
+    write_file(dir_a / "file.txt", "two")
+    run_treeop(["--update-dirdb", str(dir_a)], root)
+    assert db_path.exists()
+    out = run_treeop(["--list-files", str(dir_a)], root)
+    second_hash = extract_hash(out, "file.txt")
+    assert second_hash != first_hash
+
+
+def test_new_dirdb(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "one")
+
+    run_treeop([str(dir_a)], root)
+    db_path = dir_a / ".dirdb"
+    assert db_path.exists()
+    out = run_treeop(["--list-files", str(dir_a)], root)
+    first_hash = extract_hash(out, "file.txt")
+
+    time.sleep(1.1)
+    write_file(dir_a / "file.txt", "two")
+    run_treeop(["--new-dirdb", str(dir_a)], root)
+    assert db_path.exists()
+    out = run_treeop(["--list-files", str(dir_a)], root)
+    second_hash = extract_hash(out, "file.txt")
+    assert second_hash != first_hash
+
+
+def test_remove_dirdb(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = dir_a / "b"
+    dir_b.mkdir(parents=True)
+    write_file(dir_a / "file.txt", "one")
+    write_file(dir_b / "file.txt", "two")
+
+    run_treeop([str(dir_a)], root)
+    assert (dir_a / ".dirdb").exists()
+    assert (dir_b / ".dirdb").exists()
+
+    run_treeop(["--remove-dirdb", str(dir_a)], root)
+    assert not (dir_a / ".dirdb").exists()
+    assert not (dir_b / ".dirdb").exists()
