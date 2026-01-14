@@ -152,8 +152,8 @@ private:
     {
         double elapsed = now - startTime;
         double rate = (elapsed > 0.0) ? (double(hashedBytes) / elapsed) : 0.0;
-        std::string rateStr = formatRateMb(rate);
-        std::string sizeStr = formatCompactSize(bytes);
+        std::string rateStr = ut1::getApproxSizeStr(rate, 1, false, true) + "/s";
+        std::string sizeStr = ut1::getApproxSizeStr(bytes, 1, false, true);
         std::string prefix = ut1::toStr(files) + "f/" + ut1::toStr(dirs) + "d (" + sizeStr + ", " + rateStr + ")";
 
         std::string suffix;
@@ -224,31 +224,6 @@ private:
             return path.substr(path.size() - maxLen);
         }
         return "..." + path.substr(path.size() - (maxLen - 3));
-    }
-
-    static std::string formatRateMb(double bytesPerSec)
-    {
-        double mbPerSec = bytesPerSec / (1024.0 * 1024.0);
-        std::ostringstream os;
-        os << std::fixed << std::setprecision(1) << mbPerSec << "MB/s";
-        return os.str();
-    }
-
-    static std::string formatCompactSize(uint64_t bytes)
-    {
-        static constexpr const char* units[] = {"bytes", "kB", "MB", "GB", "TB", "PB", "EB"};
-        double value = static_cast<double>(bytes);
-        size_t unitIndex = 0;
-        uint64_t whole = bytes;
-        while (whole >= 1024 && unitIndex + 1 < std::size(units))
-        {
-            whole >>= 10;
-            value /= 1024.0;
-            unitIndex++;
-        }
-        std::ostringstream os;
-        os << std::fixed << std::setprecision(1) << value << units[unitIndex];
-        return os.str();
     }
 
     uint64_t dirs = 0;
@@ -417,18 +392,18 @@ public:
             std::vector<StatLine> stats = {
                 {"files:", formatCountInt(fileCount), std::string()},
                 {"dirs:", formatCountInt(dirCount), std::string()},
-                {"total-size:", formatSizeFixed(totalSize), std::string()},
+                {"total-size:", ut1::getApproxSizeStr(totalSize, 3, true, false), std::string()},
                 {"redundant-files:", formatCountInt(redundantFiles), "(" + redundantFilesPct + ")"},
-                {"redundant-size:", formatSizeFixed(redundantSize), "(" + redundantSizePct + ")"},
-                {"dirdb-size:", formatSizeFixed(totalDbSize), "(" + percentStr + ")"},
-                {"dirdb-bytes-per-file:", formatSizeFixed(dirdbBytesPerFile, 1), std::string()}
+                {"redundant-size:", ut1::getApproxSizeStr(redundantSize, 3, true, false), "(" + redundantSizePct + ")"},
+                {"dirdb-size:", ut1::getApproxSizeStr(totalDbSize, 3, true, false), "(" + percentStr + ")"},
+                {"dirdb-bytes-per-file:", ut1::getApproxSizeStr(dirdbBytesPerFile, 1, true, true), std::string()}
             };
             if (totalHashedBytes > 0 && totalHashSeconds > 0.0)
             {
                 double rateMb = (double(totalHashedBytes) / totalHashSeconds / (1024.0 * 1024.0));
                 std::ostringstream rateOs;
                 rateOs << std::fixed << std::setprecision(1) << rateMb << " MB/s";
-                stats.push_back({"hash-size:", formatSizeFixed(totalHashedBytes), std::string()});
+                stats.push_back({"hash-size:", ut1::getApproxSizeStr(totalHashedBytes, 3, true, false), std::string()});
                 stats.push_back({"hash-rate:", rateOs.str(), std::string()});
             }
             if (!elapsedStr.empty())
@@ -510,13 +485,14 @@ public:
         bool showEnd = clVerbose > 0;
         size_t widthStartNum = 0;
         size_t widthEndNum = 0;
-        HistogramUnit unit = getHistogramUnit(batchSize);
+        uint64_t unitFactor = 1;
+        std::string unitLabel = splitSizeStr(ut1::getPreciseSizeStr(batchSize, &unitFactor)).second;
 
         uint64_t maxStart = hasFiles ? (maxSize / batchSize) * batchSize : 0;
         for (uint64_t start = 0; start <= maxStart; start += batchSize)
         {
-            std::string startNum = ut1::toStr(start / unit.factor);
-            std::string endNum = ut1::toStr((start + batchSize) / unit.factor);
+            std::string startNum = ut1::toStr(start / unitFactor);
+            std::string endNum = ut1::toStr((start + batchSize) / unitFactor);
             widthStartNum = std::max(widthStartNum, startNum.size());
             if (showEnd)
             {
@@ -524,7 +500,7 @@ public:
             }
         }
 
-        std::string unitSuffix = std::string(" ") + unit.label;
+        std::string unitSuffix = std::string(" ") + unitLabel;
         widthStart = widthStartNum + unitSuffix.size();
         if (showEnd)
         {
@@ -537,7 +513,7 @@ public:
             const Bucket empty{};
             const Bucket& bucket = (it == buckets.end()) ? empty : it->second;
             widthCount = std::max(widthCount, ut1::toStr(bucket.count).size());
-            std::string totalStr = formatSizeFixed(bucket.totalSize);
+            std::string totalStr = ut1::getApproxSizeStr(bucket.totalSize, 3, true, false);
             auto [numberStr, suffixStr] = splitSizeStr(totalStr);
             totalDecimalPos = std::max(totalDecimalPos, getDecimalPos(numberStr));
             totalSuffixWidth = std::max(totalSuffixWidth, suffixStr.size());
@@ -566,10 +542,10 @@ public:
             const auto it = buckets.find(start);
             const Bucket empty{};
             const Bucket& bucket = (it == buckets.end()) ? empty : it->second;
-            std::string startStr = formatHistogramBoundary(start, unit, widthStartNum);
+            std::string startStr = formatHistogramBoundary(start, unitFactor, unitLabel, widthStartNum);
             std::string totalStr = (bucketIndex < bucketTotalStrings.size())
                 ? bucketTotalStrings[bucketIndex]
-                : formatSizeFixed(bucket.totalSize);
+                : ut1::getApproxSizeStr(bucket.totalSize, 3, true, false);
             totalStr = formatSizeAligned(totalStr, totalDecimalPos, totalSuffixWidth);
             if (totalStr.size() < widthTotal)
             {
@@ -578,7 +554,7 @@ public:
             std::string rangeLabel;
             if (showEnd)
             {
-                std::string endStr = formatHistogramBoundary(start + batchSize, unit, widthEndNum);
+                std::string endStr = formatHistogramBoundary(start + batchSize, unitFactor, unitLabel, widthEndNum);
                 rangeLabel = padRight(startStr, widthStart) + ".." + padRight(endStr, widthEnd) + ":";
             }
             else
@@ -677,9 +653,9 @@ public:
 
             std::vector<StatLine> stats = {
                 {"unique-files:", formatCountInt(uniqueStats.files), std::string()},
-                {"unique-size:", formatSizeFixed(uniqueStats.bytes), std::string()},
+                {"unique-size:", ut1::getApproxSizeStr(uniqueStats.bytes, 3, true, false), std::string()},
                 {"shared-files:", formatCountInt(sharedStats.files), std::string()},
-                {"shared-size:", formatSizeFixed(sharedStats.bytes), std::string()}
+                {"shared-size:", ut1::getApproxSizeStr(sharedStats.bytes, 3, true, false), std::string()}
             };
 
             std::cout << rootPaths[i].string() << ":\n";
@@ -719,18 +695,18 @@ public:
         std::string totalSharedBytesPct = formatPercentFixed(totalBytesAll == 0 ? 0.0 : (100.0 * totalShared.bytes / totalBytesAll));
         std::vector<StatLine> totalStats = {
             {"total-files:", formatCountInt(totalFilesAll), std::string()},
-            {"total-size:", formatSizeFixed(totalBytesAll), std::string()},
+            {"total-size:", ut1::getApproxSizeStr(totalBytesAll, 3, true, false), std::string()},
             {"unique-files:", formatCountInt(totalUnique.files), "(" + totalUniqueFilesPct + " of total)"},
-            {"unique-size:", formatSizeFixed(totalUnique.bytes), "(" + totalUniqueBytesPct + " of total)"},
+            {"unique-size:", ut1::getApproxSizeStr(totalUnique.bytes, 3, true, false), "(" + totalUniqueBytesPct + " of total)"},
             {"shared-files:", formatCountInt(totalShared.files), "(" + totalSharedFilesPct + " of total)"},
-            {"shared-size:", formatSizeFixed(totalShared.bytes), "(" + totalSharedBytesPct + " of total)"}
+            {"shared-size:", ut1::getApproxSizeStr(totalShared.bytes, 3, true, false), "(" + totalSharedBytesPct + " of total)"}
         };
         if (removeCopies)
         {
             std::string removedFilesPct = formatPercentFixed(totalFilesAll == 0 ? 0.0 : (100.0 * removedFiles / totalFilesAll));
             std::string removedBytesPct = formatPercentFixed(totalBytesAll == 0 ? 0.0 : (100.0 * removedBytes / totalBytesAll));
             totalStats.push_back({"removed-files:", formatCountInt(removedFiles), "(" + removedFilesPct + " of total)"});
-            totalStats.push_back({"removed-bytes:", formatSizeFixed(removedBytes), "(" + removedBytesPct + " of total)"});
+            totalStats.push_back({"removed-bytes:", ut1::getApproxSizeStr(removedBytes, 3, true, false), "(" + removedBytesPct + " of total)"});
         }
 
         std::cout << "total:\n";
@@ -1236,55 +1212,6 @@ private:
         return rootIt == root.end();
     }
 
-    static std::string formatSizeFixed(uint64_t bytes, unsigned precision = 3)
-    {
-        static constexpr const char* units[] = {"bytes", "kB", "MB", "GB", "TB", "PB", "EB"};
-        if (bytes == 0)
-        {
-            return "0";
-        }
-        double value = static_cast<double>(bytes);
-        size_t unitIndex = 0;
-        uint64_t whole = bytes;
-        while (whole >= 1024 && unitIndex + 1 < std::size(units))
-        {
-            whole >>= 10;
-            value /= 1024.0;
-            unitIndex++;
-        }
-        std::ostringstream os;
-        if (unitIndex == 0)
-        {
-            os << bytes << " " << units[unitIndex];
-        }
-        else
-        {
-            os << std::fixed << std::setprecision(precision) << value << " " << units[unitIndex];
-        }
-        return os.str();
-    }
-
-    static std::string formatSizeFixed(double bytes, unsigned precision = 3)
-    {
-        if (bytes <= 0.0)
-        {
-            return "0";
-        }
-        uint64_t whole = static_cast<uint64_t>(bytes);
-        static constexpr const char* units[] = {"bytes", "kB", "MB", "GB", "TB", "PB", "EB"};
-        double value = bytes;
-        size_t unitIndex = 0;
-        while (whole >= 1024 && unitIndex + 1 < std::size(units))
-        {
-            whole >>= 10;
-            value /= 1024.0;
-            unitIndex++;
-        }
-        std::ostringstream os;
-        os << std::fixed << std::setprecision(precision) << value << " " << units[unitIndex];
-        return os.str();
-    }
-
     static std::string formatPercentFixed(double percent)
     {
         std::ostringstream os;
@@ -1375,37 +1302,10 @@ private:
         return numberStr + " " + suffixStr;
     }
 
-    struct HistogramUnit
+    static std::string formatHistogramBoundary(uint64_t value, uint64_t unitFactor, const std::string& unitLabel, size_t numberWidth)
     {
-        uint64_t factor;
-        const char* label;
-    };
-
-    static HistogramUnit getHistogramUnit(uint64_t batchSize)
-    {
-        static constexpr HistogramUnit units[] = {
-            {1ULL, "bytes"},
-            {1024ULL, "kB"},
-            {1024ULL * 1024ULL, "MB"},
-            {1024ULL * 1024ULL * 1024ULL, "GB"},
-            {1024ULL * 1024ULL * 1024ULL * 1024ULL, "TB"},
-            {1024ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL, "PB"},
-            {1024ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL, "EB"}
-        };
-        size_t index = 0;
-        uint64_t size = batchSize;
-        while (size >= 1024 && index + 1 < std::size(units))
-        {
-            size >>= 10;
-            index++;
-        }
-        return units[index];
-    }
-
-    static std::string formatHistogramBoundary(uint64_t value, const HistogramUnit& unit, size_t numberWidth)
-    {
-        std::string number = ut1::toStr(value / unit.factor);
-        return padLeft(number, numberWidth) + " " + unit.label;
+        std::string number = ut1::toStr(value / unitFactor);
+        return padLeft(number, numberWidth) + " " + unitLabel;
     }
 
     static std::string formatFileTime(uint64_t fileTime)
