@@ -67,6 +67,35 @@ struct Hash128
            << std::setw(16) << std::setfill('0') << hi;
         return os.str();
     }
+
+    /// Convert a 16-byte vector into a Hash128 (little-endian).
+    static Hash128 fromBytes(const std::vector<uint8_t>& bytes)
+    {
+        if (bytes.size() < 16)
+        {
+            return {};
+        }
+        uint64_t outLo = 0;
+        uint64_t outHi = 0;
+        for (size_t i = 0; i < 8; i++)
+        {
+            outLo |= (static_cast<uint64_t>(bytes[i]) << (8 * i));
+            outHi |= (static_cast<uint64_t>(bytes[8 + i]) << (8 * i));
+        }
+        return Hash128{outHi, outLo};
+    }
+
+    /// Convert the hash into a 16-byte vector (little-endian).
+    std::vector<uint8_t> toBytes() const
+    {
+        std::vector<uint8_t> bytes(16);
+        for (size_t i = 0; i < 8; i++)
+        {
+            bytes[i] = static_cast<uint8_t>((lo >> (8 * i)) & 0xff);
+            bytes[8 + i] = static_cast<uint8_t>((hi >> (8 * i)) & 0xff);
+        }
+        return bytes;
+    }
 };
 
 class ProgressTracker
@@ -1037,15 +1066,8 @@ private:
     static Hash128 hashWithFilename(const Hash128& base, const std::string& name)
     {
         HashSha3_128 hasher;
-        uint8_t buffer[16]{};
-        uint64_t lo = base.lo;
-        uint64_t hi = base.hi;
-        for (size_t i = 0; i < 8; i++)
-        {
-            buffer[i] = static_cast<uint8_t>((lo >> (8 * i)) & 0xff);
-            buffer[8 + i] = static_cast<uint8_t>((hi >> (8 * i)) & 0xff);
-        }
-        hasher.update(buffer, sizeof(buffer));
+        std::vector<uint8_t> bytes = base.toBytes();
+        hasher.update(bytes.data(), bytes.size());
         if (!name.empty())
         {
             hasher.update(reinterpret_cast<const uint8_t*>(name.data()), name.size());
@@ -1055,14 +1077,7 @@ private:
         {
             return base;
         }
-        uint64_t outLo = 0;
-        uint64_t outHi = 0;
-        for (size_t i = 0; i < 8; i++)
-        {
-            outLo |= (static_cast<uint64_t>(digest[i]) << (8 * i));
-            outHi |= (static_cast<uint64_t>(digest[8 + i]) << (8 * i));
-        }
-        return Hash128{outHi, outLo};
+        return Hash128::fromBytes(digest);
     }
 
     struct ContentKey
@@ -1820,14 +1835,7 @@ static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* seco
     {
         throw std::runtime_error("Unexpected hash size while hashing: " + path.string());
     }
-    uint64_t lo = 0;
-    uint64_t hi = 0;
-    for (size_t i = 0; i < 8; i++)
-    {
-        lo |= (static_cast<uint64_t>(digest[i]) << (8 * i));
-        hi |= (static_cast<uint64_t>(digest[8 + i]) << (8 * i));
-    }
-    return Hash128{hi, lo};
+    return Hash128::fromBytes(digest);
 }
 
 /// Read a .dirdb file for a directory and return its contents.
