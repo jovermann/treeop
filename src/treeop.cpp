@@ -104,7 +104,11 @@ class ProgressTracker
 public:
     /// Initialize progress tracking with width and linefeed mode.
     explicit ProgressTracker(size_t maxWidth_ = 199, bool linefeed_ = false)
-        : startTime(ut1::getTimeSec()), lastPrintTime(startTime), maxWidth(maxWidth_), linefeed(linefeed_) {}
+        : startTime(ut1::getTimeSec()),
+          lastPrintTime(startTime),
+          lastRateTime(startTime),
+          maxWidth(maxWidth_),
+          linefeed(linefeed_) {}
 
     /// Note that directory processing started.
     void onDirStart(const fs::path& dirPath)
@@ -196,10 +200,14 @@ private:
     void printLine(double now)
     {
         double elapsed = now - startTime;
-        double rate = (elapsed > 0.0) ? (double(hashedBytes) / elapsed) : 0.0;
-        std::string rateStr = ut1::getApproxSizeStr(rate, 1, false, true) + "/s";
+        double avgRate = (elapsed > 0.0) ? (double(hashedBytes) / elapsed) : 0.0;
+        double deltaTime = now - lastRateTime;
+        uint64_t deltaBytes = hashedBytes - lastRateBytes;
+        double curRate = (deltaTime > 0.0) ? (double(deltaBytes) / deltaTime) : 0.0;
+        std::string avgRateStr = ut1::getApproxSizeStr(avgRate, 1, false, true) + "/s";
+        std::string curRateStr = ut1::getApproxSizeStr(curRate, 1, false, true) + "/s";
         std::string sizeStr = ut1::getApproxSizeStr(bytes, 1, false, true);
-        std::string prefix = ut1::toStr(files) + "f/" + ut1::toStr(dirs) + "d (" + sizeStr + ", " + rateStr + ")";
+        std::string prefix = ut1::toStr(files) + "f/" + ut1::toStr(dirs) + "d (" + sizeStr + ", " + avgRateStr + ", " + curRateStr + ")";
 
         std::string suffix;
         if (hashing && !currentFile.empty())
@@ -238,6 +246,8 @@ private:
             std::cout << "\r" << line << std::string(pad, ' ') << "\r" << std::flush;
             lastLineLen = line.size();
         }
+        lastRateTime = now;
+        lastRateBytes = hashedBytes;
     }
 
     /// Compute available path length for the progress line.
@@ -279,11 +289,13 @@ private:
     uint64_t hashedBytes = 0;
     double startTime = 0.0;
     double lastPrintTime = 0.0;
+    double lastRateTime = 0.0;
     std::string currentDir;
     std::string currentFile;
     uint64_t currentFileSize = 0;
     uint64_t currentFileDone = 0;
     bool hashing = false;
+    uint64_t lastRateBytes = 0;
     size_t lastLineLen = 0;
     size_t maxWidth = 199;
     bool linefeed = false;
