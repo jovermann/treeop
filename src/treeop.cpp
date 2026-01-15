@@ -513,6 +513,39 @@ public:
         printListRows(refs, clVerbose > 1, hashLen);
     }
 
+    /// List all directories with file counts and total size.
+    void listDirs() const
+    {
+        auto compactSizeStr = [](double bytes, unsigned precision, bool bytesWithPrecision)
+        {
+            return ut1::getApproxSizeStr(bytes, precision, false, bytesWithPrecision, true);
+        };
+
+        const size_t minFilesWidth = 6;
+        const size_t minSizeWidth = std::string("1023.9GB").size();
+        for (const auto& dir : dirs)
+        {
+            uint64_t totalSize = 0;
+            for (const auto& file : dir.files)
+            {
+                totalSize += file.size;
+            }
+            std::string sizeStr = compactSizeStr(static_cast<double>(totalSize), 1, false);
+            std::string filesStr = formatCountInt(dir.files.size()) + "f";
+            std::cout << std::setw(minFilesWidth) << filesStr << " "
+                      << std::setw(minSizeWidth) << sizeStr;
+            if (clVerbose > 0)
+            {
+                double avgBytes = dir.files.empty() ? 0.0 : (static_cast<double>(dir.dbSize) / dir.files.size());
+                std::string dbSizeStr = compactSizeStr(static_cast<double>(dir.dbSize), 3, false);
+                std::string avgStr = compactSizeStr(avgBytes, 1, true);
+                std::cout << " " << std::setw(minSizeWidth) << dbSizeStr
+                          << " " << std::setw(minSizeWidth) << avgStr;
+            }
+            std::cout << " " << dir.path.string() << "\n";
+        }
+    }
+
     /// Print a size histogram over all files.
     void printSizeHistogram(uint64_t batchSize, uint64_t maxSizeLimit, bool hasMaxSize) const
     {
@@ -2528,6 +2561,7 @@ int main(int argc, char *argv[])
     cl.addOption('i', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
+    cl.addOption(' ', "list-dirs", "List all directories with file counts and total size.");
     cl.addOption(' ', "list-a", "List files only in A when used with --intersect.");
     cl.addOption(' ', "list-b", "List files only in B when used with --intersect.");
     cl.addOption(' ', "list-both", "List files in both A and B when used with --intersect.");
@@ -2568,7 +2602,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2631,7 +2665,7 @@ int main(int argc, char *argv[])
         {
             if (cl("readbench"))
             {
-                bool otherOps = cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb")
+                bool otherOps = cl("stats") || cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both")
                     || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs");
@@ -2721,6 +2755,10 @@ int main(int argc, char *argv[])
                 if (cl("list-files"))
                 {
                     mainDb.listFiles();
+                }
+                if (cl("list-dirs"))
+                {
+                    mainDb.listDirs();
                 }
                 if (cl("get-unique-hash-len"))
                 {
