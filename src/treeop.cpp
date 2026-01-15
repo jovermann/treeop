@@ -1423,7 +1423,7 @@ private:
                 it.increment(ec);
                 continue;
             }
-            if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+            if (ut1::fsIsDirectory(it->path(), false))
             {
                 addDir(loadOrCreateDirDb(it->path(), forceCreate, update));
             }
@@ -1693,7 +1693,7 @@ static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
                 it.increment(ec);
                 continue;
             }
-            if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+            if (ut1::fsIsDirectory(it->path(), false))
             {
                 if (gProgress)
                 {
@@ -1704,7 +1704,7 @@ static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
                 it.increment(ec);
                 continue;
             }
-            if (ut1::getFileType(*it, false) != ut1::FT_REGULAR)
+            if (!ut1::fsIsRegular(it->path(), false))
             {
                 it.increment(ec);
                 continue;
@@ -1781,7 +1781,7 @@ static bool isDirEmpty(const fs::path& dir, bool& hasDirDb)
             }
             return false;
         }
-        if (it->path().filename() == ".dirdb" && ut1::getFileType(*it, false) == ut1::FT_REGULAR)
+        if (it->path().filename() == ".dirdb" && ut1::fsIsRegular(it->path(), false))
         {
             hasDirDb = true;
             continue;
@@ -1814,7 +1814,7 @@ static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool
             ec.clear();
             continue;
         }
-        if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+        if (ut1::fsIsDirectory(it->path(), false))
         {
             dirs.push_back(it->path());
         }
@@ -2276,7 +2276,7 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         {
             continue;
         }
-        if (ut1::getFileType(entry, false) != ut1::FT_REGULAR)
+        if (!ut1::fsIsRegular(entry.path(), false))
         {
             continue;
         }
@@ -2499,7 +2499,7 @@ static void removeDirDbTree(const fs::path& root, bool dryRun)
             it.increment(ec);
             continue;
         }
-        if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+        if (ut1::fsIsDirectory(it->path(), false))
         {
             removeIfExists(it->path(), dryRun);
         }
