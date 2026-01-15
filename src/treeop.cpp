@@ -361,9 +361,18 @@ struct DirDbData
     double hashSeconds{};
 };
 
+struct RemoveCopyStats
+{
+    uint64_t files{};
+    uint64_t bytes{};
+};
+
 static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update);
 static DirDbData createDirDb(const fs::path& dirPath);
 static DirDbData updateDirDb(const fs::path& dirPath);
+static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool dryRun);
+/// Check whether a directory is empty aside from an optional .dirdb file.
+static bool isDirEmpty(const fs::path& dir, bool& hasDirDb);
 
 class MainDb
 {
@@ -691,11 +700,10 @@ public:
             }
         }
 
-        uint64_t removedFiles = 0;
-        uint64_t removedBytes = 0;
+        RemoveCopyStats removedStats;
         if (removeCopies)
         {
-            std::tie(removedFiles, removedBytes) = removeCopyFiles(rootFiles, dryRun);
+            removedStats = removeCopyFiles(rootFiles, dryRun);
         }
 
         for (size_t i = 0; i < rootFiles.size(); i++)
@@ -773,10 +781,10 @@ public:
         };
         if (removeCopies)
         {
-            std::string removedFilesPct = formatPercentFixed(totalFilesAll == 0 ? 0.0 : (100.0 * removedFiles / totalFilesAll));
-            std::string removedBytesPct = formatPercentFixed(totalBytesAll == 0 ? 0.0 : (100.0 * removedBytes / totalBytesAll));
-            totalStats.push_back({"removed-files:", formatCountInt(removedFiles), "(" + removedFilesPct + " of total)"});
-            totalStats.push_back({"removed-bytes:", ut1::getApproxSizeStr(removedBytes, 3, true, false), "(" + removedBytesPct + " of total)"});
+            std::string removedFilesPct = formatPercentFixed(totalFilesAll == 0 ? 0.0 : (100.0 * removedStats.files / totalFilesAll));
+            std::string removedBytesPct = formatPercentFixed(totalBytesAll == 0 ? 0.0 : (100.0 * removedStats.bytes / totalBytesAll));
+            totalStats.push_back({"removed-files:", formatCountInt(removedStats.files), "(" + removedFilesPct + " of total)"});
+            totalStats.push_back({"removed-bytes:", ut1::getApproxSizeStr(removedStats.bytes, 3, true, false), "(" + removedBytesPct + " of total)"});
         }
 
         std::cout << "total:\n";
@@ -1278,11 +1286,10 @@ private:
     }
 
     /// Remove duplicate files from later roots, keeping earliest roots.
-    static std::pair<uint64_t, uint64_t> removeCopyFiles(const std::vector<std::map<ContentKey, std::vector<FileEntry>>>& rootFiles, bool dryRun)
+    static RemoveCopyStats removeCopyFiles(const std::vector<std::map<ContentKey, std::vector<FileEntry>>>& rootFiles, bool dryRun)
     {
         std::map<ContentKey, size_t> firstRoot;
-        uint64_t removedFiles = 0;
-        uint64_t removedBytes = 0;
+        RemoveCopyStats stats;
         std::set<fs::path> touchedDirs;
         for (size_t i = 0; i < rootFiles.size(); i++)
         {
@@ -1306,8 +1313,8 @@ private:
                         {
                             std::cout << (dryRun ? "Would remove " : "Removed ") << ref.path << "\n";
                         }
-                        removedFiles++;
-                        removedBytes += ref.size;
+                        stats.files++;
+                        stats.bytes += ref.size;
                         if (dryRun)
                         {
                             continue;
@@ -1333,7 +1340,7 @@ private:
                 }
             }
         }
-        return {removedFiles, removedBytes};
+        return stats;
     }
 
     /// Replace a file with a hardlink to the source using a temporary path.
@@ -1756,6 +1763,96 @@ static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
 
     stats.elapsed = ut1::getTimeSec() - start;
     return stats;
+}
+
+/// Remove empty directories (only .dirdb allowed) under a root.
+/// Check whether a directory is empty aside from an optional .dirdb file.
+static bool isDirEmpty(const fs::path& dir, bool& hasDirDb)
+{
+    hasDirDb = false;
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end; it != end; it.increment(ec))
+    {
+        if (ec)
+        {
+            if (clVerbose)
+            {
+                std::cerr << "Skipping entry due to error: " << dir.string() << "\n";
+            }
+            return false;
+        }
+        if (it->path().filename() == ".dirdb" && ut1::getFileType(*it, false) == ut1::FT_REGULAR)
+        {
+            hasDirDb = true;
+            continue;
+        }
+        return false;
+    }
+    return true;
+}
+
+/// Remove empty directories (only .dirdb allowed) under a root.
+static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool dryRun)
+{
+    if (!ut1::fsExists(root))
+    {
+        return 0;
+    }
+
+    std::vector<fs::path> dirs;
+    dirs.push_back(root);
+    std::error_code ec;
+    for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+         it != end; it.increment(ec))
+    {
+        if (ec)
+        {
+            if (clVerbose)
+            {
+                std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+            }
+            ec.clear();
+            continue;
+        }
+        if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+        {
+            dirs.push_back(it->path());
+        }
+    }
+
+    uint64_t removed = 0;
+    std::reverse(dirs.begin(), dirs.end());
+    for (const auto& dir : dirs)
+    {
+        if (dir == root && !includeRoot)
+        {
+            continue;
+        }
+        bool hasDirDb = false;
+        if (!isDirEmpty(dir, hasDirDb))
+        {
+            continue;
+        }
+        if (dryRun || clVerbose)
+        {
+            std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << dir.string() << "\n";
+        }
+        if (!dryRun)
+        {
+            if (hasDirDb)
+            {
+                std::error_code rmEc;
+                fs::remove(dir / ".dirdb", rmEc);
+            }
+            fs::remove(dir, ec);
+            if (ec)
+            {
+                throw std::runtime_error("Failed to remove dir " + dir.string());
+            }
+        }
+        removed++;
+    }
+    return removed;
 }
 
 /// Normalize a path for consistent comparisons.
@@ -2439,6 +2536,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "remove-copies", "Delete files from later roots when content exists in earlier roots (with --intersect).");
     cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
     cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
+    cl.addOption(' ', "remove-empty-dirs", "Remove empty directories (ignoring .dirdb files).");
     cl.addOption(' ', "readbench", "Read all files to measure filesystem read performance.");
     cl.addOption(' ', "bufsize", "Buffer size for reading (readbench and hashing).", "N", "1M");
     cl.addOption(' ', "min-size", "Minimum file size to hardlink when using --hardlink-copies.", "N", "0");
@@ -2470,7 +2568,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2511,31 +2609,32 @@ int main(int argc, char *argv[])
         {
             cl.error("--remove-copies requires --intersect.");
         }
-        if (cl("dry-run") && !(cl("remove-copies") || cl("extract-a") || cl("extract-b") || cl("remove-dirdb") || cl("hardlink-copies")))
+        if (cl("dry-run") && !(cl("remove-copies") || cl("extract-a") || cl("extract-b") || cl("remove-dirdb") || cl("hardlink-copies") || cl("remove-empty-dirs")))
         {
-            cl.error("--dry-run requires --remove-copies, --extract-a/--extract-b, --remove-dirdb, or --hardlink-copies.");
+            cl.error("--dry-run requires --remove-copies, --extract-a/--extract-b, --remove-dirdb, --hardlink-copies, or --remove-empty-dirs.");
+        }
+
+        std::vector<fs::path> normalizedRoots;
+        for (const std::string& path : cl.getArgs())
+        {
+            normalizedRoots.push_back(normalizePath(path));
         }
 
         if (cl("remove-dirdb"))
         {
-            for (const std::string& path : cl.getArgs())
+            for (const auto& path : normalizedRoots)
             {
-                removeDirDbTree(normalizePath(path), cl("dry-run"));
+                removeDirDbTree(path, cl("dry-run"));
             }
         }
         else
         {
-            std::vector<fs::path> normalizedRoots;
-            for (const std::string& path : cl.getArgs())
-            {
-                normalizedRoots.push_back(normalizePath(path));
-            }
             if (cl("readbench"))
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both")
                     || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies")
-                    || cl("get-unique-hash-len") || cl("new-dirdb");
+                    || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs");
                 if (otherOps)
                 {
                     cl.error("--readbench cannot be combined with other operations.");
@@ -2630,9 +2729,14 @@ int main(int argc, char *argv[])
             }
         }
 
-        if (clVerbose)
+        if (cl("remove-empty-dirs"))
         {
-            std::cout << "Done.\n";
+            uint64_t removedDirs = 0;
+            for (const auto& root : normalizedRoots)
+            {
+                removedDirs += removeEmptyDirsTree(root, true, cl("dry-run"));
+            }
+            std::cout << "removed-dirs: " << removedDirs << "\n";
         }
     }
     catch (const std::exception& e)

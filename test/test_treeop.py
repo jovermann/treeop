@@ -14,6 +14,8 @@ def treeop_bin() -> Path:
 
 def run_treeop(args, cwd: Path):
     bin_path = treeop_bin()
+    if "TREEOP_BIN" not in os.environ:
+        subprocess.run(["make"], cwd=cwd, check=True, capture_output=True, text=True)
     if not bin_path.exists():
         subprocess.run(["make"], cwd=cwd, check=True, capture_output=True, text=True)
         if not bin_path.exists():
@@ -302,3 +304,60 @@ def test_readbench(tmp_path: Path):
     assert "bufsize:" in out
     assert "read-rate:" in out
     assert "elapsed:" in out
+
+
+def test_remove_empty_dirs(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = dir_a / "b"
+    dir_b.mkdir(parents=True)
+    write_file(dir_b / "file.txt", "hello")
+
+    run_treeop([str(dir_a)], root)
+    assert (dir_b / ".dirdb").exists()
+
+    os.remove(dir_b / "file.txt")
+    out = run_treeop(["--remove-empty-dirs", str(dir_a)], root)
+    assert "removed-dirs:" in out
+    assert not dir_b.exists()
+
+
+def test_remove_empty_dirs_after_remove_copies(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "file.txt", "same")
+    write_file(dir_b / "file.txt", "same")
+
+    run_treeop(["--intersect", "--remove-copies", "--remove-empty-dirs", "-v", str(dir_a), str(dir_b)], root)
+    assert dir_a.exists()
+    assert not dir_b.exists()
+
+
+def test_remove_empty_dirs_dry_run(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = dir_a / "b"
+    dir_b.mkdir(parents=True)
+    write_file(dir_b / "file.txt", "hello")
+
+    run_treeop([str(dir_a)], root)
+    os.remove(dir_b / "file.txt")
+    out = run_treeop(["--remove-empty-dirs", "--dry-run", str(dir_a)], root)
+    assert "removed-dirs:" in out
+    assert dir_b.exists()
