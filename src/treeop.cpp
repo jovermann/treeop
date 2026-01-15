@@ -40,6 +40,7 @@ namespace fs = std::filesystem;
 
 static constexpr uint64_t kDirDbVersion = 1;
 static constexpr uint64_t kWindowsToUnixEpoch = 11644473600ULL; // seconds
+static uint64_t gBufSize = 1024ULL * 1024ULL;
 
 struct Hash128
 {
@@ -1628,6 +1629,123 @@ private:
     bool sameFilename{};
 };
 
+struct ReadBenchStats
+{
+    uint64_t files{};
+    uint64_t bytes{};
+    uint64_t dirs{};
+    double elapsed{};
+};
+
+/// Read all files under the given roots to measure read performance.
+static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
+{
+    ReadBenchStats stats;
+    std::vector<uint8_t> buffer(gBufSize);
+    double start = ut1::getTimeSec();
+
+    for (const auto& root : roots)
+    {
+        if (gProgress)
+        {
+            gProgress->onDirStart(root);
+        }
+        stats.dirs++;
+        std::error_code ec;
+        fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
+        fs::recursive_directory_iterator end;
+        while (it != end)
+        {
+            if (ec)
+            {
+                if (clVerbose)
+                {
+                    if (it != end)
+                    {
+                        std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+                    }
+                }
+                ec.clear();
+                it.increment(ec);
+                continue;
+            }
+            if (it->path().filename() == ".dirdb")
+            {
+                it.increment(ec);
+                continue;
+            }
+            if (ut1::getFileType(*it, false) == ut1::FT_DIR)
+            {
+                if (gProgress)
+                {
+                    gProgress->onDirStart(it->path());
+                    gProgress->onDirDone();
+                }
+                stats.dirs++;
+                it.increment(ec);
+                continue;
+            }
+            if (ut1::getFileType(*it, false) != ut1::FT_REGULAR)
+            {
+                it.increment(ec);
+                continue;
+            }
+
+            uint64_t size = 0;
+            try
+            {
+                size = static_cast<uint64_t>(it->file_size());
+            }
+            catch (const std::exception&)
+            {
+                throw std::runtime_error("Error while reading file size: " + it->path().string());
+            }
+
+            if (clVerbose)
+            {
+                std::cout << "Reading " << it->path().string() << "\n";
+            }
+
+            std::ifstream is(it->path(), std::ios::binary);
+            if (!is)
+            {
+                throw std::runtime_error("Error while opening file for reading: " + it->path().string());
+            }
+            if (gProgress)
+            {
+                gProgress->onHashStart(it->path(), size);
+            }
+            while (is)
+            {
+                is.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+                std::streamsize count = is.gcount();
+                if (count > 0)
+                {
+                    stats.bytes += static_cast<uint64_t>(count);
+                    if (gProgress)
+                    {
+                        gProgress->onHashProgress(static_cast<uint64_t>(count));
+                    }
+                }
+            }
+            if (gProgress)
+            {
+                gProgress->onHashEnd();
+                gProgress->onFileProcessed(size);
+            }
+            stats.files++;
+            it.increment(ec);
+        }
+        if (gProgress)
+        {
+            gProgress->onDirDone();
+        }
+    }
+
+    stats.elapsed = ut1::getTimeSec() - start;
+    return stats;
+}
+
 /// Normalize a path for consistent comparisons.
 static fs::path normalizePath(const fs::path& path)
 {
@@ -1806,7 +1924,7 @@ static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* seco
     {
         gProgress->onHashStart(path, fileSize);
     }
-    std::vector<uint8_t> buffer(1024 * 1024);
+    std::vector<uint8_t> buffer(gBufSize);
     double start = ut1::getTimeSec();
     while (is)
     {
@@ -2309,6 +2427,8 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "remove-copies", "Delete files from later roots when content exists in earlier roots (with --intersect).");
     cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
     cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
+    cl.addOption(' ', "readbench", "Read all files to measure filesystem read performance.");
+    cl.addOption(' ', "bufsize", "Buffer size for reading (readbench and hashing).", "N", "1M");
     cl.addOption(' ', "min-size", "Minimum file size to hardlink when using --hardlink-copies.", "N", "0");
     cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
     cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
@@ -2325,6 +2445,11 @@ int main(int argc, char *argv[])
     // Parse command line options.
     cl.parse(argc, argv);
     clVerbose = cl.getCount("verbose");
+    gBufSize = ut1::strToU64(cl.getStr("bufsize"));
+    if (gBufSize == 0)
+    {
+        cl.error("--bufsize must be greater than 0.");
+    }
     unsigned progressCount = cl.getCount("progress");
     ProgressTracker progress(cl.getUInt("width"), progressCount > 1);
     if (progressCount > 0)
@@ -2333,7 +2458,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2393,6 +2518,32 @@ int main(int argc, char *argv[])
             {
                 normalizedRoots.push_back(normalizePath(path));
             }
+            if (cl("readbench"))
+            {
+                bool otherOps = cl("stats") || cl("list-files") || cl("size-histogram") || cl("remove-dirdb")
+                    || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both")
+                    || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies")
+                    || cl("get-unique-hash-len") || cl("new-dirdb");
+                if (otherOps)
+                {
+                    cl.error("--readbench cannot be combined with other operations.");
+                }
+
+                ReadBenchStats stats = runReadBench(normalizedRoots);
+                if (gProgress)
+                {
+                    gProgress->finish();
+                }
+                double rate = (stats.elapsed > 0.0) ? (double(stats.bytes) / stats.elapsed) : 0.0;
+                std::cout << "total-files: " << stats.files << "\n";
+                std::cout << "total-dirs: " << stats.dirs << "\n";
+                std::cout << "total-size: " << ut1::getApproxSizeStr(stats.bytes, 3, true, false) << "\n";
+                std::cout << "bufsize: " << ut1::getPreciseSizeStr(static_cast<size_t>(gBufSize)) << "\n";
+                std::cout << "read-rate: " << ut1::getApproxSizeStr(rate, 1, true, true) << "/s\n";
+                std::cout << "elapsed: " << ut1::secondsToString(stats.elapsed) << "\n";
+                return 0;
+            }
+
             MainDb mainDb(normalizedRoots, cl("same-filename"));
 
             // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.

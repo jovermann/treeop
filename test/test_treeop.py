@@ -283,3 +283,22 @@ def test_remove_dirdb(tmp_path: Path):
     run_treeop(["--remove-dirdb", str(dir_a)], root)
     assert not (dir_a / ".dirdb").exists()
     assert not (dir_b / ".dirdb").exists()
+
+
+def test_readbench(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "hello")
+
+    out = run_treeop(["--readbench", str(dir_a)], root)
+    assert "total-files:" in out
+    assert "total-dirs:" in out
+    assert "total-size:" in out
+    assert "bufsize:" in out
+    assert "read-rate:" in out
+    assert "elapsed:" in out
