@@ -133,6 +133,85 @@ def test_remove_copies_from_last(tmp_path: Path):
     assert re.search(r"removed-files:\s+1", out)
 
 
+def setup_three_roots(tmp_path: Path):
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_c = tmp_path / "c"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    dir_c.mkdir()
+
+    write_file(dir_a / "first_only_a.txt", "fa")
+    write_file(dir_b / "first_only_b.txt", "fb")
+    write_file(dir_c / "last_only.txt", "lc")
+    write_file(dir_a / "shared.txt", "same")
+    write_file(dir_c / "shared.txt", "same")
+    write_file(dir_b / "shared2.txt", "same2")
+    write_file(dir_c / "shared2.txt", "same2")
+
+    return dir_a, dir_b, dir_c
+
+
+def test_list_first_three_roots(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a, dir_b, dir_c = setup_three_roots(tmp_path)
+    out = run_treeop(["--intersect", "--list-first", str(dir_a), str(dir_b), str(dir_c)], root)
+    assert "only-in-first:" in out
+    assert str(dir_a / "first_only_a.txt") in out
+    assert str(dir_b / "first_only_b.txt") in out
+    assert str(dir_c / "last_only.txt") not in out
+
+
+def test_list_last_three_roots(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a, dir_b, dir_c = setup_three_roots(tmp_path)
+    out = run_treeop(["--intersect", "--list-last", str(dir_a), str(dir_b), str(dir_c)], root)
+    assert "only-in-last:" in out
+    assert str(dir_c / "last_only.txt") in out
+    assert str(dir_a / "first_only_a.txt") not in out
+    assert str(dir_b / "first_only_b.txt") not in out
+
+
+def test_extract_first_three_roots(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a, dir_b, dir_c = setup_three_roots(tmp_path)
+    dest = tmp_path / "out_first"
+    run_treeop(["--intersect", "--extract-first", str(dest), str(dir_a), str(dir_b), str(dir_c)], root)
+    assert (dest / "first_only_a.txt").exists()
+    assert (dest / "first_only_b.txt").exists()
+    assert not (dest / "last_only.txt").exists()
+    assert not (dest / "shared.txt").exists()
+    assert not (dest / "shared2.txt").exists()
+
+
+def test_extract_last_three_roots(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a, dir_b, dir_c = setup_three_roots(tmp_path)
+    dest = tmp_path / "out_last"
+    run_treeop(["--intersect", "--extract-last", str(dest), str(dir_a), str(dir_b), str(dir_c)], root)
+    assert (dest / "last_only.txt").exists()
+    assert not (dest / "first_only_a.txt").exists()
+    assert not (dest / "first_only_b.txt").exists()
+    assert not (dest / "shared.txt").exists()
+    assert not (dest / "shared2.txt").exists()
+
+
 def supports_hardlinks(tmp_path: Path) -> bool:
     src = tmp_path / "hl_src"
     dst = tmp_path / "hl_dst"

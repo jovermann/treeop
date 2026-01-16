@@ -694,8 +694,8 @@ public:
     }
 
     /// Print intersect stats and optional file lists/extractions.
-    void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listA, bool listB, bool listBoth,
-        const fs::path* extractA, const fs::path* extractB, bool removeCopies, bool removeCopiesFromLast, bool dryRun) const
+    void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listFirst, bool listLast, bool listBoth,
+        const fs::path* extractFirst, const fs::path* extractLast, bool removeCopies, bool removeCopiesFromLast, bool dryRun) const
     {
         std::vector<std::map<ContentKey, std::vector<FileEntry>>> rootFiles(rootPaths.size());
         std::map<ContentKey, size_t> rootsWithKey;
@@ -824,51 +824,114 @@ public:
         std::cout << "total:\n";
         printStatList(totalStats);
 
-        if (rootPaths.size() == 2)
+        size_t lastIndex = rootPaths.size() - 1;
+        const auto& lastFiles = rootFiles[lastIndex];
+        std::set<ContentKey> firstKeys;
+        std::set<ContentKey> lastKeys;
+        for (const auto& [key, listRefs] : lastFiles)
         {
-            auto& filesA = rootFiles[0];
-            auto& filesB = rootFiles[1];
-            if (extractA)
+            if (!listRefs.empty())
             {
-                copyIntersectFiles(rootPaths[0], *extractA, filesA, filesB, dryRun);
+                lastKeys.insert(key);
             }
-            if (extractB)
+        }
+        for (size_t i = 0; i < lastIndex; i++)
+        {
+            for (const auto& [key, listRefs] : rootFiles[i])
             {
-                copyIntersectFiles(rootPaths[1], *extractB, filesB, filesA, dryRun);
+                if (!listRefs.empty())
+                {
+                    firstKeys.insert(key);
+                }
             }
         }
 
+            if (extractFirst)
+            {
+                for (size_t i = 0; i < lastIndex; i++)
+                {
+                    copyIntersectFiles(rootPaths[i], *extractFirst, rootFiles[i], lastFiles, dryRun, true);
+                }
+            }
+            if (extractLast)
+            {
+                std::map<ContentKey, std::vector<FileEntry>> firstFiles;
+                for (const auto& key : firstKeys)
+                {
+                    firstFiles.emplace(key, std::vector<FileEntry>{});
+                }
+                copyIntersectFiles(rootPaths[lastIndex], *extractLast, lastFiles, firstFiles, dryRun, false);
+            }
+
         size_t hashLen = 0;
-        if (clVerbose > 0 && (listA || listB || listBoth))
+        if (clVerbose > 0 && (listFirst || listLast || listBoth))
         {
             hashLen = getUniqueHashHexLen();
         }
 
-        if (listA && rootPaths.size() == 2)
+        if (listFirst)
         {
-            std::cout << "only-in-A:\n";
+            std::cout << "only-in-first:\n";
             if (clVerbose > 0)
             {
                 std::vector<FileEntry> refs;
-                for (const auto& [key, listARefs] : rootFiles[0])
+                for (size_t i = 0; i < lastIndex; i++)
                 {
-                    if (rootFiles[1].find(key) != rootFiles[1].end())
+                    for (const auto& [key, listRefs] : rootFiles[i])
                     {
-                        continue;
+                        if (lastKeys.find(key) != lastKeys.end())
+                        {
+                            continue;
+                        }
+                        refs.insert(refs.end(), listRefs.begin(), listRefs.end());
                     }
-                    refs.insert(refs.end(), listARefs.begin(), listARefs.end());
                 }
                 printListRows(refs, clVerbose > 1, hashLen);
             }
             else
             {
-                for (const auto& [key, listARefs] : rootFiles[0])
+                for (size_t i = 0; i < lastIndex; i++)
                 {
-                    if (rootFiles[1].find(key) != rootFiles[1].end())
+                    for (const auto& [key, listRefs] : rootFiles[i])
+                    {
+                        if (lastKeys.find(key) != lastKeys.end())
+                        {
+                            continue;
+                        }
+                        for (const auto& ref : listRefs)
+                        {
+                            std::cout << ref.path << "\n";
+                        }
+                    }
+                }
+            }
+        }
+
+        if (listLast)
+        {
+            std::cout << "only-in-last:\n";
+            if (clVerbose > 0)
+            {
+                std::vector<FileEntry> refs;
+                for (const auto& [key, listRefs] : lastFiles)
+                {
+                    if (firstKeys.find(key) != firstKeys.end())
                     {
                         continue;
                     }
-                    for (const auto& ref : listARefs)
+                    refs.insert(refs.end(), listRefs.begin(), listRefs.end());
+                }
+                printListRows(refs, clVerbose > 1, hashLen);
+            }
+            else
+            {
+                for (const auto& [key, listRefs] : lastFiles)
+                {
+                    if (firstKeys.find(key) != firstKeys.end())
+                    {
+                        continue;
+                    }
+                    for (const auto& ref : listRefs)
                     {
                         std::cout << ref.path << "\n";
                     }
@@ -876,61 +939,38 @@ public:
             }
         }
 
-        if (listB && rootPaths.size() == 2)
-        {
-            std::cout << "only-in-B:\n";
-            if (clVerbose > 0)
-            {
-                std::vector<FileEntry> refs;
-                for (const auto& [key, listBRefs] : rootFiles[1])
-                {
-                    if (rootFiles[0].find(key) != rootFiles[0].end())
-                    {
-                        continue;
-                    }
-                    refs.insert(refs.end(), listBRefs.begin(), listBRefs.end());
-                }
-                printListRows(refs, clVerbose > 1, hashLen);
-            }
-            else
-            {
-                for (const auto& [key, listBRefs] : rootFiles[1])
-                {
-                    if (rootFiles[0].find(key) != rootFiles[0].end())
-                    {
-                        continue;
-                    }
-                    for (const auto& ref : listBRefs)
-                    {
-                        std::cout << ref.path << "\n";
-                    }
-                }
-            }
-        }
-
-        if (listBoth && rootPaths.size() == 2)
+        if (listBoth)
         {
             std::cout << "in-both:\n";
             if (clVerbose > 0)
             {
                 std::vector<FileEntry> refs;
-                for (const auto& [key, listARefs] : rootFiles[0])
+                for (size_t i = 0; i < lastIndex; i++)
                 {
-                    auto itB = rootFiles[1].find(key);
-                    if (itB == rootFiles[1].end())
+                    for (const auto& [key, listRefs] : rootFiles[i])
+                    {
+                        if (lastKeys.find(key) == lastKeys.end())
+                        {
+                            continue;
+                        }
+                        for (const auto& ref : listRefs)
+                        {
+                            FileEntry labeled = ref;
+                            labeled.path = "first: " + labeled.path;
+                            refs.push_back(std::move(labeled));
+                        }
+                    }
+                }
+                for (const auto& [key, listRefs] : lastFiles)
+                {
+                    if (firstKeys.find(key) == firstKeys.end())
                     {
                         continue;
                     }
-                    for (const auto& ref : listARefs)
+                    for (const auto& ref : listRefs)
                     {
                         FileEntry labeled = ref;
-                        labeled.path = "A: " + labeled.path;
-                        refs.push_back(std::move(labeled));
-                    }
-                    for (const auto& ref : itB->second)
-                    {
-                        FileEntry labeled = ref;
-                        labeled.path = "B: " + labeled.path;
+                        labeled.path = "last: " + labeled.path;
                         refs.push_back(std::move(labeled));
                     }
                 }
@@ -938,20 +978,29 @@ public:
             }
             else
             {
-                for (const auto& [key, listARefs] : rootFiles[0])
+                for (size_t i = 0; i < lastIndex; i++)
                 {
-                    auto itB = rootFiles[1].find(key);
-                    if (itB == rootFiles[1].end())
+                    for (const auto& [key, listRefs] : rootFiles[i])
+                    {
+                        if (lastKeys.find(key) == lastKeys.end())
+                        {
+                            continue;
+                        }
+                        for (const auto& ref : listRefs)
+                        {
+                            std::cout << "first: " << ref.path << "\n";
+                        }
+                    }
+                }
+                for (const auto& [key, listRefs] : lastFiles)
+                {
+                    if (firstKeys.find(key) == firstKeys.end())
                     {
                         continue;
                     }
-                    for (const auto& ref : listARefs)
+                    for (const auto& ref : listRefs)
                     {
-                        std::cout << "A: " << ref.path << "\n";
-                    }
-                    for (const auto& ref : itB->second)
-                    {
-                        std::cout << "B: " << ref.path << "\n";
+                        std::cout << "last: " << ref.path << "\n";
                     }
                 }
             }
@@ -1277,13 +1326,13 @@ private:
     static void copyIntersectFiles(const fs::path& rootSrc, const fs::path& destRoot,
         const std::map<ContentKey, std::vector<FileEntry>>& filesSrc,
         const std::map<ContentKey, std::vector<FileEntry>>& filesOther,
-        bool dryRun)
+        bool dryRun, bool allowExisting)
     {
-        if (fs::exists(destRoot))
+        if (fs::exists(destRoot) && !allowExisting)
         {
             throw std::runtime_error("Destination exists: " + destRoot.string());
         }
-        if (!dryRun)
+        if (!dryRun && !fs::exists(destRoot))
         {
             fs::create_directories(destRoot);
         }
@@ -1314,6 +1363,10 @@ private:
                 if (ec)
                 {
                     throw std::runtime_error("Failed to copy to " + destPath.string());
+                }
+                if (clVerbose)
+                {
+                    std::cout << "Copied " << srcPath.string() << " -> " << destPath.string() << "\n";
                 }
             }
         }
@@ -2569,11 +2622,11 @@ int main(int argc, char *argv[])
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
     cl.addOption(' ', "list-dirs", "List all directories with file counts and total size.");
-    cl.addOption(' ', "list-a", "List files only in A when used with --intersect.");
-    cl.addOption(' ', "list-b", "List files only in B when used with --intersect.");
-    cl.addOption(' ', "list-both", "List files in both A and B when used with --intersect.");
-    cl.addOption(' ', "extract-a", "Extract files only in A into DIR when used with --intersect.", "DIR", "");
-    cl.addOption(' ', "extract-b", "Extract files only in B into DIR when used with --intersect.", "DIR", "");
+    cl.addOption(' ', "list-first", "List files only in the first roots when used with --intersect.");
+    cl.addOption(' ', "list-last", "List files only in the last root when used with --intersect.");
+    cl.addOption(' ', "list-both", "List files in both the first roots and the last root when used with --intersect.");
+    cl.addOption(' ', "extract-first", "Extract files only in the first roots into DIR when used with --intersect.", "DIR", "");
+    cl.addOption(' ', "extract-last", "Extract files only in the last root into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "remove-copies", "Delete files from later roots when content exists in earlier roots (with --intersect).");
     cl.addOption(' ', "remove-copies-from-last", "Delete files only from the last root when content exists in earlier roots (with --intersect).");
     cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
@@ -2610,7 +2663,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2639,13 +2692,13 @@ int main(int argc, char *argv[])
         {
             cl.error("Cannot combine --new-dirdb with --update-dirdb.");
         }
-        if ((cl("list-a") || cl("list-b") || cl("list-both")) && !cl("intersect"))
+        if ((cl("list-first") || cl("list-last") || cl("list-both")) && !cl("intersect"))
         {
-            cl.error("--list-a/--list-b/--list-both require --intersect.");
+            cl.error("--list-first/--list-last/--list-both require --intersect.");
         }
-        if ((cl("extract-a") || cl("extract-b")) && !cl("intersect"))
+        if ((cl("extract-first") || cl("extract-last")) && !cl("intersect"))
         {
-            cl.error("--extract-a/--extract-b require --intersect.");
+            cl.error("--extract-first/--extract-last require --intersect.");
         }
         if ((cl("remove-copies") || cl("remove-copies-from-last")) && !cl("intersect"))
         {
@@ -2654,10 +2707,6 @@ int main(int argc, char *argv[])
         if (cl("remove-copies") && cl("remove-copies-from-last"))
         {
             cl.error("Cannot combine --remove-copies with --remove-copies-from-last.");
-        }
-        if (cl("dry-run") && !(cl("remove-copies") || cl("remove-copies-from-last") || cl("extract-a") || cl("extract-b") || cl("remove-dirdb") || cl("hardlink-copies") || cl("remove-empty-dirs")))
-        {
-            cl.error("--dry-run requires --remove-copies/--remove-copies-from-last, --extract-a/--extract-b, --remove-dirdb, --hardlink-copies, or --remove-empty-dirs.");
         }
 
         std::vector<fs::path> normalizedRoots;
@@ -2678,8 +2727,8 @@ int main(int argc, char *argv[])
             if (cl("readbench"))
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                    || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both")
-                    || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies")
+                    || cl("intersect") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                    || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs");
                 if (otherOps)
                 {
@@ -2725,27 +2774,23 @@ int main(int argc, char *argv[])
                 {
                     cl.error("--intersect requires at least two directories.");
                 }
-                if ((cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b")) && normalizedRoots.size() != 2)
+                std::optional<fs::path> extractFirst;
+                std::optional<fs::path> extractLast;
+                if (cl("extract-first"))
                 {
-                    cl.error("--list-a/--list-b/--list-both/--extract-a/--extract-b require exactly two directories.");
+                    extractFirst = normalizePath(cl.getStr("extract-first"));
                 }
-                std::optional<fs::path> extractA;
-                std::optional<fs::path> extractB;
-                if (cl("extract-a"))
+                if (cl("extract-last"))
                 {
-                    extractA = normalizePath(cl.getStr("extract-a"));
-                }
-                if (cl("extract-b"))
-                {
-                    extractB = normalizePath(cl.getStr("extract-b"));
+                    extractLast = normalizePath(cl.getStr("extract-last"));
                 }
                 mainDb.printIntersectStats(
                     normalizedRoots,
-                    cl("list-a"),
-                    cl("list-b"),
+                    cl("list-first"),
+                    cl("list-last"),
                     cl("list-both"),
-                    extractA ? &*extractA : nullptr,
-                    extractB ? &*extractB : nullptr,
+                    extractFirst ? &*extractFirst : nullptr,
+                    extractLast ? &*extractLast : nullptr,
                     cl("remove-copies"),
                     cl("remove-copies-from-last"),
                     cl("dry-run"));
