@@ -695,7 +695,7 @@ public:
 
     /// Print intersect stats and optional file lists/extractions.
     void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listA, bool listB, bool listBoth,
-        const fs::path* extractA, const fs::path* extractB, bool removeCopies, bool dryRun) const
+        const fs::path* extractA, const fs::path* extractB, bool removeCopies, bool removeCopiesFromLast, bool dryRun) const
     {
         std::vector<std::map<ContentKey, std::vector<FileEntry>>> rootFiles(rootPaths.size());
         std::map<ContentKey, size_t> rootsWithKey;
@@ -734,9 +734,10 @@ public:
         }
 
         RemoveCopyStats removedStats;
-        if (removeCopies)
+        bool removeAny = removeCopies || removeCopiesFromLast;
+        if (removeAny)
         {
-            removedStats = removeCopyFiles(rootFiles, dryRun);
+            removedStats = removeCopyFiles(rootFiles, removeCopiesFromLast, dryRun);
         }
 
         for (size_t i = 0; i < rootFiles.size(); i++)
@@ -812,7 +813,7 @@ public:
             {"shared-files:", formatCountInt(totalShared.files), "(" + totalSharedFilesPct + " of total)"},
             {"shared-size:", ut1::getApproxSizeStr(totalShared.bytes, 3, true, false), "(" + totalSharedBytesPct + " of total)"}
         };
-        if (removeCopies)
+        if (removeAny)
         {
             std::string removedFilesPct = formatPercentFixed(totalFilesAll == 0 ? 0.0 : (100.0 * removedStats.files / totalFilesAll));
             std::string removedBytesPct = formatPercentFixed(totalBytesAll == 0 ? 0.0 : (100.0 * removedStats.bytes / totalBytesAll));
@@ -1318,12 +1319,18 @@ private:
         }
     }
 
-    /// Remove duplicate files from later roots, keeping earliest roots.
-    static RemoveCopyStats removeCopyFiles(const std::vector<std::map<ContentKey, std::vector<FileEntry>>>& rootFiles, bool dryRun)
+    /// Remove duplicate files from later roots, keeping earliest roots (or only from last root when requested).
+    static RemoveCopyStats removeCopyFiles(const std::vector<std::map<ContentKey, std::vector<FileEntry>>>& rootFiles, bool lastOnly, bool dryRun)
     {
-        std::map<ContentKey, size_t> firstRoot;
         RemoveCopyStats stats;
         std::set<fs::path> touchedDirs;
+        if (rootFiles.empty())
+        {
+            return stats;
+        }
+
+        size_t lastIndex = rootFiles.size() - 1;
+        std::map<ContentKey, size_t> firstRoot;
         for (size_t i = 0; i < rootFiles.size(); i++)
         {
             for (const auto& [key, listRefs] : rootFiles[i])
@@ -1338,7 +1345,7 @@ private:
                     firstRoot.emplace(key, i);
                     continue;
                 }
-                if (i > it->second)
+                if ((lastOnly && i == lastIndex) || (!lastOnly && i > it->second))
                 {
                     for (const auto& ref : listRefs)
                     {
@@ -2555,7 +2562,7 @@ int main(int argc, char *argv[])
                         "All sizes may be specified with kMGTPE suffixes indicating powers of 1024.";
     ut1::CommandLineParser cl("treeop", usage,
         "\n$programName version $version *** Copyright (c) 2026 Johannes Overmann *** https://github.com/jovermann/treeop",
-        "0.1.1");
+        "0.2.1");
 
     cl.addHeader("\nOptions:\n");
     cl.addOption('i', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
@@ -2568,6 +2575,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "extract-a", "Extract files only in A into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "extract-b", "Extract files only in B into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "remove-copies", "Delete files from later roots when content exists in earlier roots (with --intersect).");
+    cl.addOption(' ', "remove-copies-from-last", "Delete files only from the last root when content exists in earlier roots (with --intersect).");
     cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
     cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
     cl.addOption(' ', "remove-empty-dirs", "Remove empty directories (ignoring .dirdb files).");
@@ -2602,7 +2610,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-a") || cl("list-b") || cl("list-both") || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2639,13 +2647,17 @@ int main(int argc, char *argv[])
         {
             cl.error("--extract-a/--extract-b require --intersect.");
         }
-        if (cl("remove-copies") && !cl("intersect"))
+        if ((cl("remove-copies") || cl("remove-copies-from-last")) && !cl("intersect"))
         {
-            cl.error("--remove-copies requires --intersect.");
+            cl.error("--remove-copies/--remove-copies-from-last require --intersect.");
         }
-        if (cl("dry-run") && !(cl("remove-copies") || cl("extract-a") || cl("extract-b") || cl("remove-dirdb") || cl("hardlink-copies") || cl("remove-empty-dirs")))
+        if (cl("remove-copies") && cl("remove-copies-from-last"))
         {
-            cl.error("--dry-run requires --remove-copies, --extract-a/--extract-b, --remove-dirdb, --hardlink-copies, or --remove-empty-dirs.");
+            cl.error("Cannot combine --remove-copies with --remove-copies-from-last.");
+        }
+        if (cl("dry-run") && !(cl("remove-copies") || cl("remove-copies-from-last") || cl("extract-a") || cl("extract-b") || cl("remove-dirdb") || cl("hardlink-copies") || cl("remove-empty-dirs")))
+        {
+            cl.error("--dry-run requires --remove-copies/--remove-copies-from-last, --extract-a/--extract-b, --remove-dirdb, --hardlink-copies, or --remove-empty-dirs.");
         }
 
         std::vector<fs::path> normalizedRoots;
@@ -2667,7 +2679,7 @@ int main(int argc, char *argv[])
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("update-dirdb") || cl("list-a") || cl("list-b") || cl("list-both")
-                    || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("hardlink-copies")
+                    || cl("extract-a") || cl("extract-b") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs");
                 if (otherOps)
                 {
@@ -2735,6 +2747,7 @@ int main(int argc, char *argv[])
                     extractA ? &*extractA : nullptr,
                     extractB ? &*extractB : nullptr,
                     cl("remove-copies"),
+                    cl("remove-copies-from-last"),
                     cl("dry-run"));
             }
             else

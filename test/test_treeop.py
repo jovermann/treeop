@@ -109,6 +109,30 @@ def test_remove_copies_actual(tmp_path: Path):
     assert re.search(r"removed-files:\s+1", out)
 
 
+def test_remove_copies_from_last(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_c = tmp_path / "c"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    dir_c.mkdir()
+
+    write_file(dir_a / "same.txt", "hello")
+    write_file(dir_b / "same.txt", "hello")
+    write_file(dir_c / "same.txt", "hello")
+
+    out = run_treeop(["--intersect", "--remove-copies-from-last", str(dir_a), str(dir_b), str(dir_c)], root)
+    assert (dir_a / "same.txt").exists()
+    assert (dir_b / "same.txt").exists()
+    assert not (dir_c / "same.txt").exists()
+    assert re.search(r"removed-files:\s+1", out)
+
+
 def supports_hardlinks(tmp_path: Path) -> bool:
     src = tmp_path / "hl_src"
     dst = tmp_path / "hl_dst"
