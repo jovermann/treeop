@@ -502,7 +502,7 @@ public:
                     if (file.numLinks > countInRoot)
                     {
                         uint64_t outsideLinks = file.numLinks - countInRoot;
-                        std::cerr << "Warning: " << (dir.path / file.path).string()
+                        std::cout << "Warning: " << (dir.path / file.path).string()
                                   << " has " << outsideLinks << " hardlinks outside root\n";
                     }
                 }
@@ -1227,13 +1227,13 @@ public:
                     }
                     else if (clVerbose)
                     {
-                        std::cerr << "Warning: Failed to read hardlink count for " << oldestPath.string()
+                        std::cout << "Warning: Failed to read hardlink count for " << oldestPath.string()
                                   << ": " << ec.message() << "\n";
                     }
                 }
                 if (linkCount >= maxHardlinks)
                 {
-                    std::cerr << "Warning: " << oldestPath.string() << " has " << linkCount
+                    std::cout << "Warning: " << oldestPath.string() << " has " << linkCount
                               << " hardlinks (>= " << maxHardlinks << "), skipping.\n";
                     return;
                 }
@@ -1257,7 +1257,7 @@ public:
                         std::string errorMsg;
                         if (!replaceWithHardlink(oldestPath, fs::path(ref.path), &errorMsg))
                         {
-                            std::cerr << "Warning: " << errorMsg << "\n";
+                            std::cout << "Warning: " << errorMsg << "\n";
                             continue;
                         }
                         if (clVerbose)
@@ -1338,7 +1338,7 @@ public:
                 std::string errorMsg;
                 if (!replaceWithCopy(target, &errorMsg))
                 {
-                    std::cerr << "Warning: " << errorMsg << "\n";
+                    std::cout << "Warning: " << errorMsg << "\n";
                     continue;
                 }
                 if (clVerbose)
@@ -1911,7 +1911,7 @@ private:
                 {
                     if (it != end)
                     {
-                        std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+                        std::cout << "Skipping entry due to error: " << it->path() << "\n";
                     }
                 }
                 ec.clear();
@@ -2176,7 +2176,7 @@ static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
                 {
                     if (it != end)
                     {
-                        std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+                        std::cout << "Skipping entry due to error: " << it->path() << "\n";
                     }
                 }
                 ec.clear();
@@ -2272,7 +2272,7 @@ static bool isDirEmpty(const fs::path& dir, bool& hasDirDb)
         {
             if (clVerbose)
             {
-                std::cerr << "Skipping entry due to error: " << dir.string() << "\n";
+                std::cout << "Skipping entry due to error: " << dir.string() << "\n";
             }
             return false;
         }
@@ -2304,7 +2304,7 @@ static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool
         {
             if (clVerbose)
             {
-                std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+                std::cout << "Skipping entry due to error: " << it->path() << "\n";
             }
             ec.clear();
             continue;
@@ -2988,7 +2988,7 @@ static void removeDirDbTree(const fs::path& root, bool dryRun)
         {
             if (clVerbose && it != end)
             {
-                std::cerr << "Skipping entry due to error: " << it->path() << "\n";
+                std::cout << "Skipping entry due to error: " << it->path() << "\n";
             }
             ec.clear();
             it.increment(ec);

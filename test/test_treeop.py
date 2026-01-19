@@ -239,6 +239,29 @@ def test_list_hardlinks(tmp_path: Path):
     assert str(file_b) in out
 
 
+def test_stats_after_break_hardlinks_no_warning(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    root_dir = tmp_path / "root"
+    sub_dir = root_dir / "sub"
+    root_dir.mkdir()
+    sub_dir.mkdir()
+
+    write_file(root_dir / "a.txt", "same")
+    write_file(sub_dir / "b.txt", "same")
+
+    run_treeop(["--hardlink-copies", "--min-size", "1", str(root_dir)], root)
+    run_treeop(["--break-hardlinks", str(root_dir)], root)
+    out = run_treeop(["--stats", str(root_dir)], root)
+    assert "hardlinks outside root" not in out
+
+
 def setup_three_roots(tmp_path: Path):
     dir_a = tmp_path / "a"
     dir_b = tmp_path / "b"
