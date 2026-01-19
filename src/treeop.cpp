@@ -510,6 +510,11 @@ public:
                 });
             }
         }
+        std::sort(refs.begin(), refs.end(),
+            [](const FileEntry& a, const FileEntry& b)
+            {
+                return a.path < b.path;
+            });
         printListRows(refs, clVerbose > 1, hashLen);
     }
 
@@ -576,26 +581,37 @@ public:
 
         const size_t minFilesWidth = 6;
         const size_t minSizeWidth = std::string("1023.9GB").size();
+        std::vector<const DirDbData*> sortedDirs;
+        sortedDirs.reserve(dirs.size());
         for (const auto& dir : dirs)
         {
+            sortedDirs.push_back(&dir);
+        }
+        std::sort(sortedDirs.begin(), sortedDirs.end(),
+            [](const DirDbData* a, const DirDbData* b)
+            {
+                return a->path < b->path;
+            });
+        for (const auto* dir : sortedDirs)
+        {
             uint64_t totalSize = 0;
-            for (const auto& file : dir.files)
+            for (const auto& file : dir->files)
             {
                 totalSize += file.size;
             }
             std::string sizeStr = compactSizeStr(static_cast<double>(totalSize), 1, false);
-            std::string filesStr = formatCountInt(dir.files.size()) + "f";
+            std::string filesStr = formatCountInt(dir->files.size()) + "f";
             std::cout << std::setw(minFilesWidth) << filesStr << " "
                       << std::setw(minSizeWidth) << sizeStr;
             if (clVerbose > 0)
             {
-                double avgBytes = dir.files.empty() ? 0.0 : (static_cast<double>(dir.dbSize) / dir.files.size());
-                std::string dbSizeStr = compactSizeStr(static_cast<double>(dir.dbSize), 3, false);
+                double avgBytes = dir->files.empty() ? 0.0 : (static_cast<double>(dir->dbSize) / dir->files.size());
+                std::string dbSizeStr = compactSizeStr(static_cast<double>(dir->dbSize), 3, false);
                 std::string avgStr = compactSizeStr(avgBytes, 1, true);
                 std::cout << " " << std::setw(minSizeWidth) << dbSizeStr
                           << " " << std::setw(minSizeWidth) << avgStr;
             }
-            std::cout << " " << dir.path.string() << "\n";
+            std::cout << " " << dir->path.string() << "\n";
         }
     }
 
