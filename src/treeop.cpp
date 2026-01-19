@@ -672,6 +672,52 @@ public:
         }
     }
 
+    /// List all hardlink groups (inode link count >= 2).
+    void listHardlinks() const
+    {
+        std::unordered_map<uint64_t, std::vector<FileEntry>> byInode;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                byInode[file.inode].push_back(FileEntry{
+                    (dir.path / file.path).string(),
+                    file.size,
+                    file.hash,
+                    file.inode,
+                    file.date,
+                    file.numLinks
+                });
+            }
+        }
+
+        size_t hashLen = getUniqueHashHexLen();
+        std::vector<FileEntry> refs;
+        for (auto& [inode, files] : byInode)
+        {
+            if (files.size() < 2)
+            {
+                continue;
+            }
+            std::sort(files.begin(), files.end(),
+                [](const FileEntry& a, const FileEntry& b)
+                {
+                    return a.path < b.path;
+                });
+            refs.insert(refs.end(), files.begin(), files.end());
+        }
+        std::sort(refs.begin(), refs.end(),
+            [](const FileEntry& a, const FileEntry& b)
+            {
+                if (a.inode != b.inode)
+                {
+                    return a.inode < b.inode;
+                }
+                return a.path < b.path;
+            });
+        printListRows(refs, true, hashLen);
+    }
+
     /// Print a size histogram over all files.
     void printSizeHistogram(uint64_t batchSize, uint64_t maxSizeLimit, bool hasMaxSize) const
     {
@@ -1247,20 +1293,28 @@ public:
         BreakHardlinkStats stats;
         std::set<fs::path> touchedDirs;
         std::unordered_map<uint64_t, uint64_t> inodeCounts;
+        std::unordered_map<uint64_t, std::set<fs::path>> inodeDirs;
         for (const auto& dir : dirs)
         {
             for (const auto& file : dir.files)
             {
                 inodeCounts[file.inode]++;
+                inodeDirs[file.inode].insert(dir.path);
             }
         }
         std::unordered_map<uint64_t, uint64_t> remaining;
         remaining.reserve(inodeCounts.size());
+        std::set<fs::path> updateDirs;
         for (const auto& [inode, count] : inodeCounts)
         {
             if (count > 1)
             {
                 remaining.emplace(inode, count - 1);
+                auto it = inodeDirs.find(inode);
+                if (it != inodeDirs.end())
+                {
+                    updateDirs.insert(it->second.begin(), it->second.end());
+                }
             }
         }
         for (const auto& dir : dirs)
@@ -1299,7 +1353,7 @@ public:
 
         if (!dryRun)
         {
-            for (const auto& dirPath : touchedDirs)
+            for (const auto& dirPath : updateDirs)
             {
                 if (ut1::fsExists(dirPath / ".dirdb"))
                 {
@@ -2970,6 +3024,7 @@ int main(int argc, char *argv[])
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
     cl.addOption(' ', "list-redundant", "List redundant files grouped by content hash.");
+    cl.addOption(' ', "list-hardlinks", "List hardlinked files grouped by inode.");
     cl.addOption(' ', "list-dirs", "List all directories with file counts and total size.");
     cl.addOption(' ', "list-first", "List files only in the first roots when used with --intersect.");
     cl.addOption(' ', "list-last", "List files only in the last root when used with --intersect.");
@@ -3013,7 +3068,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -3076,7 +3131,7 @@ int main(int argc, char *argv[])
         {
             if (cl("readbench"))
             {
-                bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+                bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                     || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs");
@@ -3177,6 +3232,10 @@ int main(int argc, char *argv[])
                 if (cl("list-files"))
                 {
                     mainDb.listFiles();
+                }
+                if (cl("list-hardlinks"))
+                {
+                    mainDb.listHardlinks();
                 }
                 if (cl("list-redundant"))
                 {
