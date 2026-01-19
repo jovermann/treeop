@@ -239,6 +239,23 @@ def test_list_hardlinks(tmp_path: Path):
     assert str(file_b) in out
 
 
+def test_list_dirs(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = dir_a / "b"
+    dir_b.mkdir(parents=True)
+    write_file(dir_a / "file.txt", "hello")
+    write_file(dir_b / "file.txt", "world")
+
+    out = run_treeop(["--list-dirs", str(dir_a)], root)
+    assert str(dir_a) in out
+    assert str(dir_b) in out
+
+
 def test_stats_after_break_hardlinks_no_warning(tmp_path: Path):
     if not supports_hardlinks(tmp_path):
         pytest.skip("Filesystem does not support hardlinks")
@@ -260,6 +277,111 @@ def test_stats_after_break_hardlinks_no_warning(tmp_path: Path):
     run_treeop(["--break-hardlinks", str(root_dir)], root)
     out = run_treeop(["--stats", str(root_dir)], root)
     assert "hardlinks outside root" not in out
+
+
+def test_list_both(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "same.txt", "same")
+    write_file(dir_b / "same.txt", "same")
+
+    out = run_treeop(["--intersect", "--list-both", str(dir_a), str(dir_b)], root)
+    assert "in-both:" in out
+    assert "first:" in out
+    assert "last:" in out
+
+
+def test_unique_hash_len(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "a.txt", "one")
+    write_file(dir_a / "b.txt", "two")
+
+    out = run_treeop(["--get-unique-hash-len", str(dir_a)], root)
+    match = re.search(r"unique-hash-len:\s+([0-9]+)", out)
+    assert match
+    assert int(match.group(1)) > 0
+
+
+def test_size_histogram_max_size(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "small.txt", "ab")
+    write_file(dir_a / "large.txt", "x" * 10)
+
+    out = run_treeop(["--size-histogram", "4", "--max-size", "4", str(dir_a)], root)
+    assert re.search(r":\s+1\s+2 bytes", out)
+    assert "10 bytes" not in out
+
+
+def test_bufsize_readbench(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "hello")
+
+    out = run_treeop(["--readbench", "--bufsize", "4k", str(dir_a)], root)
+    assert "bufsize:" in out
+
+
+def test_max_hardlinks(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    file_a = dir_a / "same.txt"
+    file_b = dir_b / "same.txt"
+    write_file(file_a, "hello")
+    write_file(file_b, "hello")
+
+    out = run_treeop(["--hardlink-copies", "--min-size", "1", "--max-hardlinks", "1", str(dir_a), str(dir_b)], root)
+    assert file_a.stat().st_ino != file_b.stat().st_ino
+    assert re.search(r"hardlinks-created:\s+0", out)
+
+
+def test_progress_width(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "hello")
+
+    out = run_treeop(["--progress", "--width", "10", str(dir_a)], root)
+    assert "files:" in out
 
 
 def setup_three_roots(tmp_path: Path):
