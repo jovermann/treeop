@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <bit>
 #include <optional>
 #include <set>
@@ -423,6 +424,9 @@ public:
             uint64_t totalHashedBytes = 0;
             double totalHashSeconds = 0.0;
             std::map<ContentKey, uint64_t> contentCounts;
+            std::unordered_map<uint64_t, uint64_t> inodeSizes;
+            std::map<ContentKey, std::unordered_set<uint64_t>> contentInodes;
+            std::unordered_map<uint64_t, uint64_t> inodeCounts;
             for (const auto& dir : dirs)
             {
                 if (!isPathWithin(rootData.path, dir.path))
@@ -437,6 +441,12 @@ public:
                     Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
                     ContentKey key{file.size, keyHash};
                     contentCounts[key]++;
+                    if (inodeSizes.find(file.inode) == inodeSizes.end())
+                    {
+                        inodeSizes[file.inode] = file.size;
+                    }
+                    contentInodes[key].insert(file.inode);
+                    inodeCounts[file.inode]++;
                 }
                 totalDbSize += dir.dbSize;
                 totalHashedBytes += dir.hashedBytes;
@@ -447,17 +457,62 @@ public:
             uint64_t redundantSize = 0;
             for (const auto& [key, count] : contentCounts)
             {
-                if (count > 1)
+                auto inodeIt = contentInodes.find(key);
+                if (inodeIt == contentInodes.end())
                 {
-                    uint64_t extra = count - 1;
+                    continue;
+                }
+                size_t uniqueInodes = inodeIt->second.size();
+                if (uniqueInodes > 1)
+                {
+                    uint64_t extra = static_cast<uint64_t>(uniqueInodes - 1);
                     redundantFiles += extra;
                     redundantSize += extra * key.size;
+                }
+            }
+
+            uint64_t hardlinkedFiles = 0;
+            uint64_t hardlinkedSize = 0;
+            for (const auto& [key, inodes] : contentInodes)
+            {
+                auto countIt = contentCounts.find(key);
+                if (countIt == contentCounts.end())
+                {
+                    continue;
+                }
+                uint64_t count = countIt->second;
+                if (count <= inodes.size())
+                {
+                    continue;
+                }
+                uint64_t extra = count - static_cast<uint64_t>(inodes.size());
+                hardlinkedFiles += extra;
+                hardlinkedSize += extra * key.size;
+            }
+
+            for (const auto& dir : dirs)
+            {
+                if (!isPathWithin(rootData.path, dir.path))
+                {
+                    continue;
+                }
+                for (const auto& file : dir.files)
+                {
+                    uint64_t countInRoot = inodeCounts[file.inode];
+                    if (file.numLinks > countInRoot)
+                    {
+                        uint64_t outsideLinks = file.numLinks - countInRoot;
+                        std::cerr << "Warning: " << (dir.path / file.path).string()
+                                  << " has " << outsideLinks << " hardlinks outside root\n";
+                    }
                 }
             }
 
             std::string percentStr = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * totalDbSize / totalSize));
             std::string redundantFilesPct = formatPercentFixed(fileCount == 0 ? 0.0 : (100.0 * redundantFiles / fileCount));
             std::string redundantSizePct = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * redundantSize / totalSize));
+            std::string hardlinkedFilesPct = formatPercentFixed(fileCount == 0 ? 0.0 : (100.0 * hardlinkedFiles / fileCount));
+            std::string hardlinkedSizePct = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * hardlinkedSize / totalSize));
             double dirdbBytesPerFile = (fileCount == 0) ? 0.0 : (double(totalDbSize) / double(fileCount));
             std::string elapsedStr;
             if (rootData.elapsedSeconds > 0.0)
@@ -470,6 +525,8 @@ public:
                 {"total-size:", ut1::getApproxSizeStr(totalSize, 3, true, false), std::string()},
                 {"redundant-files:", formatCountInt(redundantFiles), "(" + redundantFilesPct + ")"},
                 {"redundant-size:", ut1::getApproxSizeStr(redundantSize, 3, true, false), "(" + redundantSizePct + ")"},
+                {"hardlinked-files:", formatCountInt(hardlinkedFiles), "(" + hardlinkedFilesPct + ")"},
+                {"hardlinked-size:", ut1::getApproxSizeStr(hardlinkedSize, 3, true, false), "(" + hardlinkedSizePct + ")"},
                 {"dirdb-size:", ut1::getApproxSizeStr(totalDbSize, 3, true, false), "(" + percentStr + ")"},
                 {"dirdb-bytes-per-file:", ut1::getApproxSizeStr(dirdbBytesPerFile, 1, true, true), std::string()}
             };

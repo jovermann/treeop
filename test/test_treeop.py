@@ -154,6 +154,42 @@ def test_remove_copies_without_intersect(tmp_path: Path):
     assert re.search(r"removed-files:\s+1", out)
 
 
+def test_stats_hardlinked_and_redundant(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    root_dir = tmp_path / "root"
+    sub_dir = root_dir / "sub"
+    root_dir.mkdir()
+    sub_dir.mkdir()
+
+    write_file(root_dir / "unique.txt", "abc")
+    write_file(root_dir / "dup.txt", "dupe")
+    write_file(sub_dir / "dup_copy.txt", "dupe")
+    write_file(root_dir / "hl.txt", "hlink!")
+    os.link(root_dir / "hl.txt", sub_dir / "hl_link.txt")
+
+    out = run_treeop(["--stats", str(root_dir)], root)
+
+    def stat_value(label: str) -> int:
+        match = re.search(rf"{label}\s+([0-9]+)", out, re.MULTILINE)
+        assert match, f"Missing {label} in output: {out}"
+        return int(match.group(1))
+
+    assert stat_value("files:") == 5
+    assert stat_value("dirs:") == 2
+    assert stat_value("total-size:") == 23
+    assert stat_value("redundant-files:") == 1
+    assert stat_value("redundant-size:") == 4
+    assert stat_value("hardlinked-files:") == 1
+    assert stat_value("hardlinked-size:") == 6
+
+
 def setup_three_roots(tmp_path: Path):
     dir_a = tmp_path / "a"
     dir_b = tmp_path / "b"
