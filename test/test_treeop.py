@@ -133,6 +133,27 @@ def test_remove_copies_from_last(tmp_path: Path):
     assert re.search(r"removed-files:\s+1", out)
 
 
+def test_remove_copies_without_intersect(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "same.txt", "hello")
+    time.sleep(1.1)
+    write_file(dir_b / "same.txt", "hello")
+
+    out = run_treeop(["--remove-copies", str(dir_a), str(dir_b)], root)
+    assert (dir_a / "same.txt").exists()
+    assert not (dir_b / "same.txt").exists()
+    assert re.search(r"removed-files:\s+1", out)
+
+
 def setup_three_roots(tmp_path: Path):
     dir_a = tmp_path / "a"
     dir_b = tmp_path / "b"

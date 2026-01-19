@@ -1085,107 +1085,116 @@ public:
     /// Replace duplicate files with hardlinks to the oldest file.
     HardlinkStats hardlinkCopies(uint64_t minSize, uint64_t maxHardlinks, bool dryRun) const
     {
-        std::map<ContentKey, std::vector<FileEntry>> contentFiles;
-        for (const auto& dir : dirs)
-        {
-            for (const auto& file : dir.files)
-            {
-                if (file.size < minSize)
-                {
-                    continue;
-                }
-                Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
-                ContentKey key{file.size, keyHash};
-                contentFiles[key].push_back(FileEntry{
-                    (dir.path / file.path).string(),
-                    file.size,
-                    file.hash,
-                    file.inode,
-                    file.date,
-                    file.numLinks
-                });
-            }
-        }
-
         HardlinkStats stats;
         std::set<fs::path> touchedDirs;
-        for (const auto& [key, files] : contentFiles)
-        {
-            if (files.size() < 2)
+        forEachRedundancyGroup(minSize,
+            [&](const std::vector<FileEntry>& files, const FileEntry& oldest)
             {
-                continue;
-            }
-            auto oldestIt = std::min_element(files.begin(), files.end(),
-                [](const FileEntry& a, const FileEntry& b)
+                fs::path oldestPath(oldest.path);
+                uint64_t linkCount = oldest.numLinks;
+                if (!dryRun)
                 {
-                    if (a.date != b.date)
+                    std::error_code ec;
+                    uint64_t currentLinks = fs::hard_link_count(oldestPath, ec);
+                    if (!ec)
                     {
-                        return a.date < b.date;
+                        linkCount = currentLinks;
                     }
-                    return a.path < b.path;
-                });
-            if (oldestIt == files.end())
-            {
-                continue;
-            }
-            const FileEntry& oldest = *oldestIt;
-            fs::path oldestPath(oldest.path);
-            uint64_t linkCount = oldest.numLinks;
-            if (!dryRun)
-            {
-                std::error_code ec;
-                uint64_t currentLinks = fs::hard_link_count(oldestPath, ec);
-                if (!ec)
-                {
-                    linkCount = currentLinks;
-                }
-                else if (clVerbose)
-                {
-                    std::cerr << "Warning: Failed to read hardlink count for " << oldestPath.string()
-                              << ": " << ec.message() << "\n";
-                }
-            }
-            if (linkCount >= maxHardlinks)
-            {
-                std::cerr << "Warning: " << oldestPath.string() << " has " << linkCount
-                          << " hardlinks (>= " << maxHardlinks << "), skipping.\n";
-                continue;
-            }
-
-            for (const auto& ref : files)
-            {
-                if (ref.path == oldest.path)
-                {
-                    continue;
-                }
-                if (ref.inode == oldest.inode)
-                {
-                    continue;
-                }
-                if (dryRun)
-                {
-                    std::cout << "Would hardlink " << ref.path << " -> " << oldest.path << "\n";
-                }
-                else
-                {
-                    std::string errorMsg;
-                    if (!replaceWithHardlink(oldestPath, fs::path(ref.path), &errorMsg))
+                    else if (clVerbose)
                     {
-                        std::cerr << "Warning: " << errorMsg << "\n";
+                        std::cerr << "Warning: Failed to read hardlink count for " << oldestPath.string()
+                                  << ": " << ec.message() << "\n";
+                    }
+                }
+                if (linkCount >= maxHardlinks)
+                {
+                    std::cerr << "Warning: " << oldestPath.string() << " has " << linkCount
+                              << " hardlinks (>= " << maxHardlinks << "), skipping.\n";
+                    return;
+                }
+
+                for (const auto& ref : files)
+                {
+                    if (ref.path == oldest.path)
+                    {
                         continue;
                     }
-                    if (clVerbose)
+                    if (ref.inode == oldest.inode)
                     {
-                        std::cout << "Hardlinked " << ref.path << " -> " << oldest.path << "\n";
+                        continue;
                     }
-                    touchedDirs.insert(oldestPath.parent_path());
-                    touchedDirs.insert(fs::path(ref.path).parent_path());
+                    if (dryRun)
+                    {
+                        std::cout << "Would hardlink " << ref.path << " -> " << oldest.path << "\n";
+                    }
+                    else
+                    {
+                        std::string errorMsg;
+                        if (!replaceWithHardlink(oldestPath, fs::path(ref.path), &errorMsg))
+                        {
+                            std::cerr << "Warning: " << errorMsg << "\n";
+                            continue;
+                        }
+                        if (clVerbose)
+                        {
+                            std::cout << "Hardlinked " << ref.path << " -> " << oldest.path << "\n";
+                        }
+                        touchedDirs.insert(oldestPath.parent_path());
+                        touchedDirs.insert(fs::path(ref.path).parent_path());
+                    }
+                    stats.createdLinks++;
+                    stats.removedFiles++;
+                    stats.removedBytes += ref.size;
                 }
-                stats.createdLinks++;
-                stats.removedFiles++;
-                stats.removedBytes += ref.size;
+            });
+
+        if (!dryRun)
+        {
+            for (const auto& dirPath : touchedDirs)
+            {
+                if (ut1::fsExists(dirPath / ".dirdb"))
+                {
+                    updateDirDb(dirPath);
+                }
             }
         }
+
+        return stats;
+    }
+
+    /// Remove duplicate files, keeping the oldest file for each content hash.
+    RemoveCopyStats removeRedundantFiles(uint64_t minSize, bool dryRun) const
+    {
+        RemoveCopyStats stats;
+        std::set<fs::path> touchedDirs;
+        forEachRedundancyGroup(minSize,
+            [&](const std::vector<FileEntry>& files, const FileEntry& oldest)
+            {
+                for (const auto& ref : files)
+                {
+                    if (ref.path == oldest.path)
+                    {
+                        continue;
+                    }
+                    if (dryRun || clVerbose)
+                    {
+                        std::cout << (dryRun ? "Would remove " : "Removed ") << ref.path << "\n";
+                    }
+                    stats.files++;
+                    stats.bytes += ref.size;
+                    if (dryRun)
+                    {
+                        continue;
+                    }
+                    std::error_code ec;
+                    fs::remove(ref.path, ec);
+                    if (ec)
+                    {
+                        throw std::runtime_error("Failed to remove " + ref.path);
+                    }
+                    touchedDirs.insert(fs::path(ref.path).parent_path());
+                }
+            });
 
         if (!dryRun)
         {
@@ -1208,6 +1217,16 @@ public:
             {"hardlinks-created:", formatCountInt(stats.createdLinks), std::string()},
             {"removed-files:", formatCountInt(stats.removedFiles), std::string()},
             {"removed-bytes:", ut1::getApproxSizeStr(stats.removedBytes, 3, true, false), std::string()}
+        };
+        printStatList(lines);
+    }
+
+    /// Print remove-copies statistics.
+    void printRemoveCopyStats(const RemoveCopyStats& stats) const
+    {
+        std::vector<StatLine> lines = {
+            {"removed-files:", formatCountInt(stats.files), std::string()},
+            {"removed-bytes:", ut1::getApproxSizeStr(stats.bytes, 3, true, false), std::string()}
         };
         printStatList(lines);
     }
@@ -1251,6 +1270,61 @@ private:
             return hash < other.hash;
         }
     };
+
+    using ContentFiles = std::map<ContentKey, std::vector<FileEntry>>;
+
+    ContentFiles collectContentFiles(uint64_t minSize) const
+    {
+        ContentFiles contentFiles;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                if (file.size < minSize)
+                {
+                    continue;
+                }
+                Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
+                ContentKey key{file.size, keyHash};
+                contentFiles[key].push_back(FileEntry{
+                    (dir.path / file.path).string(),
+                    file.size,
+                    file.hash,
+                    file.inode,
+                    file.date,
+                    file.numLinks
+                });
+            }
+        }
+        return contentFiles;
+    }
+
+    template <typename GroupFn>
+    void forEachRedundancyGroup(uint64_t minSize, GroupFn&& fn) const
+    {
+        ContentFiles contentFiles = collectContentFiles(minSize);
+        for (const auto& [key, files] : contentFiles)
+        {
+            if (files.size() < 2)
+            {
+                continue;
+            }
+            auto oldestIt = std::min_element(files.begin(), files.end(),
+                [](const FileEntry& a, const FileEntry& b)
+                {
+                    if (a.date != b.date)
+                    {
+                        return a.date < b.date;
+                    }
+                    return a.path < b.path;
+                });
+            if (oldestIt == files.end())
+            {
+                continue;
+            }
+            fn(files, *oldestIt);
+        }
+    }
 
     struct StatLine
     {
@@ -2688,7 +2762,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "list-both", "List files in both the first roots and the last root when used with --intersect.");
     cl.addOption(' ', "extract-first", "Extract files only in the first roots into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "extract-last", "Extract files only in the last root into DIR when used with --intersect.", "DIR", "");
-    cl.addOption(' ', "remove-copies", "Delete files from later roots when content exists in earlier roots (with --intersect).");
+    cl.addOption(' ', "remove-copies", "Delete duplicate files (with --intersect removes from later roots; otherwise keeps oldest).");
     cl.addOption(' ', "remove-copies-from-last", "Delete files only from the last root when content exists in earlier roots (with --intersect).");
     cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
     cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
@@ -2761,9 +2835,9 @@ int main(int argc, char *argv[])
         {
             cl.error("--extract-first/--extract-last require --intersect.");
         }
-        if ((cl("remove-copies") || cl("remove-copies-from-last")) && !cl("intersect"))
+        if (cl("remove-copies-from-last") && !cl("intersect"))
         {
-            cl.error("--remove-copies/--remove-copies-from-last require --intersect.");
+            cl.error("--remove-copies-from-last requires --intersect.");
         }
         if (cl("remove-copies") && cl("remove-copies-from-last"))
         {
@@ -2858,6 +2932,14 @@ int main(int argc, char *argv[])
             }
             else
             {
+                if (cl("remove-copies"))
+                {
+                    uint64_t minSize = ut1::strToU64(cl.getStr("min-size"));
+                    auto stats = mainDb.removeRedundantFiles(minSize, cl("dry-run"));
+                    std::cout << "remove-copies:\n";
+                    mainDb.printRemoveCopyStats(stats);
+                }
+
                 if (cl("stats"))
                 {
                     mainDb.printStats();
