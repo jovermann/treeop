@@ -513,6 +513,59 @@ public:
         printListRows(refs, clVerbose > 1, hashLen);
     }
 
+    /// List all redundant files grouped by content hash.
+    void listRedundant() const
+    {
+        std::map<Hash128, std::vector<FileEntry>> byHash;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                byHash[file.hash].push_back(FileEntry{
+                    (dir.path / file.path).string(),
+                    file.size,
+                    file.hash,
+                    file.inode,
+                    file.date,
+                    file.numLinks
+                });
+            }
+        }
+
+        size_t hashLen = getUniqueHashHexLen();
+        ListRowWidths widths;
+        std::vector<std::vector<FileEntry>> groups;
+        groups.reserve(byHash.size());
+        for (auto& [hash, files] : byHash)
+        {
+            if (files.size() < 2)
+            {
+                continue;
+            }
+            std::sort(files.begin(), files.end(),
+                [](const FileEntry& a, const FileEntry& b)
+                {
+                    return a.path < b.path;
+                });
+            for (const auto& ref : files)
+            {
+                updateListRowWidths(ref, clVerbose > 1, hashLen, widths);
+            }
+            groups.push_back(std::move(files));
+        }
+
+        std::sort(groups.begin(), groups.end(),
+            [](const std::vector<FileEntry>& a, const std::vector<FileEntry>& b)
+            {
+                return a.front().path < b.front().path;
+            });
+
+        for (const auto& group : groups)
+        {
+            printListRowsWithWidths(group, clVerbose > 1, hashLen, widths);
+        }
+    }
+
     /// List all directories with file counts and total size.
     void listDirs() const
     {
@@ -1206,64 +1259,71 @@ private:
         std::string extra;
     };
 
+    struct ListRowWidths
+    {
+        size_t size{};
+        size_t hash{};
+        size_t inode{};
+        size_t date{};
+        size_t links{};
+    };
+
+    /// Update width tracking for aligned file list columns.
+    static void updateListRowWidths(const FileEntry& ref, bool showInodeLinks, size_t hashLen, ListRowWidths& widths)
+    {
+        std::string sizeStr = ut1::toStr(ref.size);
+        std::string hex = ref.hash.toHex();
+        std::string hashStr = hex.substr(0, std::min(hashLen, hex.size()));
+        std::string inodeStr = ut1::toStr(ref.inode);
+        std::string dateStr = formatFileTime(ref.date);
+        std::string linksStr = ut1::toStr(ref.numLinks);
+
+        widths.size = std::max(widths.size, sizeStr.size());
+        widths.hash = std::max(widths.hash, hashStr.size());
+        widths.date = std::max(widths.date, dateStr.size());
+        if (showInodeLinks)
+        {
+            widths.inode = std::max(widths.inode, inodeStr.size());
+            widths.links = std::max(widths.links, linksStr.size());
+        }
+    }
+
+    /// Print rows for file listings with aligned columns using precomputed widths.
+    static void printListRowsWithWidths(const std::vector<FileEntry>& refs, bool showInodeLinks, size_t hashLen, const ListRowWidths& widths)
+    {
+        for (const auto& ref : refs)
+        {
+            std::string sizeStr = ut1::toStr(ref.size);
+            std::string hex = ref.hash.toHex();
+            std::string hashStr = hex.substr(0, std::min(hashLen, hex.size()));
+            std::string inodeStr = ut1::toStr(ref.inode);
+            std::string dateStr = formatFileTime(ref.date);
+            std::string linksStr = ut1::toStr(ref.numLinks);
+
+            std::cout << std::setw(static_cast<int>(widths.size)) << sizeStr << " "
+                      << std::setw(static_cast<int>(widths.hash)) << hashStr << " ";
+            if (showInodeLinks)
+            {
+                std::cout << std::setw(static_cast<int>(widths.inode)) << inodeStr << " ";
+            }
+            std::cout << std::setw(static_cast<int>(widths.date)) << dateStr << " ";
+            if (showInodeLinks)
+            {
+                std::cout << std::setw(static_cast<int>(widths.links)) << linksStr << " ";
+            }
+            std::cout << ref.path << "\n";
+        }
+    }
+
     /// Print rows for file listings with aligned columns.
     static void printListRows(const std::vector<FileEntry>& refs, bool showInodeLinks, size_t hashLen)
     {
-        struct Row
-        {
-            std::string size;
-            std::string hash;
-            std::string inode;
-            std::string date;
-            std::string numLinks;
-            std::string name;
-        };
-
-        std::vector<Row> rows;
-        size_t widthSize = 0;
-        size_t widthHash = 0;
-        size_t widthInode = 0;
-        size_t widthDate = 0;
-        size_t widthLinks = 0;
-
+        ListRowWidths widths;
         for (const auto& ref : refs)
         {
-            Row row;
-            row.size = ut1::toStr(ref.size);
-            std::string hex = ref.hash.toHex();
-            row.hash = hex.substr(0, std::min(hashLen, hex.size()));
-            row.inode = ut1::toStr(ref.inode);
-            row.date = formatFileTime(ref.date);
-            row.numLinks = ut1::toStr(ref.numLinks);
-            row.name = ref.path;
-
-            widthSize = std::max(widthSize, row.size.size());
-            widthHash = std::max(widthHash, row.hash.size());
-            if (showInodeLinks)
-            {
-                widthInode = std::max(widthInode, row.inode.size());
-                widthLinks = std::max(widthLinks, row.numLinks.size());
-            }
-            widthDate = std::max(widthDate, row.date.size());
-
-            rows.push_back(std::move(row));
+            updateListRowWidths(ref, showInodeLinks, hashLen, widths);
         }
-
-        for (const auto& row : rows)
-        {
-            std::cout << std::setw(static_cast<int>(widthSize)) << row.size << " "
-                      << std::setw(static_cast<int>(widthHash)) << row.hash << " ";
-            if (showInodeLinks)
-            {
-                std::cout << std::setw(static_cast<int>(widthInode)) << row.inode << " ";
-            }
-            std::cout << std::setw(static_cast<int>(widthDate)) << row.date << " ";
-            if (showInodeLinks)
-            {
-                std::cout << std::setw(static_cast<int>(widthLinks)) << row.numLinks << " ";
-            }
-            std::cout << row.name << "\n";
-        }
+        printListRowsWithWidths(refs, showInodeLinks, hashLen, widths);
     }
 
     /// Print aligned statistics lines.
@@ -2621,6 +2681,7 @@ int main(int argc, char *argv[])
     cl.addOption('i', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
+    cl.addOption(' ', "list-redundant", "List redundant files grouped by content hash.");
     cl.addOption(' ', "list-dirs", "List all directories with file counts and total size.");
     cl.addOption(' ', "list-first", "List files only in the first roots when used with --intersect.");
     cl.addOption(' ', "list-last", "List files only in the last root when used with --intersect.");
@@ -2663,7 +2724,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2726,7 +2787,7 @@ int main(int argc, char *argv[])
         {
             if (cl("readbench"))
             {
-                bool otherOps = cl("stats") || cl("list-files") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+                bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                     || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs");
@@ -2813,6 +2874,10 @@ int main(int argc, char *argv[])
                 if (cl("list-files"))
                 {
                     mainDb.listFiles();
+                }
+                if (cl("list-redundant"))
+                {
+                    mainDb.listRedundant();
                 }
                 if (cl("list-dirs"))
                 {

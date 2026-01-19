@@ -212,6 +212,35 @@ def test_extract_last_three_roots(tmp_path: Path):
     assert not (dest / "shared2.txt").exists()
 
 
+def test_list_redundant_alignment(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "small.txt", "hi")
+    write_file(dir_b / "small_copy.txt", "hi")
+    write_file(dir_a / "big.txt", "x" * 3000)
+    write_file(dir_b / "big_copy.txt", "x" * 3000)
+
+    out = run_treeop(["--list-redundant", str(dir_a), str(dir_b)], root)
+    lines = [line for line in out.splitlines() if line.strip()]
+    assert len(lines) == 4
+    def hash_start(line: str) -> int:
+        size_start = len(line) - len(line.lstrip(" "))
+        size_end = line.find(" ", size_start)
+        tail = line[size_end + 1:]
+        return size_end + 1 + (len(tail) - len(tail.lstrip(" ")))
+
+    starts = [hash_start(line) for line in lines]
+    assert all(start == starts[0] for start in starts)
+
+
 def supports_hardlinks(tmp_path: Path) -> bool:
     src = tmp_path / "hl_src"
     dst = tmp_path / "hl_dst"
