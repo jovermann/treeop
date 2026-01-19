@@ -1155,6 +1155,12 @@ public:
         uint64_t removedBytes{};
     };
 
+    struct BreakHardlinkStats
+    {
+        uint64_t files{};
+        uint64_t bytes{};
+    };
+
     /// Replace duplicate files with hardlinks to the oldest file.
     HardlinkStats hardlinkCopies(uint64_t minSize, uint64_t maxHardlinks, bool dryRun) const
     {
@@ -1235,6 +1241,76 @@ public:
         return stats;
     }
 
+    /// Break hardlinks by replacing each file with a private copy.
+    BreakHardlinkStats breakHardlinks(bool dryRun) const
+    {
+        BreakHardlinkStats stats;
+        std::set<fs::path> touchedDirs;
+        std::unordered_map<uint64_t, uint64_t> inodeCounts;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                inodeCounts[file.inode]++;
+            }
+        }
+        std::unordered_map<uint64_t, uint64_t> remaining;
+        remaining.reserve(inodeCounts.size());
+        for (const auto& [inode, count] : inodeCounts)
+        {
+            if (count > 1)
+            {
+                remaining.emplace(inode, count - 1);
+            }
+        }
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                auto remainingIt = remaining.find(file.inode);
+                if (remainingIt == remaining.end() || remainingIt->second == 0)
+                {
+                    continue;
+                }
+                remainingIt->second--;
+                fs::path target = dir.path / file.path;
+                if (dryRun)
+                {
+                    std::cout << "Would break hardlink " << target.string() << "\n";
+                    stats.files++;
+                    stats.bytes += file.size;
+                    continue;
+                }
+                std::string errorMsg;
+                if (!replaceWithCopy(target, &errorMsg))
+                {
+                    std::cerr << "Warning: " << errorMsg << "\n";
+                    continue;
+                }
+                if (clVerbose)
+                {
+                    std::cout << "Broke hardlink " << target.string() << "\n";
+                }
+                stats.files++;
+                stats.bytes += file.size;
+                touchedDirs.insert(target.parent_path());
+            }
+        }
+
+        if (!dryRun)
+        {
+            for (const auto& dirPath : touchedDirs)
+            {
+                if (ut1::fsExists(dirPath / ".dirdb"))
+                {
+                    updateDirDb(dirPath);
+                }
+            }
+        }
+
+        return stats;
+    }
+
     /// Remove duplicate files, keeping the oldest file for each content hash.
     RemoveCopyStats removeRedundantFiles(uint64_t minSize, bool dryRun) const
     {
@@ -1290,6 +1366,16 @@ public:
             {"hardlinks-created:", formatCountInt(stats.createdLinks), std::string()},
             {"removed-files:", formatCountInt(stats.removedFiles), std::string()},
             {"removed-bytes:", ut1::getApproxSizeStr(stats.removedBytes, 3, true, false), std::string()}
+        };
+        printStatList(lines);
+    }
+
+    /// Print break-hardlinks statistics.
+    void printBreakHardlinkStats(const BreakHardlinkStats& stats) const
+    {
+        std::vector<StatLine> lines = {
+            {"broken-files:", formatCountInt(stats.files), std::string()},
+            {"broken-bytes:", ut1::getApproxSizeStr(stats.bytes, 3, true, false), std::string()}
         };
         printStatList(lines);
     }
@@ -1691,6 +1777,61 @@ private:
         {
             std::error_code rmEc;
             fs::remove(temp, rmEc);
+            if (errorMsg)
+            {
+                *errorMsg = "Failed to replace " + target.string() + ": " + ec.message();
+            }
+            return false;
+        }
+        return true;
+    }
+
+    /// Replace a file with a private copy using a temporary path.
+    static bool replaceWithCopy(const fs::path& target, std::string* errorMsg)
+    {
+        std::error_code ec;
+        fs::path temp;
+        for (int i = 0; i < 100; i++)
+        {
+            temp = target;
+            temp += ".treeop_copy_tmp";
+            if (i > 0)
+            {
+                temp += ut1::toStr(i);
+            }
+            if (!fs::exists(temp, ec))
+            {
+                break;
+            }
+        }
+        if (fs::exists(temp, ec))
+        {
+            if (errorMsg)
+            {
+                *errorMsg = "No temporary path available for " + target.string();
+            }
+            return false;
+        }
+
+        fs::copy_file(target, temp, fs::copy_options::none, ec);
+        if (ec)
+        {
+            if (errorMsg)
+            {
+                *errorMsg = "Failed to copy " + target.string() + ": " + ec.message();
+            }
+            return false;
+        }
+
+        fs::rename(temp, target, ec);
+        if (ec)
+        {
+            std::error_code rmEc;
+            fs::remove(target, rmEc);
+            fs::rename(temp, target, ec);
+        }
+        if (ec)
+        {
             if (errorMsg)
             {
                 *errorMsg = "Failed to replace " + target.string() + ": " + ec.message();
@@ -2839,6 +2980,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "remove-copies-from-last", "Delete files only from the last root when content exists in earlier roots (with --intersect).");
     cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
     cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
+    cl.addOption(' ', "break-hardlinks", "Break all hardlinks by replacing files with private copies.");
     cl.addOption(' ', "remove-empty-dirs", "Remove empty directories (ignoring .dirdb files).");
     cl.addOption(' ', "readbench", "Read all files to measure filesystem read performance.");
     cl.addOption(' ', "bufsize", "Buffer size for reading (readbench and hashing).", "N", "1M");
@@ -2871,7 +3013,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("readbench") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -2936,7 +3078,7 @@ int main(int argc, char *argv[])
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
-                    || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies")
+                    || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs");
                 if (otherOps)
                 {
@@ -2974,6 +3116,12 @@ int main(int argc, char *argv[])
                 auto stats = mainDb.hardlinkCopies(minSize, maxHardlinks, cl("dry-run"));
                 std::cout << "hardlink-copies:\n";
                 mainDb.printHardlinkStats(stats);
+            }
+            if (cl("break-hardlinks"))
+            {
+                auto stats = mainDb.breakHardlinks(cl("dry-run"));
+                std::cout << "break-hardlinks:\n";
+                mainDb.printBreakHardlinkStats(stats);
             }
 
             if (cl("intersect"))
