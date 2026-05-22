@@ -3,12 +3,8 @@
 # Distributed under the Boost Software License, Version 1.0.
 # (See accompanying file LICENSE or copy at https://www.boost.org/LICENSE_1_0.txt)
 
-# For GCC:
-#CXXFLAGS ?= -Wall -Wextra -O3
-# For clang:
-WARNINGS ?= -Weverything -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-padded -Wno-shorten-64-to-32 -Wno-missing-prototypes -Wno-sign-conversion -Wno-implicit-int-conversion -Wno-poison-system-directories -fcomment-block-commands=n -Wno-string-conversion -Wno-covered-switch-default -Wno-unsafe-buffer-usage -Wno-implicit-int-float-conversion -Wno-extra-semi-stmt
-CXXFLAGS ?= -O3 $(WARNINGS)
-#CXXFLAGS ?= -g $(WARNINGS)
+WARNING_FLAGS ?= -Weverything -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-padded -Wno-shorten-64-to-32 -Wno-missing-prototypes -Wno-sign-conversion -Wno-implicit-int-conversion -Wno-poison-system-directories -fcomment-block-commands=n -Wno-string-conversion -Wno-covered-switch-default -Wno-unsafe-buffer-usage -Wno-implicit-int-float-conversion -Wno-extra-semi-stmt
+CXXFLAGS ?= -O3 -Wall
 CPPFLAGS ?= -pedantic
 CXXSTD ?= -std=c++23 # C++23 for ranges
 
@@ -37,7 +33,6 @@ clean:
 
 uint_test: clean
 unit_test: CPPFLAGS += -D ENABLE_UNIT_TEST
-unit_test: CXXFLAGS += -Wno-weak-vtables -Wno-missing-variable-declarations -Wno-exit-time-destructors -Wno-global-constructors
 unit_test: $(OBJECTS)
 	$(CXX) $^ -o $@
 	./unit_test
@@ -45,7 +40,11 @@ unit_test: $(OBJECTS)
 test: $(TARGET)
 	pytest -v
 
-.PHONY: clean default unit_test test
+warnings:
+	$(MAKE) clean
+	$(MAKE) CXXFLAGS="-O3 $(WARNING_FLAGS)" $(TARGET)
+
+.PHONY: clean default unit_test test warnings
 
 ifeq ($(findstring $(MAKECMDGOALS),clean),)
 -include $(DEPENDS)

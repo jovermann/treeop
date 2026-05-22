@@ -3016,7 +3016,7 @@ int main(int argc, char *argv[])
                         "\n"
                         "All sizes may be specified with kMGTPE suffixes indicating powers of 1024.";
     ut1::CommandLineParser cl("treeop", usage,
-        "\n$programName version $version *** Copyright (c) 2026 Johannes Overmann *** https://github.com/jovermann/treeop",
+        "\n$programName version $version ($compileDate) *** Copyright (c) 2026 Johannes Overmann *** https://github.com/jovermann/treeop",
         "0.2.1");
 
     cl.addHeader("\nOptions:\n");
