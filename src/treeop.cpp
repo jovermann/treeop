@@ -2151,6 +2151,39 @@ struct ReadBenchStats
     double elapsed{};
 };
 
+struct HashRateStats
+{
+    uint64_t bytes{};
+    double elapsed{};
+    Hash128 digest{};
+};
+
+/// Hash memory for roughly two seconds to measure CPU hashing throughput without filesystem IO.
+static HashRateStats runHashRateBench()
+{
+    constexpr double kDurationSec = 2.0;
+    HashRateStats stats;
+    std::vector<uint8_t> buffer(gBufSize);
+    for (size_t i = 0; i < buffer.size(); i++)
+    {
+        buffer[i] = static_cast<uint8_t>((i * 131U + 17U) & 0xffU);
+    }
+
+    HashSha3_128 hasher;
+    double start = ut1::getTimeSec();
+    double now = start;
+    do
+    {
+        hasher.update(buffer.data(), buffer.size());
+        stats.bytes += static_cast<uint64_t>(buffer.size());
+        now = ut1::getTimeSec();
+    } while ((now - start) < kDurationSec);
+
+    stats.elapsed = now - start;
+    stats.digest = Hash128::fromBytes(hasher.finalize());
+    return stats;
+}
+
 /// Read all files under the given roots to measure read performance.
 static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
 {
@@ -3038,6 +3071,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "break-hardlinks", "Break all hardlinks by replacing files with private copies.");
     cl.addOption(' ', "remove-empty-dirs", "Remove empty directories (ignoring .dirdb files).");
     cl.addOption(' ', "readbench", "Read all files to measure filesystem read performance.");
+    cl.addOption(' ', "hashrate", "Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.");
     cl.addOption(' ', "bufsize", "Buffer size for reading (readbench and hashing).", "N", "1M");
     cl.addOption(' ', "min-size", "Minimum file size to hardlink when using --hardlink-copies.", "N", "0");
     cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
@@ -3068,13 +3102,37 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
 
     try
     {
+        if (cl("hashrate"))
+        {
+            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+                || cl("intersect") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
+                || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench");
+            if (otherOps)
+            {
+                cl.error("--hashrate cannot be combined with other operations.");
+            }
+
+            HashRateStats stats = runHashRateBench();
+            double rate = (stats.elapsed > 0.0) ? (double(stats.bytes) / stats.elapsed) : 0.0;
+            std::cout << "hash-size: " << ut1::getApproxSizeStr(stats.bytes, 3, true, false) << "\n";
+            std::cout << "bufsize: " << ut1::getPreciseSizeStr(static_cast<size_t>(gBufSize)) << "\n";
+            std::cout << "hashrate: " << ut1::getApproxSizeStr(rate, 1, true, true) << "/s\n";
+            std::cout << "elapsed: " << ut1::secondsToString(stats.elapsed) << "\n";
+            if (clVerbose)
+            {
+                std::cout << "digest: " << stats.digest.toHex() << "\n";
+            }
+            return 0;
+        }
+
         if (cl.getArgs().empty())
         {
             cl.error("Please specify at least one directory.");
@@ -3134,7 +3192,7 @@ int main(int argc, char *argv[])
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                     || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
-                    || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs");
+                    || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("hashrate");
                 if (otherOps)
                 {
                     cl.error("--readbench cannot be combined with other operations.");

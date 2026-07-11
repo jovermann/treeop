@@ -7,6 +7,7 @@ WARNING_FLAGS ?= -Weverything -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-
 CXXFLAGS ?= -O3 -Wall
 CPPFLAGS ?= -pedantic
 CXXSTD ?= -std=c++23 # C++23 for ranges
+PYTEST ?= pytest-3
 
 BUILDDIR=build
 SOURCES = $(wildcard src/*.cpp)
@@ -38,7 +39,7 @@ unit_test: $(OBJECTS)
 	./unit_test
 
 test: $(TARGET)
-	pytest -v
+	$(PYTEST) -v
 
 warnings:
 	$(MAKE) clean

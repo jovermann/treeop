@@ -65,6 +65,7 @@ Options:
   -u --update-dirdb        Update .dirdb files, reusing hashes when inode/size/mtime match.
      --remove-dirdb        Recursively remove all .dirdb files under specified dirs.
      --get-unique-hash-len Calculate the minimum hash length in bits that makes all file contents unique.
+     --hashrate            Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.
      --size-histogram=N    Print size histogram for all files in all dirs where N in the batch size in
                            bytes. (default=0)
      --max-size=N          Maximum file size to include in size histogram. (default=0)
@@ -88,7 +89,6 @@ Linux/MacOS:
 ## Running tests
 
 `make test`
-
 
 
 
