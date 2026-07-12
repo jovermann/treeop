@@ -30,6 +30,23 @@ def run_treeop(args, cwd: Path):
     return result.stdout
 
 
+def run_treeop_result(args, cwd: Path):
+    bin_path = treeop_bin()
+    if "TREEOP_BIN" not in os.environ:
+        subprocess.run(["make"], cwd=cwd, check=True, capture_output=True, text=True)
+    if not bin_path.exists():
+        subprocess.run(["make"], cwd=cwd, check=True, capture_output=True, text=True)
+        if not bin_path.exists():
+            raise FileNotFoundError(f"treeop binary not found after make: {bin_path}")
+    return subprocess.run(
+        [str(bin_path)] + args,
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+
 def write_file(path: Path, content: str):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(content, encoding="utf-8")
@@ -42,6 +59,7 @@ def extract_hash(output: str, filename: str) -> str:
             if len(parts) >= 2:
                 return parts[1]
     raise AssertionError(f"hash not found for {filename} in output:\n{output}")
+
 
 def test_intersect_stats_two_roots(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
@@ -66,6 +84,32 @@ def test_intersect_stats_two_roots(tmp_path: Path):
     assert "shared-files:" in out
     assert "total:" in out
     assert "total-files:" in out
+    assert out.splitlines().count("----------------------------------------") == 2
+
+
+def test_intersect_min_size_filters_file_sets(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "small-shared.txt", "xx")
+    write_file(dir_b / "small-shared.txt", "xx")
+    write_file(dir_a / "large-shared.txt", "large-data")
+    write_file(dir_b / "large-shared.txt", "large-data")
+
+    out = run_treeop(["--intersect", "--min-size", "5", str(dir_a), str(dir_b)], root)
+    total_section = out.split("total:\n", 1)[1]
+
+    assert re.search(r"total-files:\s+2", total_section)
+    assert re.search(r"total-size:\s+20 bytes", total_section)
+    assert re.search(r"shared-files:\s+2", total_section)
+    assert "small-shared.txt" not in out
 
 
 def test_remove_copies_dry_run(tmp_path: Path):
@@ -188,6 +232,63 @@ def test_stats_hardlinked_and_redundant(tmp_path: Path):
     assert stat_value("redundant-size:") == 4
     assert stat_value("hardlinked-files:") == 1
     assert stat_value("hardlinked-size:") == 6
+
+
+def test_stats_total_for_multiple_roots(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "same-a.txt", "dupe")
+    write_file(dir_a / "only-a.txt", "aaa")
+    write_file(dir_b / "same-b.txt", "dupe")
+    write_file(dir_b / "only-b.txt", "bbbbb")
+
+    out = run_treeop([str(dir_a), str(dir_b)], root)
+    assert f"{dir_a}\n" in out
+    assert f"{dir_b}\n" in out
+    assert "total:\n" in out
+    assert out.splitlines().count("----------------------------------------") == 2
+
+    total_section = out.split("total:\n", 1)[1]
+
+    def total_stat_value(label: str) -> int:
+        match = re.search(rf"{label}\s+([0-9]+)", total_section, re.MULTILINE)
+        assert match, f"Missing {label} in total section: {out}"
+        return int(match.group(1))
+
+    assert total_stat_value("files:") == 4
+    assert total_stat_value("dirs:") == 2
+    assert total_stat_value("total-size:") == 16
+    assert total_stat_value("redundant-files:") == 1
+    assert total_stat_value("redundant-size:") == 4
+
+
+def test_stats_min_size_filters_stats_not_dirdb(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "small.txt", "xx")
+    write_file(dir_a / "large.txt", "large-data")
+
+    out = run_treeop(["--stats", "--min-size", "5", str(dir_a)], root)
+    assert re.search(r"files:\s+1", out)
+    assert re.search(r"total-size:\s+10 bytes", out)
+    assert (dir_a / ".dirdb").exists()
+
+    file_list = run_treeop(["--list-files", str(dir_a)], root)
+    assert "small.txt" in file_list
+    assert "large.txt" in file_list
 
 
 def test_break_hardlinks(tmp_path: Path):
@@ -332,6 +433,22 @@ def test_size_histogram_max_size(tmp_path: Path):
     assert "10 bytes" not in out
 
 
+def test_invalid_size_histogram_fails_before_processing_dirs(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "hello")
+
+    result = run_treeop_result(["--size-histogram", "0", str(dir_a)], root)
+    assert result.returncode != 0
+    assert "--size-histogram must be greater than 0." in result.stdout
+    assert not (dir_a / ".dirdb").exists()
+
+
 def test_bufsize_readbench(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
@@ -344,6 +461,20 @@ def test_bufsize_readbench(tmp_path: Path):
 
     out = run_treeop(["--readbench", "--bufsize", "4k", str(dir_a)], root)
     assert "bufsize:" in out
+
+
+def test_lowercase_m_size_suffix(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "hello")
+
+    out = run_treeop(["--readbench", "--bufsize", "1m", str(dir_a)], root)
+    assert "bufsize: 1 MB" in out
 
 
 def test_max_hardlinks(tmp_path: Path):

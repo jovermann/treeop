@@ -809,6 +809,7 @@ uint64_t strToU64(const std::string& s)
         {
             case 'k': r <<= 10; break;
             case 'M': r <<= 20; break;
+            case 'm': r <<= 20; break;
             case 'G': r <<= 30; break;
             case 'T': r <<= 40; break;
             case 'P': r <<= 50; break;
@@ -826,6 +827,7 @@ UNIT_TEST(strToU64)
     ASSERT_EQ(ut1::strToU64("42"), 42ull);
     ASSERT_EQ(ut1::strToU64("4k"), 4096ull);
     ASSERT_EQ(ut1::strToU64("2M"), 2*1024*1024ull);
+    ASSERT_EQ(ut1::strToU64("2m"), 2*1024*1024ull);
 }
 
 UNIT_TEST(csvIntegersToVector)

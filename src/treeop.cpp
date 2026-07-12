@@ -39,6 +39,18 @@ using DirIndex = size_t;
 using FileIndex = size_t;
 namespace fs = std::filesystem;
 
+static uint64_t parseSizeOption(const ut1::CommandLineParser& cl, const std::string& optionName)
+{
+    try
+    {
+        return ut1::strToU64(cl.getStr(optionName));
+    }
+    catch (const std::exception& e)
+    {
+        throw std::runtime_error("Invalid value for --" + optionName + ": " + e.what());
+    }
+}
+
 static constexpr uint64_t kDirDbVersion = 1;
 static constexpr uint64_t kWindowsToUnixEpoch = 11644473600ULL; // seconds
 static uint64_t gBufSize = 1024ULL * 1024ULL;
@@ -384,6 +396,22 @@ public:
         double elapsedSeconds{};
     };
 
+    struct TreeStats
+    {
+        size_t dirCount{};
+        NumFiles fileCount{};
+        FileSize totalSize{};
+        uint64_t totalDbSize{};
+        uint64_t totalHashedBytes{};
+        double totalHashSeconds{};
+        uint64_t redundantFiles{};
+        uint64_t redundantSize{};
+        uint64_t hardlinkedFiles{};
+        uint64_t hardlinkedSize{};
+        double elapsedSeconds{};
+        std::unordered_map<uint64_t, uint64_t> inodeCounts;
+    };
+
     /// Initialize the database with a list of root directories.
     /// Initialize the database with a list of root directories.
     explicit MainDb(std::vector<fs::path> rootDirs, bool sameFilename_)
@@ -413,138 +441,53 @@ public:
     }
 
     /// Print per-root statistics.
-    void printStats() const
+    void printStats(uint64_t minSize) const
     {
-        for (const auto& rootData : roots)
+        for (size_t i = 0; i < roots.size(); i++)
         {
-            size_t dirCount = 0;
-            NumFiles fileCount = 0;
-            FileSize totalSize = 0;
-            uint64_t totalDbSize = 0;
-            uint64_t totalHashedBytes = 0;
-            double totalHashSeconds = 0.0;
-            std::map<ContentKey, uint64_t> contentCounts;
-            std::unordered_map<uint64_t, uint64_t> inodeSizes;
-            std::map<ContentKey, std::unordered_set<uint64_t>> contentInodes;
-            std::unordered_map<uint64_t, uint64_t> inodeCounts;
-            for (const auto& dir : dirs)
-            {
-                if (!isPathWithin(rootData.path, dir.path))
+            const auto& rootData = roots[i];
+            TreeStats treeStats = collectStats(
+                [&](const DirDbData& dir)
                 {
-                    continue;
-                }
-                dirCount++;
-                fileCount += dir.files.size();
-                for (const auto& file : dir.files)
-                {
-                    totalSize += file.size;
-                    Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
-                    ContentKey key{file.size, keyHash};
-                    contentCounts[key]++;
-                    if (inodeSizes.find(file.inode) == inodeSizes.end())
-                    {
-                        inodeSizes[file.inode] = file.size;
-                    }
-                    contentInodes[key].insert(file.inode);
-                    inodeCounts[file.inode]++;
-                }
-                totalDbSize += dir.dbSize;
-                totalHashedBytes += dir.hashedBytes;
-                totalHashSeconds += dir.hashSeconds;
-            }
-
-            uint64_t redundantFiles = 0;
-            uint64_t redundantSize = 0;
-            for (const auto& [key, count] : contentCounts)
-            {
-                auto inodeIt = contentInodes.find(key);
-                if (inodeIt == contentInodes.end())
-                {
-                    continue;
-                }
-                size_t uniqueInodes = inodeIt->second.size();
-                if (uniqueInodes > 1)
-                {
-                    uint64_t extra = static_cast<uint64_t>(uniqueInodes - 1);
-                    redundantFiles += extra;
-                    redundantSize += extra * key.size;
-                }
-            }
-
-            uint64_t hardlinkedFiles = 0;
-            uint64_t hardlinkedSize = 0;
-            for (const auto& [key, inodes] : contentInodes)
-            {
-                auto countIt = contentCounts.find(key);
-                if (countIt == contentCounts.end())
-                {
-                    continue;
-                }
-                uint64_t count = countIt->second;
-                if (count <= inodes.size())
-                {
-                    continue;
-                }
-                uint64_t extra = count - static_cast<uint64_t>(inodes.size());
-                hardlinkedFiles += extra;
-                hardlinkedSize += extra * key.size;
-            }
-
-            for (const auto& dir : dirs)
-            {
-                if (!isPathWithin(rootData.path, dir.path))
-                {
-                    continue;
-                }
-                for (const auto& file : dir.files)
-                {
-                    uint64_t countInRoot = inodeCounts[file.inode];
-                    if (file.numLinks > countInRoot)
-                    {
-                        uint64_t outsideLinks = file.numLinks - countInRoot;
-                        std::cout << "Warning: " << (dir.path / file.path).string()
-                                  << " has " << outsideLinks << " hardlinks outside root\n";
-                    }
-                }
-            }
-
-            std::string percentStr = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * totalDbSize / totalSize));
-            std::string redundantFilesPct = formatPercentFixed(fileCount == 0 ? 0.0 : (100.0 * redundantFiles / fileCount));
-            std::string redundantSizePct = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * redundantSize / totalSize));
-            std::string hardlinkedFilesPct = formatPercentFixed(fileCount == 0 ? 0.0 : (100.0 * hardlinkedFiles / fileCount));
-            std::string hardlinkedSizePct = formatPercentFixed(totalSize == 0 ? 0.0 : (100.0 * hardlinkedSize / totalSize));
-            double dirdbBytesPerFile = (fileCount == 0) ? 0.0 : (double(totalDbSize) / double(fileCount));
-            std::string elapsedStr;
-            if (rootData.elapsedSeconds > 0.0)
-            {
-                elapsedStr = ut1::secondsToString(rootData.elapsedSeconds);
-            }
-            std::vector<StatLine> stats = {
-                {"files:", formatCountInt(fileCount), std::string()},
-                {"dirs:", formatCountInt(dirCount), std::string()},
-                {"total-size:", ut1::getApproxSizeStr(totalSize, 3, true, false), std::string()},
-                {"redundant-files:", formatCountInt(redundantFiles), "(" + redundantFilesPct + ")"},
-                {"redundant-size:", ut1::getApproxSizeStr(redundantSize, 3, true, false), "(" + redundantSizePct + ")"},
-                {"hardlinked-files:", formatCountInt(hardlinkedFiles), "(" + hardlinkedFilesPct + ")"},
-                {"hardlinked-size:", ut1::getApproxSizeStr(hardlinkedSize, 3, true, false), "(" + hardlinkedSizePct + ")"},
-                {"dirdb-size:", ut1::getApproxSizeStr(totalDbSize, 3, true, false), "(" + percentStr + ")"},
-                {"dirdb-bytes-per-file:", ut1::getApproxSizeStr(dirdbBytesPerFile, 1, true, true), std::string()}
-            };
-            if (totalHashedBytes > 0 && totalHashSeconds > 0.0)
-            {
-                double rateMb = (double(totalHashedBytes) / totalHashSeconds / (1024.0 * 1024.0));
-                std::ostringstream rateOs;
-                rateOs << std::fixed << std::setprecision(1) << rateMb << " MB/s";
-                stats.push_back({"hash-size:", ut1::getApproxSizeStr(totalHashedBytes, 3, true, false), std::string()});
-                stats.push_back({"hash-rate:", rateOs.str(), std::string()});
-            }
-            if (!elapsedStr.empty())
-            {
-                stats.push_back({"elapsed:", elapsedStr, std::string()});
-            }
-
+                    return isPathWithin(rootData.path, dir.path);
+                },
+                rootData.elapsedSeconds,
+                minSize);
+            printHardlinkOutsideRootWarnings(rootData.path, treeStats.inodeCounts);
             std::cout << rootData.path.string() << "\n";
-            printStatList(stats);
+            printStatList(buildStatsLines(treeStats));
+            if (roots.size() > 1)
+            {
+                printBlockSeparator();
+            }
+        }
+
+        if (roots.size() > 1)
+        {
+            std::set<fs::path> seenDirs;
+            double elapsedSeconds = 0.0;
+            for (const auto& rootData : roots)
+            {
+                elapsedSeconds += rootData.elapsedSeconds;
+            }
+            TreeStats treeStats = collectStats(
+                [&](const DirDbData& dir)
+                {
+                    bool inAnyRoot = false;
+                    for (const auto& rootData : roots)
+                    {
+                        if (isPathWithin(rootData.path, dir.path))
+                        {
+                            inAnyRoot = true;
+                            break;
+                        }
+                    }
+                    return inAnyRoot && seenDirs.insert(dir.path).second;
+                },
+                elapsedSeconds,
+                minSize);
+            std::cout << "total:\n";
+            printStatList(buildStatsLines(treeStats));
         }
     }
 
@@ -867,7 +810,7 @@ public:
 
     /// Print intersect stats and optional file lists/extractions.
     void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listFirst, bool listLast, bool listBoth,
-        const fs::path* extractFirst, const fs::path* extractLast, bool removeCopies, bool removeCopiesFromLast, bool dryRun) const
+        const fs::path* extractFirst, const fs::path* extractLast, bool removeCopies, bool removeCopiesFromLast, bool dryRun, uint64_t minSize) const
     {
         std::vector<std::map<ContentKey, std::vector<FileEntry>>> rootFiles(rootPaths.size());
         std::map<ContentKey, size_t> rootsWithKey;
@@ -882,6 +825,10 @@ public:
                 }
                 for (const auto& file : dir.files)
                 {
+                    if (file.size < minSize)
+                    {
+                        continue;
+                    }
                     Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
                     ContentKey key{file.size, keyHash};
                     rootFiles[i][key].push_back(FileEntry{(dir.path / file.path).string(), file.size, file.hash, file.inode, file.date, file.numLinks});
@@ -944,6 +891,7 @@ public:
 
             std::cout << rootPaths[i].string() << ":\n";
             printStatList(stats);
+            printBlockSeparator();
         }
 
         BucketStats totalUnique;
@@ -1546,6 +1494,121 @@ private:
         std::string extra;
     };
 
+    template <typename IncludeDirFn>
+    TreeStats collectStats(IncludeDirFn&& includeDir, double elapsedSeconds, uint64_t minSize) const
+    {
+        TreeStats stats;
+        stats.elapsedSeconds = elapsedSeconds;
+        std::map<ContentKey, uint64_t> contentCounts;
+        std::map<ContentKey, std::unordered_set<uint64_t>> contentInodes;
+
+        for (const auto& dir : dirs)
+        {
+            if (!includeDir(dir))
+            {
+                continue;
+            }
+            stats.dirCount++;
+            for (const auto& file : dir.files)
+            {
+                if (file.size < minSize)
+                {
+                    continue;
+                }
+                stats.fileCount++;
+                stats.totalSize += file.size;
+                Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
+                ContentKey key{file.size, keyHash};
+                contentCounts[key]++;
+                contentInodes[key].insert(file.inode);
+                stats.inodeCounts[file.inode]++;
+            }
+            stats.totalDbSize += dir.dbSize;
+            stats.totalHashedBytes += dir.hashedBytes;
+            stats.totalHashSeconds += dir.hashSeconds;
+        }
+
+        for (const auto& [key, count] : contentCounts)
+        {
+            auto inodeIt = contentInodes.find(key);
+            if (inodeIt == contentInodes.end())
+            {
+                continue;
+            }
+            size_t uniqueInodes = inodeIt->second.size();
+            if (uniqueInodes > 1)
+            {
+                uint64_t extra = static_cast<uint64_t>(uniqueInodes - 1);
+                stats.redundantFiles += extra;
+                stats.redundantSize += extra * key.size;
+            }
+            if (count > uniqueInodes)
+            {
+                uint64_t extra = count - static_cast<uint64_t>(uniqueInodes);
+                stats.hardlinkedFiles += extra;
+                stats.hardlinkedSize += extra * key.size;
+            }
+        }
+
+        return stats;
+    }
+
+    std::vector<StatLine> buildStatsLines(const TreeStats& stats) const
+    {
+        std::string percentStr = formatPercentFixed(stats.totalSize == 0 ? 0.0 : (100.0 * stats.totalDbSize / stats.totalSize));
+        std::string redundantFilesPct = formatPercentFixed(stats.fileCount == 0 ? 0.0 : (100.0 * stats.redundantFiles / stats.fileCount));
+        std::string redundantSizePct = formatPercentFixed(stats.totalSize == 0 ? 0.0 : (100.0 * stats.redundantSize / stats.totalSize));
+        std::string hardlinkedFilesPct = formatPercentFixed(stats.fileCount == 0 ? 0.0 : (100.0 * stats.hardlinkedFiles / stats.fileCount));
+        std::string hardlinkedSizePct = formatPercentFixed(stats.totalSize == 0 ? 0.0 : (100.0 * stats.hardlinkedSize / stats.totalSize));
+        double dirdbBytesPerFile = (stats.fileCount == 0) ? 0.0 : (double(stats.totalDbSize) / double(stats.fileCount));
+        std::vector<StatLine> lines = {
+            {"files:", formatCountInt(stats.fileCount), std::string()},
+            {"dirs:", formatCountInt(stats.dirCount), std::string()},
+            {"total-size:", ut1::getApproxSizeStr(stats.totalSize, 3, true, false), std::string()},
+            {"redundant-files:", formatCountInt(stats.redundantFiles), "(" + redundantFilesPct + ")"},
+            {"redundant-size:", ut1::getApproxSizeStr(stats.redundantSize, 3, true, false), "(" + redundantSizePct + ")"},
+            {"hardlinked-files:", formatCountInt(stats.hardlinkedFiles), "(" + hardlinkedFilesPct + ")"},
+            {"hardlinked-size:", ut1::getApproxSizeStr(stats.hardlinkedSize, 3, true, false), "(" + hardlinkedSizePct + ")"},
+            {"dirdb-size:", ut1::getApproxSizeStr(stats.totalDbSize, 3, true, false), "(" + percentStr + ")"},
+            {"dirdb-bytes-per-file:", ut1::getApproxSizeStr(dirdbBytesPerFile, 1, true, true), std::string()}
+        };
+        if (stats.totalHashedBytes > 0 && stats.totalHashSeconds > 0.0)
+        {
+            double rateMb = (double(stats.totalHashedBytes) / stats.totalHashSeconds / (1024.0 * 1024.0));
+            std::ostringstream rateOs;
+            rateOs << std::fixed << std::setprecision(1) << rateMb << " MB/s";
+            lines.push_back({"hash-size:", ut1::getApproxSizeStr(stats.totalHashedBytes, 3, true, false), std::string()});
+            lines.push_back({"hash-rate:", rateOs.str(), std::string()});
+        }
+        if (stats.elapsedSeconds > 0.0)
+        {
+            lines.push_back({"elapsed:", ut1::secondsToString(stats.elapsedSeconds), std::string()});
+        }
+        return lines;
+    }
+
+    void printHardlinkOutsideRootWarnings(const fs::path& rootPath, const std::unordered_map<uint64_t, uint64_t>& inodeCounts) const
+    {
+        for (const auto& dir : dirs)
+        {
+            if (!isPathWithin(rootPath, dir.path))
+            {
+                continue;
+            }
+            for (const auto& file : dir.files)
+            {
+                auto countIt = inodeCounts.find(file.inode);
+                uint64_t countInRoot = (countIt == inodeCounts.end()) ? 0 : countIt->second;
+                if (file.numLinks > countInRoot)
+                {
+                    uint64_t outsideLinks = file.numLinks - countInRoot;
+                    std::cout << "Warning: " << (dir.path / file.path).string()
+                              << " has " << outsideLinks << " hardlinks outside root\n";
+                }
+            }
+        }
+    }
+
     struct ListRowWidths
     {
         size_t size{};
@@ -1667,6 +1730,11 @@ private:
             }
             std::cout << lineOut << "\n";
         }
+    }
+
+    static void printBlockSeparator()
+    {
+        std::cout << "----------------------------------------\n";
     }
 
     /// Copy files that exist only in the source root.
@@ -3088,14 +3156,37 @@ int main(int argc, char *argv[])
 
     // Parse command line options.
     cl.parse(argc, argv);
-    clVerbose = cl.getCount("verbose");
-    gBufSize = ut1::strToU64(cl.getStr("bufsize"));
-    if (gBufSize == 0)
+    uint64_t minSize = 0;
+    uint64_t maxHardlinks = 0;
+    uint64_t sizeHistogram = 0;
+    uint64_t maxSize = 0;
+    unsigned progressCount = 0;
+    uint64_t progressWidth = 0;
+    try
     {
-        cl.error("--bufsize must be greater than 0.");
+        clVerbose = cl.getCount("verbose");
+        gBufSize = parseSizeOption(cl, "bufsize");
+        minSize = parseSizeOption(cl, "min-size");
+        maxHardlinks = parseSizeOption(cl, "max-hardlinks");
+        sizeHistogram = parseSizeOption(cl, "size-histogram");
+        maxSize = parseSizeOption(cl, "max-size");
+        if (gBufSize == 0)
+        {
+            cl.error("--bufsize must be greater than 0.");
+        }
+        if (cl("size-histogram") && sizeHistogram == 0)
+        {
+            cl.error("--size-histogram must be greater than 0.");
+        }
+        progressCount = cl.getCount("progress");
+        progressWidth = cl.getUInt("width");
     }
-    unsigned progressCount = cl.getCount("progress");
-    ProgressTracker progress(cl.getUInt("width"), progressCount > 1);
+    catch (const std::exception& e)
+    {
+        cl.error(e.what());
+    }
+
+    ProgressTracker progress(progressWidth, progressCount > 1);
     if (progressCount > 0)
     {
         gProgress = &progress;
@@ -3224,8 +3315,6 @@ int main(int argc, char *argv[])
 
             if (cl("hardlink-copies"))
             {
-                uint64_t minSize = ut1::strToU64(cl.getStr("min-size"));
-                uint64_t maxHardlinks = ut1::strToU64(cl.getStr("max-hardlinks"));
                 auto stats = mainDb.hardlinkCopies(minSize, maxHardlinks, cl("dry-run"));
                 std::cout << "hardlink-copies:\n";
                 mainDb.printHardlinkStats(stats);
@@ -3262,13 +3351,13 @@ int main(int argc, char *argv[])
                     extractLast ? &*extractLast : nullptr,
                     cl("remove-copies"),
                     cl("remove-copies-from-last"),
-                    cl("dry-run"));
+                    cl("dry-run"),
+                    minSize);
             }
             else
             {
                 if (cl("remove-copies"))
                 {
-                    uint64_t minSize = ut1::strToU64(cl.getStr("min-size"));
                     auto stats = mainDb.removeRedundantFiles(minSize, cl("dry-run"));
                     std::cout << "remove-copies:\n";
                     mainDb.printRemoveCopyStats(stats);
@@ -3276,15 +3365,13 @@ int main(int argc, char *argv[])
 
                 if (cl("stats"))
                 {
-                    mainDb.printStats();
+                    mainDb.printStats(minSize);
                 }
 
                 if (cl("size-histogram"))
                 {
-                    uint64_t batchSize = ut1::strToU64(cl.getStr("size-histogram"));
-                    uint64_t maxSize = ut1::strToU64(cl.getStr("max-size"));
-                    bool hasMaxSize = cl.getStr("max-size") != "0";
-                    mainDb.printSizeHistogram(batchSize, maxSize, hasMaxSize);
+                    bool hasMaxSize = maxSize != 0;
+                    mainDb.printSizeHistogram(sizeHistogram, maxSize, hasMaxSize);
                 }
 
                 if (cl("list-files"))
