@@ -380,6 +380,13 @@ struct RemoveCopyStats
     uint64_t bytes{};
 };
 
+struct RemoveContainedDirStats
+{
+    uint64_t dirs{};
+    uint64_t files{};
+    uint64_t bytes{};
+};
+
 static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update);
 static DirDbData createDirDb(const fs::path& dirPath);
 static DirDbData updateDirDb(const fs::path& dirPath);
@@ -1128,7 +1135,14 @@ public:
     }
 
     /// Print containment relation of the last root in all previous roots.
-    void printContainment(const std::vector<fs::path>& rootPaths, uint64_t minSize, bool listContainedFiles, bool listNotContainedFiles) const
+    RemoveContainedDirStats printContainment(
+        const std::vector<fs::path>& rootPaths,
+        uint64_t minSize,
+        bool listContainedFiles,
+        bool listNotContainedFiles,
+        bool showNotContained,
+        bool removeCompletelyContained,
+        bool dryRun) const
     {
         if (rootPaths.size() < 2)
         {
@@ -1138,7 +1152,18 @@ public:
         size_t lastIndex = rootPaths.size() - 1;
         std::vector<fs::path> firstRoots(rootPaths.begin(), rootPaths.begin() + static_cast<std::ptrdiff_t>(lastIndex));
         std::set<ContentKey> firstRootKeys = collectRootsContentKeys(firstRoots, minSize);
-        printContainmentDirection(rootPaths[lastIndex], firstRoots, firstRootKeys, minSize, listContainedFiles, listNotContainedFiles);
+        printContainmentDirection(rootPaths[lastIndex], firstRoots, firstRootKeys, minSize, listContainedFiles, listNotContainedFiles, showNotContained);
+
+        if (!removeCompletelyContained)
+        {
+            return {};
+        }
+
+        std::set<ContentKey> allFirstRootKeys = collectRootsContentKeys(firstRoots, 0);
+        RemoveContainedDirStats stats = removeCompletelyContainedDirs(rootPaths[lastIndex], allFirstRootKeys, dryRun);
+        std::cout << "remove-completely-contained:\n";
+        printRemoveContainedDirStats(stats);
+        return stats;
     }
 
     /// Print the minimum hash length needed to distinguish distinct contents.
@@ -1400,6 +1425,17 @@ public:
     void printRemoveCopyStats(const RemoveCopyStats& stats) const
     {
         std::vector<StatLine> lines = {
+            {"removed-files:", formatCountInt(stats.files), std::string()},
+            {"removed-bytes:", ut1::getApproxSizeStr(stats.bytes, 3, true, false), std::string()}
+        };
+        printStatList(lines);
+    }
+
+    /// Print remove-completely-contained statistics.
+    void printRemoveContainedDirStats(const RemoveContainedDirStats& stats) const
+    {
+        std::vector<StatLine> lines = {
+            {"removed-dirs:", formatCountInt(stats.dirs), std::string()},
             {"removed-files:", formatCountInt(stats.files), std::string()},
             {"removed-bytes:", ut1::getApproxSizeStr(stats.bytes, 3, true, false), std::string()}
         };
@@ -1855,6 +1891,109 @@ private:
         return ancestor != path && isPathWithin(ancestor, path);
     }
 
+    static std::vector<fs::path> collectTopContainedDirs(const std::map<fs::path, ContainmentStats>& byDir)
+    {
+        std::vector<fs::path> result;
+        for (const auto& [path, stats] : byDir)
+        {
+            if (!isCompletelyContained(stats))
+            {
+                continue;
+            }
+
+            bool hasContainedAncestor = false;
+            for (const auto& selected : result)
+            {
+                if (isContainmentListDescendantOf(selected, path))
+                {
+                    hasContainedAncestor = true;
+                    break;
+                }
+            }
+            if (!hasContainedAncestor)
+            {
+                result.push_back(path);
+            }
+        }
+        return result;
+    }
+
+    static uint64_t countDirsInTree(const fs::path& root)
+    {
+        uint64_t count = 1;
+        std::error_code ec;
+        for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
+             it != end; it.increment(ec))
+        {
+            if (ec)
+            {
+                if (clVerbose)
+                {
+                    std::cout << "Skipping entry due to error: " << it->path() << "\n";
+                }
+                ec.clear();
+                continue;
+            }
+            if (ut1::fsIsDirectory(it->path(), false))
+            {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    RemoveContainedDirStats removeCompletelyContainedDirs(
+        const fs::path& sourceRoot,
+        const std::set<ContentKey>& targetKeys,
+        bool dryRun) const
+    {
+        std::map<fs::path, ContainmentStats> byDir = collectContainmentStats(sourceRoot, targetKeys, 0);
+        std::vector<fs::path> dirsToRemove = collectTopContainedDirs(byDir);
+        RemoveContainedDirStats stats;
+        std::set<fs::path> touchedDirs;
+
+        for (const auto& relDir : dirsToRemove)
+        {
+            const ContainmentStats& containment = byDir.at(relDir);
+            fs::path fullPath = (relDir == ".") ? sourceRoot : (sourceRoot / relDir);
+            uint64_t dirCount = countDirsInTree(fullPath);
+
+            if (dryRun || clVerbose)
+            {
+                std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << fullPath.string() << "\n";
+            }
+
+            stats.dirs += dirCount;
+            stats.files += containment.files;
+            stats.bytes += containment.bytes;
+            if (dryRun)
+            {
+                continue;
+            }
+
+            std::error_code ec;
+            fs::remove_all(fullPath, ec);
+            if (ec)
+            {
+                throw std::runtime_error("Failed to remove dir " + fullPath.string());
+            }
+            touchedDirs.insert(fullPath.parent_path());
+        }
+
+        if (!dryRun)
+        {
+            for (const auto& dirPath : touchedDirs)
+            {
+                if (ut1::fsExists(dirPath / ".dirdb"))
+                {
+                    updateDirDb(dirPath);
+                }
+            }
+        }
+
+        return stats;
+    }
+
     static void printContainmentDirList(
         const std::string& label,
         const std::map<fs::path, ContainmentStats>& byDir,
@@ -1917,7 +2056,8 @@ private:
         const std::set<ContentKey>& targetKeys,
         uint64_t minSize,
         bool listContainedFiles,
-        bool listNotContainedFiles) const
+        bool listNotContainedFiles,
+        bool showNotContained) const
     {
         std::map<fs::path, ContainmentStats> byDir = collectContainmentStats(sourceRoot, targetKeys, minSize);
         ContainmentStats total = byDir[fs::path(".")];
@@ -1944,8 +2084,11 @@ private:
         printStatList(stats);
         printContainmentDirList("complete-dirs", byDir, isCompletelyContained, true);
         printContainmentDirList("mostly-contained-dirs", byDir, isMostlyContained);
-        printContainmentDirList("mostly-not-contained-dirs", byDir, isMostlyNotContained);
-        printContainmentDirList("not-contained-dirs", byDir, isNotContained, true);
+        if (showNotContained)
+        {
+            printContainmentDirList("mostly-not-contained-dirs", byDir, isMostlyNotContained);
+            printContainmentDirList("not-contained-dirs", byDir, isNotContained, true);
+        }
         if (listContainedFiles)
         {
             std::cout << "contained-files:\n";
@@ -3474,6 +3617,8 @@ int main(int argc, char *argv[])
     cl.addOption('c', "containment", "Show how much of the last dir is contained in the previous dirs.");
     cl.addOption(' ', "cont-files", "List files in the last dir that are contained in the previous dirs (with --containment).");
     cl.addOption(' ', "not-cont-files", "List files in the last dir that are not contained in the previous dirs (with --containment).");
+    cl.addOption(' ', "show-not-contained", "Show mostly-not-contained and not-contained dir sections (with --containment).");
+    cl.addOption(' ', "remove-completely-contained", "Delete dirs from the last root that are completely contained in previous roots (with --containment).");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
     cl.addOption(' ', "list-redundant", "List redundant files grouped by content hash.");
@@ -3545,7 +3690,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("show-not-contained") || cl("remove-completely-contained") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -3555,7 +3700,7 @@ int main(int argc, char *argv[])
         if (cl("hashrate"))
         {
             bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("show-not-contained") || cl("remove-completely-contained") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                 || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench");
             if (otherOps)
@@ -3610,6 +3755,14 @@ int main(int argc, char *argv[])
         {
             cl.error("--cont-files/--not-cont-files require --containment.");
         }
+        if (cl("show-not-contained") && !cl("containment"))
+        {
+            cl.error("--show-not-contained requires --containment.");
+        }
+        if (cl("remove-completely-contained") && !cl("containment"))
+        {
+            cl.error("--remove-completely-contained requires --containment.");
+        }
         if (cl("remove-copies-from-last") && !cl("intersect"))
         {
             cl.error("--remove-copies-from-last requires --intersect.");
@@ -3645,7 +3798,7 @@ int main(int argc, char *argv[])
             if (cl("readbench"))
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                    || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                    || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("show-not-contained") || cl("remove-completely-contained") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                     || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("hashrate");
                 if (otherOps)
@@ -3692,7 +3845,14 @@ int main(int argc, char *argv[])
 
             if (cl("containment"))
             {
-                mainDb.printContainment(normalizedRoots, minSize, cl("cont-files"), cl("not-cont-files"));
+                mainDb.printContainment(
+                    normalizedRoots,
+                    minSize,
+                    cl("cont-files"),
+                    cl("not-cont-files"),
+                    cl("show-not-contained"),
+                    cl("remove-completely-contained"),
+                    cl("dry-run"));
             }
             else if (cl("intersect"))
             {
