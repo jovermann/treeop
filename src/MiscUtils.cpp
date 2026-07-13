@@ -14,8 +14,13 @@
 #ifdef __APPLE__
 #include <sys/disk.h> // for DKIOCGETBLOCKCOUNT and DKIOCGETBLOCKSIZE
 #endif
+#ifdef __linux__
+#include <linux/fs.h> // for BLKGETSIZE64
+#endif
 #include "MiscUtils.hpp"
 #include "UnitTest.hpp"
+#include <cerrno>
+#include <cstring>
 #include <iostream>
 #include <array>
 #include <chrono>
@@ -809,7 +814,6 @@ uint64_t strToU64(const std::string& s)
         {
             case 'k': r <<= 10; break;
             case 'M': r <<= 20; break;
-            case 'm': r <<= 20; break;
             case 'G': r <<= 30; break;
             case 'T': r <<= 40; break;
             case 'P': r <<= 50; break;
@@ -827,7 +831,6 @@ UNIT_TEST(strToU64)
     ASSERT_EQ(ut1::strToU64("42"), 42ull);
     ASSERT_EQ(ut1::strToU64("4k"), 4096ull);
     ASSERT_EQ(ut1::strToU64("2M"), 2*1024*1024ull);
-    ASSERT_EQ(ut1::strToU64("2m"), 2*1024*1024ull);
 }
 
 UNIT_TEST(csvIntegersToVector)
@@ -1116,7 +1119,16 @@ size_t getFileSize(const std::string& filename)
     }
     else if (S_ISBLK(st.st_mode) || S_ISCHR(st.st_mode)) // Block or character device (e.g., /dev/disk16).
     {
-#ifdef __APPLE__
+#if defined(__linux__)
+        uint64_t deviceSize = 0;
+        if (::ioctl(fd, BLKGETSIZE64, &deviceSize) == -1)
+        {
+            const std::string error = std::strerror(errno);
+            ::close(fd);
+            throw std::runtime_error(std::format("getFileSize({}): ioctl BLKGETSIZE64 failed: {}.", filename, error));
+        }
+        size = size_t(deviceSize);
+#elif defined(__APPLE__)
         uint64_t blockCount = 0;
         uint32_t blockSize = 0;
 
