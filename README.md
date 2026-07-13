@@ -51,6 +51,11 @@ All sizes may be specified with kMGTPE suffixes indicating powers of 1024.
 Options:
   -i --intersect           Determine intersections of two or more dirs. Print unique/shared statistics per
                            dir.
+  -c --containment         Show how much of the last dir is contained in the previous dirs.
+     --cont-files          List files in the last dir that are contained in the previous dirs (with
+                           --containment).
+     --not-cont-files      List files in the last dir that are not contained in the previous dirs (with
+                           --containment).
   -s --stats               Print statistics about each dir (number of files and total size etc).
   -l --list-files          List all files with stored meta-data.
      --list-a              List files only in A when used with --intersect.
@@ -89,6 +94,4 @@ Linux/MacOS:
 ## Running tests
 
 `make test`
-
-
 

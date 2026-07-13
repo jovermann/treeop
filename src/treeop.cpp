@@ -1127,6 +1127,20 @@ public:
         }
     }
 
+    /// Print containment relation of the last root in all previous roots.
+    void printContainment(const std::vector<fs::path>& rootPaths, uint64_t minSize, bool listContainedFiles, bool listNotContainedFiles) const
+    {
+        if (rootPaths.size() < 2)
+        {
+            throw std::runtime_error("--containment requires at least two directories.");
+        }
+
+        size_t lastIndex = rootPaths.size() - 1;
+        std::vector<fs::path> firstRoots(rootPaths.begin(), rootPaths.begin() + static_cast<std::ptrdiff_t>(lastIndex));
+        std::set<ContentKey> firstRootKeys = collectRootsContentKeys(firstRoots, minSize);
+        printContainmentDirection(rootPaths[lastIndex], firstRoots, firstRootKeys, minSize, listContainedFiles, listNotContainedFiles);
+    }
+
     /// Print the minimum hash length needed to distinguish distinct contents.
     void printUniqueHashLen() const
     {
@@ -1606,6 +1620,341 @@ private:
                               << " has " << outsideLinks << " hardlinks outside root\n";
                 }
             }
+        }
+    }
+
+    struct ContainmentStats
+    {
+        uint64_t files{};
+        uint64_t bytes{};
+        uint64_t matchedFiles{};
+        uint64_t matchedBytes{};
+    };
+
+    ContentKey contentKeyForFile(const FileEntry& file) const
+    {
+        Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
+        return ContentKey{file.size, keyHash};
+    }
+
+    std::set<ContentKey> collectRootsContentKeys(const std::vector<fs::path>& rootPaths, uint64_t minSize) const
+    {
+        std::set<ContentKey> keys;
+        for (const auto& dir : dirs)
+        {
+            bool inAnyRoot = false;
+            for (const auto& rootPath : rootPaths)
+            {
+                if (isPathWithin(rootPath, dir.path))
+                {
+                    inAnyRoot = true;
+                    break;
+                }
+            }
+            if (!inAnyRoot)
+            {
+                continue;
+            }
+            for (const auto& file : dir.files)
+            {
+                if (file.size < minSize)
+                {
+                    continue;
+                }
+                keys.insert(contentKeyForFile(file));
+            }
+        }
+        return keys;
+    }
+
+    static fs::path normalizedRelativeDir(const fs::path& path)
+    {
+        if (path.empty() || path == ".")
+        {
+            return fs::path(".");
+        }
+        return path.lexically_normal();
+    }
+
+    static std::vector<fs::path> ancestorDirsForFile(const fs::path& relFile)
+    {
+        std::vector<fs::path> ancestors;
+        ancestors.push_back(fs::path("."));
+        fs::path parent = relFile.parent_path();
+        fs::path current;
+        for (const auto& part : parent)
+        {
+            if (part == ".")
+            {
+                continue;
+            }
+            current /= part;
+            ancestors.push_back(current);
+        }
+        return ancestors;
+    }
+
+    std::map<fs::path, ContainmentStats> collectContainmentStats(
+        const fs::path& sourceRoot,
+        const std::set<ContentKey>& targetKeys,
+        uint64_t minSize) const
+    {
+        std::map<fs::path, ContainmentStats> byDir;
+        byDir[fs::path(".")];
+        for (const auto& dir : dirs)
+        {
+            if (!isPathWithin(sourceRoot, dir.path))
+            {
+                continue;
+            }
+
+            std::error_code ec;
+            fs::path relDir = fs::relative(dir.path, sourceRoot, ec);
+            if (ec)
+            {
+                throw std::runtime_error("Failed to compute relative path for " + dir.path.string());
+            }
+            byDir[normalizedRelativeDir(relDir)];
+
+            for (const auto& file : dir.files)
+            {
+                if (file.size < minSize)
+                {
+                    continue;
+                }
+                fs::path fullPath = dir.path / file.path;
+                fs::path relFile = fs::relative(fullPath, sourceRoot, ec);
+                if (ec)
+                {
+                    throw std::runtime_error("Failed to compute relative path for " + fullPath.string());
+                }
+
+                ContentKey key = contentKeyForFile(file);
+                bool matched = targetKeys.find(key) != targetKeys.end();
+                for (const auto& ancestor : ancestorDirsForFile(relFile))
+                {
+                    ContainmentStats& stats = byDir[normalizedRelativeDir(ancestor)];
+                    stats.files++;
+                    stats.bytes += file.size;
+                    if (matched)
+                    {
+                        stats.matchedFiles++;
+                        stats.matchedBytes += file.size;
+                    }
+                }
+            }
+        }
+        return byDir;
+    }
+
+    std::vector<FileEntry> collectContainmentFiles(
+        const fs::path& sourceRoot,
+        const std::set<ContentKey>& targetKeys,
+        uint64_t minSize,
+        bool wantContained) const
+    {
+        std::vector<FileEntry> refs;
+        for (const auto& dir : dirs)
+        {
+            if (!isPathWithin(sourceRoot, dir.path))
+            {
+                continue;
+            }
+            for (const auto& file : dir.files)
+            {
+                if (file.size < minSize)
+                {
+                    continue;
+                }
+                bool matched = targetKeys.find(contentKeyForFile(file)) != targetKeys.end();
+                if (matched != wantContained)
+                {
+                    continue;
+                }
+
+                fs::path fullPath = dir.path / file.path;
+                std::error_code ec;
+                fs::path relFile = fs::relative(fullPath, sourceRoot, ec);
+                if (ec)
+                {
+                    throw std::runtime_error("Failed to compute relative path for " + fullPath.string());
+                }
+                refs.push_back(FileEntry{
+                    relFile.generic_string(),
+                    file.size,
+                    file.hash,
+                    file.inode,
+                    file.date,
+                    file.numLinks
+                });
+            }
+        }
+        std::sort(refs.begin(), refs.end(),
+            [](const FileEntry& a, const FileEntry& b)
+            {
+                return a.path < b.path;
+            });
+        return refs;
+    }
+
+    static double containmentPercent(const ContainmentStats& stats)
+    {
+        return (stats.files == 0) ? 0.0 : (100.0 * stats.matchedFiles / stats.files);
+    }
+
+    static bool isCompletelyContained(const ContainmentStats& stats)
+    {
+        return stats.files > 0 && stats.matchedFiles == stats.files;
+    }
+
+    static bool isMostlyContained(const ContainmentStats& stats)
+    {
+        double percent = containmentPercent(stats);
+        return stats.files > 0 && percent > 90.0 && percent < 100.0;
+    }
+
+    static bool isMostlyNotContained(const ContainmentStats& stats)
+    {
+        double percent = containmentPercent(stats);
+        return stats.files > 0 && percent > 0.0 && percent < 10.0;
+    }
+
+    static bool isNotContained(const ContainmentStats& stats)
+    {
+        return stats.files > 0 && stats.matchedFiles == 0;
+    }
+
+    static std::string formatContainmentRatio(uint64_t matched, uint64_t total)
+    {
+        std::string pct = formatPercentFixed(total == 0 ? 0.0 : (100.0 * matched / total));
+        return formatCountInt(matched) + " / " + formatCountInt(total) + " (" + pct + ")";
+    }
+
+    static std::string formatContainmentSizeRatio(uint64_t matched, uint64_t total)
+    {
+        std::string pct = formatPercentFixed(total == 0 ? 0.0 : (100.0 * matched / total));
+        return ut1::getApproxSizeStr(matched, 3, true, false) + " / "
+            + ut1::getApproxSizeStr(total, 3, true, false) + " (" + pct + ")";
+    }
+
+    static std::string formatContainmentPath(const fs::path& path)
+    {
+        if (path == ".")
+        {
+            return ".";
+        }
+        return path.generic_string();
+    }
+
+    static bool isContainmentListDescendantOf(const fs::path& ancestor, const fs::path& path)
+    {
+        if (ancestor == ".")
+        {
+            return path != ".";
+        }
+        return ancestor != path && isPathWithin(ancestor, path);
+    }
+
+    static void printContainmentDirList(
+        const std::string& label,
+        const std::map<fs::path, ContainmentStats>& byDir,
+        bool (*predicate)(const ContainmentStats&),
+        bool suppressDescendants = false)
+    {
+        std::cout << label << ":\n";
+        bool any = false;
+        std::vector<fs::path> printedDirs;
+        for (const auto& [path, stats] : byDir)
+        {
+            if (!predicate(stats))
+            {
+                continue;
+            }
+            if (suppressDescendants)
+            {
+                bool hasPrintedAncestor = false;
+                for (const auto& printed : printedDirs)
+                {
+                    if (isContainmentListDescendantOf(printed, path))
+                    {
+                        hasPrintedAncestor = true;
+                        break;
+                    }
+                }
+                if (hasPrintedAncestor)
+                {
+                    continue;
+                }
+            }
+            any = true;
+            printedDirs.push_back(path);
+            std::cout << "  " << formatContainmentPath(path)
+                      << " files=" << formatContainmentRatio(stats.matchedFiles, stats.files)
+                      << " size=" << formatContainmentSizeRatio(stats.matchedBytes, stats.bytes) << "\n";
+        }
+        if (!any)
+        {
+            std::cout << "  (none)\n";
+        }
+    }
+
+    void printContainmentFileList(const std::vector<FileEntry>& refs) const
+    {
+        if (clVerbose > 0)
+        {
+            printListRows(refs, clVerbose > 1, getUniqueHashHexLen());
+            return;
+        }
+        for (const auto& ref : refs)
+        {
+            std::cout << ref.path << "\n";
+        }
+    }
+
+    void printContainmentDirection(
+        const fs::path& sourceRoot,
+        const std::vector<fs::path>& targetRoots,
+        const std::set<ContentKey>& targetKeys,
+        uint64_t minSize,
+        bool listContainedFiles,
+        bool listNotContainedFiles) const
+    {
+        std::map<fs::path, ContainmentStats> byDir = collectContainmentStats(sourceRoot, targetKeys, minSize);
+        ContainmentStats total = byDir[fs::path(".")];
+        std::vector<StatLine> stats = {
+            {"files:", formatContainmentRatio(total.matchedFiles, total.files), std::string()},
+            {"size:", formatContainmentSizeRatio(total.matchedBytes, total.bytes), std::string()}
+        };
+
+        std::cout << sourceRoot.string() << " in previous roots";
+        if (!targetRoots.empty())
+        {
+            std::cout << " (";
+            for (size_t i = 0; i < targetRoots.size(); i++)
+            {
+                if (i > 0)
+                {
+                    std::cout << ", ";
+                }
+                std::cout << targetRoots[i].string();
+            }
+            std::cout << ")";
+        }
+        std::cout << ":\n";
+        printStatList(stats);
+        printContainmentDirList("complete-dirs", byDir, isCompletelyContained, true);
+        printContainmentDirList("mostly-contained-dirs", byDir, isMostlyContained);
+        printContainmentDirList("mostly-not-contained-dirs", byDir, isMostlyNotContained);
+        printContainmentDirList("not-contained-dirs", byDir, isNotContained, true);
+        if (listContainedFiles)
+        {
+            std::cout << "contained-files:\n";
+            printContainmentFileList(collectContainmentFiles(sourceRoot, targetKeys, minSize, true));
+        }
+        if (listNotContainedFiles)
+        {
+            std::cout << "not-contained-files:\n";
+            printContainmentFileList(collectContainmentFiles(sourceRoot, targetKeys, minSize, false));
         }
     }
 
@@ -3122,6 +3471,9 @@ int main(int argc, char *argv[])
 
     cl.addHeader("\nOptions:\n");
     cl.addOption('i', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
+    cl.addOption('c', "containment", "Show how much of the last dir is contained in the previous dirs.");
+    cl.addOption(' ', "cont-files", "List files in the last dir that are contained in the previous dirs (with --containment).");
+    cl.addOption(' ', "not-cont-files", "List files in the last dir that are not contained in the previous dirs (with --containment).");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
     cl.addOption(' ', "list-redundant", "List redundant files grouped by content hash.");
@@ -3141,7 +3493,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "readbench", "Read all files to measure filesystem read performance.");
     cl.addOption(' ', "hashrate", "Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.");
     cl.addOption(' ', "bufsize", "Buffer size for reading (readbench and hashing).", "N", "1M");
-    cl.addOption(' ', "min-size", "Minimum file size to hardlink when using --hardlink-copies.", "N", "0");
+    cl.addOption(' ', "min-size", "Minimum file size for operations that support file filtering.", "N", "0");
     cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
     cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
@@ -3193,7 +3545,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -3203,7 +3555,7 @@ int main(int argc, char *argv[])
         if (cl("hashrate"))
         {
             bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                || cl("intersect") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                 || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench");
             if (otherOps)
@@ -3254,6 +3606,10 @@ int main(int argc, char *argv[])
         {
             cl.error("--extract-first/--extract-last require --intersect.");
         }
+        if ((cl("cont-files") || cl("not-cont-files")) && !cl("containment"))
+        {
+            cl.error("--cont-files/--not-cont-files require --containment.");
+        }
         if (cl("remove-copies-from-last") && !cl("intersect"))
         {
             cl.error("--remove-copies-from-last requires --intersect.");
@@ -3261,6 +3617,14 @@ int main(int argc, char *argv[])
         if (cl("remove-copies") && cl("remove-copies-from-last"))
         {
             cl.error("Cannot combine --remove-copies with --remove-copies-from-last.");
+        }
+        if (cl("containment") && cl("intersect"))
+        {
+            cl.error("Cannot combine --containment with --intersect.");
+        }
+        if (cl("containment") && cl.getArgs().size() < 2)
+        {
+            cl.error("--containment requires at least two directories.");
         }
 
         std::vector<fs::path> normalizedRoots;
@@ -3281,7 +3645,7 @@ int main(int argc, char *argv[])
             if (cl("readbench"))
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                    || cl("intersect") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                    || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                     || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("hashrate");
                 if (otherOps)
@@ -3326,7 +3690,11 @@ int main(int argc, char *argv[])
                 mainDb.printBreakHardlinkStats(stats);
             }
 
-            if (cl("intersect"))
+            if (cl("containment"))
+            {
+                mainDb.printContainment(normalizedRoots, minSize, cl("cont-files"), cl("not-cont-files"));
+            }
+            else if (cl("intersect"))
             {
                 if (normalizedRoots.size() < 2)
                 {
