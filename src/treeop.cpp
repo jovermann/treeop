@@ -1218,6 +1218,96 @@ public:
         return {};
     }
 
+    /// Find and print ranked overlapping directory pairs.
+    void printOverlappingDirs(const std::vector<fs::path>& rootPaths, uint64_t minSize, uint64_t top) const
+    {
+        std::vector<OverlapDirData> overlapDirs = collectOverlapDirs(rootPaths, minSize);
+        std::vector<OverlapResult> results;
+        uint64_t totalPairs = 0;
+        if (overlapDirs.size() > 1)
+        {
+            totalPairs = static_cast<uint64_t>(overlapDirs.size()) * static_cast<uint64_t>(overlapDirs.size() - 1);
+            results.reserve(static_cast<size_t>(totalPairs));
+        }
+
+        if (gProgress)
+        {
+            gProgress->onPhaseStart("overlap: compare dirs", totalPairs);
+        }
+        uint64_t processed = 0;
+        for (size_t i = 0; i < overlapDirs.size(); i++)
+        {
+            for (size_t j = 0; j < overlapDirs.size(); j++)
+            {
+                if (i == j)
+                {
+                    continue;
+                }
+                OverlapResult result = buildOverlapResult(overlapDirs[i], overlapDirs[j]);
+                if (result.shared.bytes > 0)
+                {
+                    results.push_back(std::move(result));
+                }
+                if (gProgress)
+                {
+                    gProgress->onPhaseProgress(++processed);
+                }
+            }
+        }
+        if (gProgress)
+        {
+            gProgress->onPhaseEnd();
+            gProgress->finish();
+        }
+
+        std::sort(results.begin(), results.end(),
+            [](const OverlapResult& a, const OverlapResult& b)
+            {
+                if (a.sharedPercentBytes != b.sharedPercentBytes)
+                {
+                    return a.sharedPercentBytes > b.sharedPercentBytes;
+                }
+                if (a.sharedPercentFiles != b.sharedPercentFiles)
+                {
+                    return a.sharedPercentFiles > b.sharedPercentFiles;
+                }
+                if (a.shared.bytes != b.shared.bytes)
+                {
+                    return a.shared.bytes > b.shared.bytes;
+                }
+                if (a.shared.files != b.shared.files)
+                {
+                    return a.shared.files > b.shared.files;
+                }
+                if (a.a != b.a)
+                {
+                    return a.a < b.a;
+                }
+                return a.b < b.b;
+            });
+
+        size_t limit = results.size();
+        if (top > 0)
+        {
+            limit = std::min(limit, static_cast<size_t>(top));
+        }
+
+        std::cout << "overlapping-dirs:\n";
+        if (limit == 0)
+        {
+            std::cout << "  (none)\n";
+            return;
+        }
+        for (size_t i = 0; i < limit; i++)
+        {
+            printOverlapResult(results[i]);
+            if (i + 1 < limit)
+            {
+                printBlockSeparator();
+            }
+        }
+    }
+
     /// Print the minimum hash length needed to distinguish distinct contents.
     void printUniqueHashLen() const
     {
@@ -1719,6 +1809,32 @@ private:
         uint64_t matchedBytes{};
     };
 
+    struct OverlapBucketStats
+    {
+        uint64_t files{};
+        uint64_t bytes{};
+    };
+
+    struct OverlapDirData
+    {
+        fs::path path;
+        std::map<ContentKey, uint64_t> contentCounts;
+        OverlapBucketStats total;
+    };
+
+    struct OverlapResult
+    {
+        fs::path a;
+        fs::path b;
+        OverlapBucketStats onlyA;
+        OverlapBucketStats shared;
+        OverlapBucketStats onlyB;
+        OverlapBucketStats totalA;
+        OverlapBucketStats totalB;
+        double sharedPercentFiles{};
+        double sharedPercentBytes{};
+    };
+
     ContentKey contentKeyForFile(const FileEntry& file) const
     {
         Hash128 keyHash = sameFilename ? hashWithFilename(file.hash, keyNameForPath(file.path)) : file.hash;
@@ -1757,6 +1873,148 @@ private:
     uint64_t countRootFiles(const fs::path& rootPath, uint64_t minSize) const
     {
         return countRootFiles(std::vector<fs::path>{rootPath}, minSize);
+    }
+
+    std::vector<OverlapDirData> collectOverlapDirs(const std::vector<fs::path>& rootPaths, uint64_t minSize) const
+    {
+        std::vector<OverlapDirData> result;
+        for (const auto& dir : dirs)
+        {
+            bool inAnyRoot = false;
+            for (const auto& rootPath : rootPaths)
+            {
+                if (isPathWithin(rootPath, dir.path))
+                {
+                    inAnyRoot = true;
+                    break;
+                }
+            }
+            if (!inAnyRoot)
+            {
+                continue;
+            }
+
+            OverlapDirData data;
+            data.path = dir.path;
+            for (const auto& file : dir.files)
+            {
+                if (file.size < minSize)
+                {
+                    continue;
+                }
+                ContentKey key = contentKeyForFile(file);
+                data.contentCounts[key]++;
+                data.total.files++;
+                data.total.bytes += file.size;
+            }
+            if (data.total.files > 0)
+            {
+                result.push_back(std::move(data));
+            }
+        }
+        return result;
+    }
+
+    static double percentOf(uint64_t value, uint64_t total)
+    {
+        return total == 0 ? 0.0 : (100.0 * double(value) / double(total));
+    }
+
+    static std::string formatOverlapBytes(uint64_t bytes)
+    {
+        return ut1::getApproxSizeStr(bytes, 1, true, false);
+    }
+
+    struct OverlapRow
+    {
+        std::string label;
+        std::string filePercent;
+        std::string files;
+        std::string bytePercent;
+        std::string bytes;
+        std::string suffix;
+    };
+
+    static std::string formatOverlapTotal(const OverlapBucketStats& total, const std::string& label)
+    {
+        return "(" + formatOverlapBytes(total.bytes) + "/" + formatCountInt(total.files) + " files total in " + label + ")";
+    }
+
+    static OverlapResult buildOverlapResult(const OverlapDirData& a, const OverlapDirData& b)
+    {
+        OverlapResult result;
+        result.a = a.path;
+        result.b = b.path;
+        result.totalA = a.total;
+        result.totalB = b.total;
+
+        for (const auto& [key, count] : a.contentCounts)
+        {
+            if (b.contentCounts.find(key) != b.contentCounts.end())
+            {
+                result.shared.files += count;
+                result.shared.bytes += count * key.size;
+            }
+            else
+            {
+                result.onlyA.files += count;
+                result.onlyA.bytes += count * key.size;
+            }
+        }
+        for (const auto& [key, count] : b.contentCounts)
+        {
+            if (a.contentCounts.find(key) != a.contentCounts.end())
+            {
+                continue;
+            }
+            result.onlyB.files += count;
+            result.onlyB.bytes += count * key.size;
+        }
+
+        result.sharedPercentFiles = percentOf(result.shared.files, result.totalA.files);
+        result.sharedPercentBytes = percentOf(result.shared.bytes, result.totalA.bytes);
+        return result;
+    }
+
+    static void printOverlapResult(const OverlapResult& result)
+    {
+        std::cout << "A: " << result.a.string() << "\n";
+        std::cout << "B: " << result.b.string() << "\n";
+        std::vector<OverlapRow> rows = {
+            {"shared:", formatPercentFixed(percentOf(result.shared.files, result.totalA.files)), formatCountInt(result.shared.files),
+                formatPercentFixed(percentOf(result.shared.bytes, result.totalA.bytes)), formatOverlapBytes(result.shared.bytes), std::string()},
+            {"only in A:", formatPercentFixed(percentOf(result.onlyA.files, result.totalA.files)), formatCountInt(result.onlyA.files),
+                formatPercentFixed(percentOf(result.onlyA.bytes, result.totalA.bytes)), formatOverlapBytes(result.onlyA.bytes), formatOverlapTotal(result.totalA, "A")},
+            {"only in B:", formatPercentFixed(percentOf(result.onlyB.files, result.totalB.files)), formatCountInt(result.onlyB.files),
+                formatPercentFixed(percentOf(result.onlyB.bytes, result.totalB.bytes)), formatOverlapBytes(result.onlyB.bytes), formatOverlapTotal(result.totalB, "B")}
+        };
+
+        size_t labelWidth = 0;
+        size_t filePercentWidth = 0;
+        size_t fileWidth = 0;
+        size_t bytePercentWidth = 0;
+        size_t byteWidth = 0;
+        for (const auto& row : rows)
+        {
+            labelWidth = std::max(labelWidth, row.label.size());
+            filePercentWidth = std::max(filePercentWidth, row.filePercent.size());
+            fileWidth = std::max(fileWidth, row.files.size());
+            bytePercentWidth = std::max(bytePercentWidth, row.bytePercent.size());
+            byteWidth = std::max(byteWidth, row.bytes.size());
+        }
+        for (const auto& row : rows)
+        {
+            std::cout << std::left << std::setw(static_cast<int>(labelWidth)) << row.label << " "
+                      << std::right << std::setw(static_cast<int>(bytePercentWidth)) << row.bytePercent << "/"
+                      << std::setw(static_cast<int>(byteWidth)) << row.bytes << ", "
+                      << std::setw(static_cast<int>(filePercentWidth)) << row.filePercent << "/"
+                      << std::setw(static_cast<int>(fileWidth)) << row.files << " files";
+            if (!row.suffix.empty())
+            {
+                std::cout << " " << row.suffix;
+            }
+            std::cout << "\n";
+        }
     }
 
     std::set<ContentKey> collectRootsContentKeys(const std::vector<fs::path>& rootPaths, uint64_t minSize) const
@@ -3833,6 +4091,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "show-not-contained", "Show mostly-not-contained and not-contained dir sections (with --containment).");
     cl.addOption(' ', "remove-contained-dirs", "Delete dirs from the last root that are completely contained in previous roots (with --containment).");
     cl.addOption(' ', "remove-contained-files", "Delete files from the last root that are contained in previous roots (with --containment).");
+    cl.addOption(' ', "find-overlapping-dirs", "Find and rank overlapping directory pairs within the specified trees.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
     cl.addOption(' ', "list-redundant", "List redundant files grouped by content hash.");
@@ -3861,6 +4120,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
     cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
     cl.addOption(' ', "max-size", "Maximum file size to include in size histogram.", "N", "0");
+    cl.addOption(' ', "top", "Maximum number of overlapping directory pairs to print (with --find-overlapping-dirs).", "N", "0");
     cl.addOption('p', "progress", "Print progress once per second.");
     cl.addOption('W', "width", "Max width for progress line.", "N", "199");
     cl.addOption('v', "verbose", "Increase verbosity. Specify multiple times to be more verbose.");
@@ -3871,6 +4131,7 @@ int main(int argc, char *argv[])
     uint64_t maxHardlinks = 0;
     uint64_t sizeHistogram = 0;
     uint64_t maxSize = 0;
+    uint64_t top = 0;
     unsigned progressCount = 0;
     uint64_t progressWidth = 0;
     try
@@ -3881,6 +4142,7 @@ int main(int argc, char *argv[])
         maxHardlinks = parseSizeOption(cl, "max-hardlinks");
         sizeHistogram = parseSizeOption(cl, "size-histogram");
         maxSize = parseSizeOption(cl, "max-size");
+        top = cl.getUInt("top");
         if (gBufSize == 0)
         {
             cl.error("--bufsize must be greater than 0.");
@@ -3904,7 +4166,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -3914,7 +4176,7 @@ int main(int argc, char *argv[])
         if (cl("hashrate"))
         {
             bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                 || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench");
             if (otherOps)
@@ -3993,6 +4255,22 @@ int main(int argc, char *argv[])
         {
             cl.error("Cannot combine --containment with --intersect.");
         }
+        if (cl("top") && !cl("find-overlapping-dirs"))
+        {
+            cl.error("--top requires --find-overlapping-dirs.");
+        }
+        if (cl("find-overlapping-dirs"))
+        {
+            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+                || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained")
+                || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
+                || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench") || cl("hashrate");
+            if (otherOps)
+            {
+                cl.error("--find-overlapping-dirs cannot be combined with other operations.");
+            }
+        }
         if (cl("containment") && cl.getArgs().size() < 2)
         {
             cl.error("--containment requires at least two directories.");
@@ -4016,7 +4294,7 @@ int main(int argc, char *argv[])
             if (cl("readbench"))
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                    || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                    || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                     || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("hashrate");
                 if (otherOps)
@@ -4061,7 +4339,11 @@ int main(int argc, char *argv[])
                 mainDb.printBreakHardlinkStats(stats);
             }
 
-            if (cl("containment"))
+            if (cl("find-overlapping-dirs"))
+            {
+                mainDb.printOverlappingDirs(normalizedRoots, minSize, top);
+            }
+            else if (cl("containment"))
             {
                 mainDb.printContainment(
                     normalizedRoots,

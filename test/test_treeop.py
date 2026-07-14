@@ -482,6 +482,127 @@ def test_remove_contained_dirs_and_files_conflict(tmp_path: Path):
     assert not (dir_b / ".dirdb").exists()
 
 
+def test_find_overlapping_dirs_top_lists_best_pair(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "source" / "shared-one.txt", "shared-one")
+    write_file(dir_a / "source" / "shared-two.txt", "shared-two")
+    write_file(dir_a / "source" / "only-a.txt", "only-a")
+    write_file(dir_b / "copy" / "copy-one.txt", "shared-one")
+    write_file(dir_b / "copy" / "copy-two.txt", "shared-two")
+    write_file(dir_b / "copy" / "only-b.txt", "only-b")
+    write_file(dir_b / "partial" / "copy-one.txt", "shared-one")
+    write_file(dir_b / "partial" / "different.txt", "different")
+
+    out = run_treeop(["--find-overlapping-dirs", "--top", "1", str(dir_a), str(dir_b)], root)
+
+    assert "overlapping-dirs:" in out
+    assert f"A: {dir_a / 'source'}" in out or f"A: {dir_b / 'copy'}" in out
+    assert f"B: {dir_b / 'copy'}" in out or f"B: {dir_a / 'source'}" in out
+    assert "partial" not in out
+    assert "shared in files:" not in out
+    assert "shared in bytes:" not in out
+    assert re.search(r"shared:\s+\d+\.?\d*%/\s*\d+\.?\d* bytes,\s+66\.7%/\s*2 files", out)
+    assert re.search(r"only in A:\s+\d+\.?\d*%/\s*\d+\.?\d* bytes,\s+33\.3%/\s*1 files\s+\(\d+\.?\d* bytes/3 files total in A\)", out)
+    assert re.search(r"only in B:\s+\d+\.?\d*%/\s*\d+\.?\d* bytes,\s+33\.3%/\s*1 files\s+\(\d+\.?\d* bytes/3 files total in B\)", out)
+    assert out.index("shared:") < out.index("only in A:")
+
+
+def test_find_overlapping_dirs_honors_min_size(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "x" / "small.txt", "hi")
+    write_file(dir_b / "y" / "small-copy.txt", "hi")
+    write_file(dir_a / "x" / "large.txt", "large-shared")
+    write_file(dir_b / "y" / "large-copy.txt", "large-shared")
+
+    out = run_treeop(["--find-overlapping-dirs", "--top", "1", "--min-size", "5", str(dir_a), str(dir_b)], root)
+
+    assert re.search(r"shared:\s+100\.0%/\s*\d+\.?\d* bytes,\s+100\.0%/\s*1 files", out)
+
+
+def test_find_overlapping_dirs_sorts_by_shared_bytes_percent(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "mostly_bytes" / "big.txt", "x" * 100)
+    write_file(dir_a / "mostly_bytes" / "small-unique.txt", "u")
+    write_file(dir_b / "big_copy" / "big-copy.txt", "x" * 100)
+
+    write_file(dir_a / "mostly_files" / "one.txt", "one")
+    write_file(dir_a / "mostly_files" / "two.txt", "two")
+    write_file(dir_a / "mostly_files" / "large-unique.txt", "y" * 100)
+    write_file(dir_b / "small_copies" / "one-copy.txt", "one")
+    write_file(dir_b / "small_copies" / "two-copy.txt", "two")
+
+    out = run_treeop(["--find-overlapping-dirs", "--top", "1", str(dir_a), str(dir_b)], root)
+
+    assert f"A: {dir_b / 'big_copy'}" in out
+    assert f"B: {dir_a / 'mostly_bytes'}" in out
+    assert "mostly_files" not in out
+
+
+def test_find_overlapping_dirs_omits_zero_shared_bytes(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "x" / "one.txt", "one")
+    write_file(dir_b / "y" / "two.txt", "two")
+
+    out = run_treeop(["--find-overlapping-dirs", str(dir_a), str(dir_b)], root)
+
+    assert "overlapping-dirs:" in out
+    assert "  (none)" in out
+    assert "A:" not in out
+    assert "shared:" not in out
+
+
+def test_top_requires_find_overlapping_dirs(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+
+    result = run_treeop_result(["--top", "1", str(dir_a)], root)
+
+    assert result.returncode != 0
+    assert "--top requires --find-overlapping-dirs." in result.stdout
+    assert not (dir_a / ".dirdb").exists()
+
+
 def test_remove_copies_dry_run(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()

@@ -66,6 +66,8 @@ Options:
      --remove-contained-files
                            Delete files from the last root that are contained in previous roots (with
                            --containment).
+     --find-overlapping-dirs
+                           Find and rank overlapping directory pairs within the specified trees.
   -s --stats               Print statistics about each dir (number of files and total size etc).
   -l --list-files          List all files with stored meta-data.
      --list-a              List files only in A when used with --intersect.
@@ -83,6 +85,8 @@ Options:
      --hashrate            Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.
      --size-histogram=N    Print size histogram for all files in all dirs where N in the batch size in
                            bytes. (default=0)
+     --top=N               Maximum number of overlapping directory pairs to print (with
+                           --find-overlapping-dirs). (default=0)
      --max-size=N          Maximum file size to include in size histogram. (default=0)
   -p --progress            Print progress once per second.
   -W --width=N             Max width for progress line. (default=199)
