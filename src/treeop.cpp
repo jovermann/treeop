@@ -185,6 +185,31 @@ public:
         tick();
     }
 
+    /// Begin tracking a named in-memory phase with known work units.
+    void onPhaseStart(const std::string& name, uint64_t total)
+    {
+        currentPhase = name;
+        phaseDone = 0;
+        phaseTotal = total;
+        tick();
+    }
+
+    /// Update the current in-memory phase progress.
+    void onPhaseProgress(uint64_t done)
+    {
+        phaseDone = done;
+        tick();
+    }
+
+    /// End tracking the current in-memory phase.
+    void onPhaseEnd()
+    {
+        currentPhase.clear();
+        phaseDone = 0;
+        phaseTotal = 0;
+        tick();
+    }
+
     /// Clear the progress line and finish output.
     void finish()
     {
@@ -223,7 +248,16 @@ private:
         std::string prefix = ut1::toStr(files) + "f/" + ut1::toStr(dirs) + "d (" + sizeStr + ", " + avgRateStr + ", " + curRateStr + ")";
 
         std::string suffix;
-        if (hashing && !currentFile.empty())
+        if (!currentPhase.empty())
+        {
+            prefix = currentPhase + " " + ut1::toStr(phaseDone) + "/" + ut1::toStr(phaseTotal);
+            if (phaseTotal > 0)
+            {
+                unsigned percent = unsigned((phaseDone * 100) / phaseTotal);
+                suffix = ut1::toStr(percent) + "%";
+            }
+        }
+        else if (hashing && !currentFile.empty())
         {
             unsigned percent = 0;
             if (currentFileSize > 0)
@@ -305,8 +339,11 @@ private:
     double lastRateTime = 0.0;
     std::string currentDir;
     std::string currentFile;
+    std::string currentPhase;
     uint64_t currentFileSize = 0;
     uint64_t currentFileDone = 0;
+    uint64_t phaseDone = 0;
+    uint64_t phaseTotal = 0;
     bool hashing = false;
     uint64_t lastRateBytes = 0;
     size_t lastLineLen = 0;
@@ -1141,7 +1178,8 @@ public:
         bool listContainedFiles,
         bool listNotContainedFiles,
         bool showNotContained,
-        bool removeCompletelyContained,
+        bool removeContainedDirs,
+        bool removeContainedFiles,
         bool dryRun) const
     {
         if (rootPaths.size() < 2)
@@ -1154,16 +1192,30 @@ public:
         std::set<ContentKey> firstRootKeys = collectRootsContentKeys(firstRoots, minSize);
         printContainmentDirection(rootPaths[lastIndex], firstRoots, firstRootKeys, minSize, listContainedFiles, listNotContainedFiles, showNotContained);
 
-        if (!removeCompletelyContained)
+        if (removeContainedDirs)
         {
-            return {};
+            std::set<ContentKey> allFirstRootKeys = collectRootsContentKeys(firstRoots, 0);
+            RemoveContainedDirStats stats = removeContainedDirsFromLastRoot(rootPaths[lastIndex], allFirstRootKeys, dryRun);
+            if (gProgress)
+            {
+                gProgress->finish();
+            }
+            std::cout << "remove-contained-dirs:\n";
+            printRemoveContainedDirStats(stats);
         }
 
-        std::set<ContentKey> allFirstRootKeys = collectRootsContentKeys(firstRoots, 0);
-        RemoveContainedDirStats stats = removeCompletelyContainedDirs(rootPaths[lastIndex], allFirstRootKeys, dryRun);
-        std::cout << "remove-completely-contained:\n";
-        printRemoveContainedDirStats(stats);
-        return stats;
+        if (removeContainedFiles)
+        {
+            RemoveCopyStats stats = removeContainedFilesFromLastRoot(rootPaths[lastIndex], firstRootKeys, minSize, dryRun);
+            if (gProgress)
+            {
+                gProgress->finish();
+            }
+            std::cout << "remove-contained-files:\n";
+            printRemoveCopyStats(stats);
+        }
+
+        return {};
     }
 
     /// Print the minimum hash length needed to distinguish distinct contents.
@@ -1431,7 +1483,7 @@ public:
         printStatList(lines);
     }
 
-    /// Print remove-completely-contained statistics.
+    /// Print remove-contained-dirs statistics.
     void printRemoveContainedDirStats(const RemoveContainedDirStats& stats) const
     {
         std::vector<StatLine> lines = {
@@ -1673,9 +1725,48 @@ private:
         return ContentKey{file.size, keyHash};
     }
 
+    uint64_t countRootFiles(const std::vector<fs::path>& rootPaths, uint64_t minSize) const
+    {
+        uint64_t total = 0;
+        for (const auto& dir : dirs)
+        {
+            bool inAnyRoot = false;
+            for (const auto& rootPath : rootPaths)
+            {
+                if (isPathWithin(rootPath, dir.path))
+                {
+                    inAnyRoot = true;
+                    break;
+                }
+            }
+            if (!inAnyRoot)
+            {
+                continue;
+            }
+            for (const auto& file : dir.files)
+            {
+                if (file.size >= minSize)
+                {
+                    total++;
+                }
+            }
+        }
+        return total;
+    }
+
+    uint64_t countRootFiles(const fs::path& rootPath, uint64_t minSize) const
+    {
+        return countRootFiles(std::vector<fs::path>{rootPath}, minSize);
+    }
+
     std::set<ContentKey> collectRootsContentKeys(const std::vector<fs::path>& rootPaths, uint64_t minSize) const
     {
         std::set<ContentKey> keys;
+        uint64_t processed = 0;
+        if (gProgress)
+        {
+            gProgress->onPhaseStart("containment: target keys", countRootFiles(rootPaths, minSize));
+        }
         for (const auto& dir : dirs)
         {
             bool inAnyRoot = false;
@@ -1698,7 +1789,15 @@ private:
                     continue;
                 }
                 keys.insert(contentKeyForFile(file));
+                if (gProgress)
+                {
+                    gProgress->onPhaseProgress(++processed);
+                }
             }
+        }
+        if (gProgress)
+        {
+            gProgress->onPhaseEnd();
         }
         return keys;
     }
@@ -1737,6 +1836,11 @@ private:
     {
         std::map<fs::path, ContainmentStats> byDir;
         byDir[fs::path(".")];
+        uint64_t processed = 0;
+        if (gProgress)
+        {
+            gProgress->onPhaseStart("containment: dir stats", countRootFiles(sourceRoot, minSize));
+        }
         for (const auto& dir : dirs)
         {
             if (!isPathWithin(sourceRoot, dir.path))
@@ -1778,7 +1882,15 @@ private:
                         stats.matchedBytes += file.size;
                     }
                 }
+                if (gProgress)
+                {
+                    gProgress->onPhaseProgress(++processed);
+                }
             }
+        }
+        if (gProgress)
+        {
+            gProgress->onPhaseEnd();
         }
         return byDir;
     }
@@ -1790,6 +1902,11 @@ private:
         bool wantContained) const
     {
         std::vector<FileEntry> refs;
+        uint64_t processed = 0;
+        if (gProgress)
+        {
+            gProgress->onPhaseStart(wantContained ? "containment: contained files" : "containment: not-contained files", countRootFiles(sourceRoot, minSize));
+        }
         for (const auto& dir : dirs)
         {
             if (!isPathWithin(sourceRoot, dir.path))
@@ -1801,6 +1918,10 @@ private:
                 if (file.size < minSize)
                 {
                     continue;
+                }
+                if (gProgress)
+                {
+                    gProgress->onPhaseProgress(++processed);
                 }
                 bool matched = targetKeys.find(contentKeyForFile(file)) != targetKeys.end();
                 if (matched != wantContained)
@@ -1824,6 +1945,10 @@ private:
                     file.numLinks
                 });
             }
+        }
+        if (gProgress)
+        {
+            gProgress->onPhaseEnd();
         }
         std::sort(refs.begin(), refs.end(),
             [](const FileEntry& a, const FileEntry& b)
@@ -1942,7 +2067,7 @@ private:
         return count;
     }
 
-    RemoveContainedDirStats removeCompletelyContainedDirs(
+    RemoveContainedDirStats removeContainedDirsFromLastRoot(
         const fs::path& sourceRoot,
         const std::set<ContentKey>& targetKeys,
         bool dryRun) const
@@ -1952,6 +2077,11 @@ private:
         RemoveContainedDirStats stats;
         std::set<fs::path> touchedDirs;
 
+        if (gProgress)
+        {
+            gProgress->onPhaseStart("containment: remove dirs", dirsToRemove.size());
+        }
+        uint64_t processed = 0;
         for (const auto& relDir : dirsToRemove)
         {
             const ContainmentStats& containment = byDir.at(relDir);
@@ -1966,6 +2096,10 @@ private:
             stats.dirs += dirCount;
             stats.files += containment.files;
             stats.bytes += containment.bytes;
+            if (gProgress)
+            {
+                gProgress->onPhaseProgress(++processed);
+            }
             if (dryRun)
             {
                 continue;
@@ -1978,6 +2112,71 @@ private:
                 throw std::runtime_error("Failed to remove dir " + fullPath.string());
             }
             touchedDirs.insert(fullPath.parent_path());
+        }
+        if (gProgress)
+        {
+            gProgress->onPhaseEnd();
+        }
+
+        if (!dryRun)
+        {
+            for (const auto& dirPath : touchedDirs)
+            {
+                if (ut1::fsExists(dirPath / ".dirdb"))
+                {
+                    updateDirDb(dirPath);
+                }
+            }
+        }
+
+        return stats;
+    }
+
+    RemoveCopyStats removeContainedFilesFromLastRoot(
+        const fs::path& sourceRoot,
+        const std::set<ContentKey>& targetKeys,
+        uint64_t minSize,
+        bool dryRun) const
+    {
+        std::vector<FileEntry> refs = collectContainmentFiles(sourceRoot, targetKeys, minSize, true);
+        RemoveCopyStats stats;
+        std::set<fs::path> touchedDirs;
+
+        if (gProgress)
+        {
+            gProgress->onPhaseStart("containment: remove files", refs.size());
+        }
+        uint64_t processed = 0;
+        for (const auto& ref : refs)
+        {
+            fs::path fullPath = sourceRoot / fs::path(ref.path);
+            if (dryRun || clVerbose)
+            {
+                std::cout << (dryRun ? "Would remove " : "Removed ") << fullPath.string() << "\n";
+            }
+
+            stats.files++;
+            stats.bytes += ref.size;
+            if (gProgress)
+            {
+                gProgress->onPhaseProgress(++processed);
+            }
+            if (dryRun)
+            {
+                continue;
+            }
+
+            std::error_code ec;
+            fs::remove(fullPath, ec);
+            if (ec)
+            {
+                throw std::runtime_error("Failed to remove " + fullPath.string());
+            }
+            touchedDirs.insert(fullPath.parent_path());
+        }
+        if (gProgress)
+        {
+            gProgress->onPhaseEnd();
         }
 
         if (!dryRun)
@@ -2066,6 +2265,10 @@ private:
             {"size:", formatContainmentSizeRatio(total.matchedBytes, total.bytes), std::string()}
         };
 
+        if (gProgress)
+        {
+            gProgress->finish();
+        }
         std::cout << sourceRoot.string() << " in previous roots";
         if (!targetRoots.empty())
         {
@@ -2091,13 +2294,23 @@ private:
         }
         if (listContainedFiles)
         {
+            std::vector<FileEntry> containedFiles = collectContainmentFiles(sourceRoot, targetKeys, minSize, true);
+            if (gProgress)
+            {
+                gProgress->finish();
+            }
             std::cout << "contained-files:\n";
-            printContainmentFileList(collectContainmentFiles(sourceRoot, targetKeys, minSize, true));
+            printContainmentFileList(containedFiles);
         }
         if (listNotContainedFiles)
         {
+            std::vector<FileEntry> notContainedFiles = collectContainmentFiles(sourceRoot, targetKeys, minSize, false);
+            if (gProgress)
+            {
+                gProgress->finish();
+            }
             std::cout << "not-contained-files:\n";
-            printContainmentFileList(collectContainmentFiles(sourceRoot, targetKeys, minSize, false));
+            printContainmentFileList(notContainedFiles);
         }
     }
 
@@ -3615,10 +3828,11 @@ int main(int argc, char *argv[])
     cl.addHeader("\nOptions:\n");
     cl.addOption('i', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
     cl.addOption('c', "containment", "Show how much of the last dir is contained in the previous dirs.");
-    cl.addOption(' ', "cont-files", "List files in the last dir that are contained in the previous dirs (with --containment).");
-    cl.addOption(' ', "not-cont-files", "List files in the last dir that are not contained in the previous dirs (with --containment).");
+    cl.addOption(' ', "show-contained-files", "List files in the last dir that are contained in the previous dirs (with --containment).");
+    cl.addOption(' ', "show-not-contained-files", "List files in the last dir that are not contained in the previous dirs (with --containment).");
     cl.addOption(' ', "show-not-contained", "Show mostly-not-contained and not-contained dir sections (with --containment).");
-    cl.addOption(' ', "remove-completely-contained", "Delete dirs from the last root that are completely contained in previous roots (with --containment).");
+    cl.addOption(' ', "remove-contained-dirs", "Delete dirs from the last root that are completely contained in previous roots (with --containment).");
+    cl.addOption(' ', "remove-contained-files", "Delete files from the last root that are contained in previous roots (with --containment).");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
     cl.addOption(' ', "list-redundant", "List redundant files grouped by content hash.");
@@ -3690,7 +3904,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("show-not-contained") || cl("remove-completely-contained") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -3700,7 +3914,7 @@ int main(int argc, char *argv[])
         if (cl("hashrate"))
         {
             bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("show-not-contained") || cl("remove-completely-contained") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                 || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench");
             if (otherOps)
@@ -3751,17 +3965,21 @@ int main(int argc, char *argv[])
         {
             cl.error("--extract-first/--extract-last require --intersect.");
         }
-        if ((cl("cont-files") || cl("not-cont-files")) && !cl("containment"))
+        if ((cl("show-contained-files") || cl("show-not-contained-files")) && !cl("containment"))
         {
-            cl.error("--cont-files/--not-cont-files require --containment.");
+            cl.error("--show-contained-files/--show-not-contained-files require --containment.");
         }
         if (cl("show-not-contained") && !cl("containment"))
         {
             cl.error("--show-not-contained requires --containment.");
         }
-        if (cl("remove-completely-contained") && !cl("containment"))
+        if ((cl("remove-contained-dirs") || cl("remove-contained-files")) && !cl("containment"))
         {
-            cl.error("--remove-completely-contained requires --containment.");
+            cl.error("--remove-contained-dirs/--remove-contained-files require --containment.");
+        }
+        if (cl("remove-contained-dirs") && cl("remove-contained-files"))
+        {
+            cl.error("Cannot combine --remove-contained-dirs with --remove-contained-files.");
         }
         if (cl("remove-copies-from-last") && !cl("intersect"))
         {
@@ -3798,7 +4016,7 @@ int main(int argc, char *argv[])
             if (cl("readbench"))
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                    || cl("intersect") || cl("containment") || cl("cont-files") || cl("not-cont-files") || cl("show-not-contained") || cl("remove-completely-contained") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                    || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                     || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("hashrate");
                 if (otherOps)
@@ -3848,10 +4066,11 @@ int main(int argc, char *argv[])
                 mainDb.printContainment(
                     normalizedRoots,
                     minSize,
-                    cl("cont-files"),
-                    cl("not-cont-files"),
+                    cl("show-contained-files"),
+                    cl("show-not-contained-files"),
                     cl("show-not-contained"),
-                    cl("remove-completely-contained"),
+                    cl("remove-contained-dirs"),
+                    cl("remove-contained-files"),
                     cl("dry-run"));
             }
             else if (cl("intersect"))

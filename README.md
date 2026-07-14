@@ -52,15 +52,20 @@ Options:
   -i --intersect           Determine intersections of two or more dirs. Print unique/shared statistics per
                            dir.
   -c --containment         Show how much of the last dir is contained in the previous dirs.
-     --cont-files          List files in the last dir that are contained in the previous dirs (with
+     --show-contained-files
+                           List files in the last dir that are contained in the previous dirs (with
                            --containment).
-     --not-cont-files      List files in the last dir that are not contained in the previous dirs (with
+     --show-not-contained-files
+                           List files in the last dir that are not contained in the previous dirs (with
                            --containment).
      --show-not-contained  Show mostly-not-contained and not-contained dir sections (with
                            --containment).
-     --remove-completely-contained
+     --remove-contained-dirs
                            Delete dirs from the last root that are completely contained in previous
                            roots (with --containment).
+     --remove-contained-files
+                           Delete files from the last root that are contained in previous roots (with
+                           --containment).
   -s --stats               Print statistics about each dir (number of files and total size etc).
   -l --list-files          List all files with stored meta-data.
      --list-a              List files only in A when used with --intersect.

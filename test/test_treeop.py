@@ -245,8 +245,8 @@ def test_containment_file_lists_honor_min_size(tmp_path: Path):
 
     out = run_treeop([
         "--containment",
-        "--cont-files",
-        "--not-cont-files",
+        "--show-contained-files",
+        "--show-not-contained-files",
         "--min-size",
         "5",
         str(dir_a),
@@ -264,6 +264,28 @@ def test_containment_file_lists_honor_min_size(tmp_path: Path):
     assert "small-missing.txt" not in not_contained
 
 
+def test_show_contained_files_lists_contained_files(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "copy.txt", "contained")
+    write_file(dir_b / "contained.txt", "contained")
+    write_file(dir_b / "missing.txt", "missing")
+
+    out = run_treeop(["--containment", "--show-contained-files", str(dir_a), str(dir_b)], root)
+
+    contained = out.split("contained-files:\n", 1)[1]
+    assert "contained.txt" in contained
+    assert "missing.txt" not in contained
+
+
 def test_containment_file_lists_require_containment(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
@@ -275,9 +297,9 @@ def test_containment_file_lists_require_containment(tmp_path: Path):
     dir_a.mkdir()
     dir_b.mkdir()
 
-    result = run_treeop_result(["--cont-files", str(dir_a), str(dir_b)], root)
+    result = run_treeop_result(["--show-contained-files", str(dir_a), str(dir_b)], root)
     assert result.returncode != 0
-    assert "--cont-files/--not-cont-files require --containment." in result.stdout
+    assert "--show-contained-files/--show-not-contained-files require --containment." in result.stdout
     assert not (dir_a / ".dirdb").exists()
     assert not (dir_b / ".dirdb").exists()
 
@@ -316,7 +338,7 @@ def test_containment_requires_at_least_two_dirs_before_processing(tmp_path: Path
     assert not (dir_a / ".dirdb").exists()
 
 
-def test_remove_completely_contained_dry_run(tmp_path: Path):
+def test_remove_contained_dirs_dry_run(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
     if not bin_path.exists():
@@ -334,9 +356,9 @@ def test_remove_completely_contained_dry_run(tmp_path: Path):
     write_file(dir_b / "partial" / "one.txt", "one")
     write_file(dir_b / "partial" / "unique.txt", "unique")
 
-    out = run_treeop(["--containment", "--remove-completely-contained", "--dry-run", str(dir_a), str(dir_b)], root)
+    out = run_treeop(["--containment", "--remove-contained-dirs", "--dry-run", str(dir_a), str(dir_b)], root)
 
-    assert "remove-completely-contained:" in out
+    assert "remove-contained-dirs:" in out
     assert f"Would remove dir {dir_b / 'complete'}" in out
     assert re.search(r"removed-dirs:\s+2", out)
     assert re.search(r"removed-files:\s+2", out)
@@ -344,7 +366,7 @@ def test_remove_completely_contained_dry_run(tmp_path: Path):
     assert (dir_b / "partial" / "unique.txt").exists()
 
 
-def test_remove_completely_contained_actual(tmp_path: Path):
+def test_remove_contained_dirs_actual(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
     if not bin_path.exists():
@@ -362,9 +384,9 @@ def test_remove_completely_contained_actual(tmp_path: Path):
     write_file(dir_b / "partial" / "one.txt", "one")
     write_file(dir_b / "partial" / "unique.txt", "unique")
 
-    out = run_treeop(["--containment", "--remove-completely-contained", str(dir_a), str(dir_b)], root)
+    out = run_treeop(["--containment", "--remove-contained-dirs", str(dir_a), str(dir_b)], root)
 
-    assert "remove-completely-contained:" in out
+    assert "remove-contained-dirs:" in out
     assert re.search(r"removed-dirs:\s+2", out)
     assert re.search(r"removed-files:\s+2", out)
     assert not (dir_b / "complete").exists()
@@ -372,7 +394,7 @@ def test_remove_completely_contained_actual(tmp_path: Path):
     assert (dir_b / "partial" / "unique.txt").exists()
 
 
-def test_remove_completely_contained_requires_containment(tmp_path: Path):
+def test_remove_contained_requires_containment(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
     if not bin_path.exists():
@@ -383,10 +405,79 @@ def test_remove_completely_contained_requires_containment(tmp_path: Path):
     dir_a.mkdir()
     dir_b.mkdir()
 
-    result = run_treeop_result(["--remove-completely-contained", str(dir_a), str(dir_b)], root)
+    result = run_treeop_result(["--remove-contained-dirs", str(dir_a), str(dir_b)], root)
 
     assert result.returncode != 0
-    assert "--remove-completely-contained requires --containment." in result.stdout
+    assert "--remove-contained-dirs/--remove-contained-files require --containment." in result.stdout
+    assert not (dir_a / ".dirdb").exists()
+    assert not (dir_b / ".dirdb").exists()
+
+
+def test_remove_contained_files_dry_run(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "copy.txt", "contained")
+    write_file(dir_b / "contained.txt", "contained")
+    write_file(dir_b / "missing.txt", "missing")
+
+    out = run_treeop(["--containment", "--remove-contained-files", "--dry-run", str(dir_a), str(dir_b)], root)
+
+    assert "remove-contained-files:" in out
+    assert f"Would remove {dir_b / 'contained.txt'}" in out
+    assert re.search(r"removed-files:\s+1", out)
+    assert (dir_b / "contained.txt").exists()
+    assert (dir_b / "missing.txt").exists()
+
+
+def test_remove_contained_files_actual(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "copy.txt", "contained")
+    write_file(dir_a / "small-copy.txt", "xx")
+    write_file(dir_b / "contained.txt", "contained")
+    write_file(dir_b / "small-contained.txt", "xx")
+    write_file(dir_b / "missing.txt", "missing")
+
+    out = run_treeop(["--containment", "--remove-contained-files", "--min-size", "5", str(dir_a), str(dir_b)], root)
+
+    assert "remove-contained-files:" in out
+    assert re.search(r"removed-files:\s+1", out)
+    assert not (dir_b / "contained.txt").exists()
+    assert (dir_b / "small-contained.txt").exists()
+    assert (dir_b / "missing.txt").exists()
+
+
+def test_remove_contained_dirs_and_files_conflict(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    result = run_treeop_result(["--containment", "--remove-contained-dirs", "--remove-contained-files", str(dir_a), str(dir_b)], root)
+
+    assert result.returncode != 0
+    assert "Cannot combine --remove-contained-dirs with --remove-contained-files." in result.stdout
     assert not (dir_a / ".dirdb").exists()
     assert not (dir_b / ".dirdb").exists()
 
