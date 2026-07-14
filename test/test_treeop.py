@@ -587,6 +587,111 @@ def test_find_overlapping_dirs_omits_zero_shared_bytes(tmp_path: Path):
     assert "shared:" not in out
 
 
+def test_find_overlapping_dirs_prints_only_best_direction_per_pair(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "large" / "shared.txt", "shared")
+    write_file(dir_a / "large" / "unique.txt", "unique")
+    write_file(dir_b / "small" / "copy.txt", "shared")
+
+    out = run_treeop(["--find-overlapping-dirs", str(dir_a), str(dir_b)], root)
+
+    assert out.count("\nA: ") == 1
+    assert f"A: {dir_b / 'small'}" in out
+    assert f"B: {dir_a / 'large'}" in out
+
+
+def test_find_overlapping_dirs_remove_copies_dry_run_and_verbose(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    a_old = dir_a / "pair" / "a-old.txt"
+    a_new = dir_a / "pair" / "a-new.txt"
+    b_old = dir_b / "pair" / "b-old.txt"
+    b_new = dir_b / "pair" / "b-new.txt"
+    write_file(a_old, "keep-a")
+    write_file(b_new, "keep-a")
+    write_file(b_old, "keep-b")
+    write_file(a_new, "keep-b")
+    os.utime(a_old, (1000, 1000))
+    os.utime(b_new, (2000, 2000))
+    os.utime(b_old, (1000, 1000))
+    os.utime(a_new, (2000, 2000))
+
+    out = run_treeop([
+        "--find-overlapping-dirs",
+        "--remove-copies",
+        "--dry-run",
+        "-vv",
+        "--top",
+        "1",
+        str(dir_a),
+        str(dir_b),
+    ], root)
+
+    assert re.search(r"remove from A:\s+\d+\.?\d* bytes,\s+1 files", out)
+    assert re.search(r"remove from B:\s+\d+\.?\d* bytes,\s+1 files", out)
+    assert f"Would remove A {a_new}" in out
+    assert f"Would remove B {b_new}" in out
+    assert f"kept {b_old}" in out
+    assert f"kept {a_old}" in out
+    assert "removed-date=" in out
+    assert "kept-date=" in out
+    assert a_old.exists()
+    assert a_new.exists()
+    assert b_old.exists()
+    assert b_new.exists()
+
+
+def test_find_overlapping_dirs_remove_copies_actual_preserves_oldest(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    a_old = dir_a / "pair" / "a-old.txt"
+    a_new = dir_a / "pair" / "a-new.txt"
+    b_old = dir_b / "pair" / "b-old.txt"
+    b_new = dir_b / "pair" / "b-new.txt"
+    write_file(a_old, "keep-a")
+    write_file(b_new, "keep-a")
+    write_file(b_old, "keep-b")
+    write_file(a_new, "keep-b")
+    os.utime(a_old, (1000, 1000))
+    os.utime(b_new, (2000, 2000))
+    os.utime(b_old, (1000, 1000))
+    os.utime(a_new, (2000, 2000))
+
+    out = run_treeop(["--find-overlapping-dirs", "--remove-copies", "--top", "1", str(dir_a), str(dir_b)], root)
+
+    assert re.search(r"remove from A:\s+\d+\.?\d* bytes,\s+1 files", out)
+    assert re.search(r"remove from B:\s+\d+\.?\d* bytes,\s+1 files", out)
+    assert a_old.exists()
+    assert not a_new.exists()
+    assert b_old.exists()
+    assert not b_new.exists()
+
+
 def test_top_requires_find_overlapping_dirs(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()

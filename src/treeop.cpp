@@ -1219,14 +1219,14 @@ public:
     }
 
     /// Find and print ranked overlapping directory pairs.
-    void printOverlappingDirs(const std::vector<fs::path>& rootPaths, uint64_t minSize, uint64_t top) const
+    void printOverlappingDirs(const std::vector<fs::path>& rootPaths, uint64_t minSize, uint64_t top, bool removeCopies, bool dryRun) const
     {
         std::vector<OverlapDirData> overlapDirs = collectOverlapDirs(rootPaths, minSize);
         std::vector<OverlapResult> results;
         uint64_t totalPairs = 0;
         if (overlapDirs.size() > 1)
         {
-            totalPairs = static_cast<uint64_t>(overlapDirs.size()) * static_cast<uint64_t>(overlapDirs.size() - 1);
+            totalPairs = static_cast<uint64_t>(overlapDirs.size()) * static_cast<uint64_t>(overlapDirs.size() - 1) / 2;
             results.reserve(static_cast<size_t>(totalPairs));
         }
 
@@ -1237,16 +1237,13 @@ public:
         uint64_t processed = 0;
         for (size_t i = 0; i < overlapDirs.size(); i++)
         {
-            for (size_t j = 0; j < overlapDirs.size(); j++)
+            for (size_t j = i + 1; j < overlapDirs.size(); j++)
             {
-                if (i == j)
+                OverlapResult forward = buildOverlapResult(overlapDirs[i], overlapDirs[j]);
+                OverlapResult backward = buildOverlapResult(overlapDirs[j], overlapDirs[i]);
+                if (forward.shared.bytes > 0 || backward.shared.bytes > 0)
                 {
-                    continue;
-                }
-                OverlapResult result = buildOverlapResult(overlapDirs[i], overlapDirs[j]);
-                if (result.shared.bytes > 0)
-                {
-                    results.push_back(std::move(result));
+                    results.push_back(overlapRanksBefore(backward, forward) ? std::move(backward) : std::move(forward));
                 }
                 if (gProgress)
                 {
@@ -1260,31 +1257,7 @@ public:
             gProgress->finish();
         }
 
-        std::sort(results.begin(), results.end(),
-            [](const OverlapResult& a, const OverlapResult& b)
-            {
-                if (a.sharedPercentBytes != b.sharedPercentBytes)
-                {
-                    return a.sharedPercentBytes > b.sharedPercentBytes;
-                }
-                if (a.sharedPercentFiles != b.sharedPercentFiles)
-                {
-                    return a.sharedPercentFiles > b.sharedPercentFiles;
-                }
-                if (a.shared.bytes != b.shared.bytes)
-                {
-                    return a.shared.bytes > b.shared.bytes;
-                }
-                if (a.shared.files != b.shared.files)
-                {
-                    return a.shared.files > b.shared.files;
-                }
-                if (a.a != b.a)
-                {
-                    return a.a < b.a;
-                }
-                return a.b < b.b;
-            });
+        std::sort(results.begin(), results.end(), overlapRanksBefore);
 
         size_t limit = results.size();
         if (top > 0)
@@ -1292,6 +1265,7 @@ public:
             limit = std::min(limit, static_cast<size_t>(top));
         }
 
+        std::set<std::string> removedPaths;
         std::cout << "overlapping-dirs:\n";
         if (limit == 0)
         {
@@ -1301,6 +1275,16 @@ public:
         for (size_t i = 0; i < limit; i++)
         {
             printOverlapResult(results[i]);
+            if (removeCopies)
+            {
+                const OverlapDirData* a = findOverlapDirData(overlapDirs, results[i].a);
+                const OverlapDirData* b = findOverlapDirData(overlapDirs, results[i].b);
+                if (a != nullptr && b != nullptr)
+                {
+                    OverlapRemoveStats stats = removeOverlapCopies(results[i], *a, *b, dryRun, removedPaths);
+                    printOverlapRemoveStats(stats, dryRun);
+                }
+            }
             if (i + 1 < limit)
             {
                 printBlockSeparator();
@@ -1818,7 +1802,7 @@ private:
     struct OverlapDirData
     {
         fs::path path;
-        std::map<ContentKey, uint64_t> contentCounts;
+        std::map<ContentKey, std::vector<FileEntry>> contentFiles;
         OverlapBucketStats total;
     };
 
@@ -1834,6 +1818,37 @@ private:
         double sharedPercentFiles{};
         double sharedPercentBytes{};
     };
+
+    struct OverlapRemoveStats
+    {
+        RemoveCopyStats a;
+        RemoveCopyStats b;
+    };
+
+    static bool overlapRanksBefore(const OverlapResult& a, const OverlapResult& b)
+    {
+        if (a.sharedPercentBytes != b.sharedPercentBytes)
+        {
+            return a.sharedPercentBytes > b.sharedPercentBytes;
+        }
+        if (a.sharedPercentFiles != b.sharedPercentFiles)
+        {
+            return a.sharedPercentFiles > b.sharedPercentFiles;
+        }
+        if (a.shared.bytes != b.shared.bytes)
+        {
+            return a.shared.bytes > b.shared.bytes;
+        }
+        if (a.shared.files != b.shared.files)
+        {
+            return a.shared.files > b.shared.files;
+        }
+        if (a.a != b.a)
+        {
+            return a.a < b.a;
+        }
+        return a.b < b.b;
+    }
 
     ContentKey contentKeyForFile(const FileEntry& file) const
     {
@@ -1903,7 +1918,14 @@ private:
                     continue;
                 }
                 ContentKey key = contentKeyForFile(file);
-                data.contentCounts[key]++;
+                data.contentFiles[key].push_back(FileEntry{
+                    (dir.path / file.path).string(),
+                    file.size,
+                    file.hash,
+                    file.inode,
+                    file.date,
+                    file.numLinks
+                });
                 data.total.files++;
                 data.total.bytes += file.size;
             }
@@ -1948,9 +1970,10 @@ private:
         result.totalA = a.total;
         result.totalB = b.total;
 
-        for (const auto& [key, count] : a.contentCounts)
+        for (const auto& [key, refs] : a.contentFiles)
         {
-            if (b.contentCounts.find(key) != b.contentCounts.end())
+            uint64_t count = refs.size();
+            if (b.contentFiles.find(key) != b.contentFiles.end())
             {
                 result.shared.files += count;
                 result.shared.bytes += count * key.size;
@@ -1961,12 +1984,13 @@ private:
                 result.onlyA.bytes += count * key.size;
             }
         }
-        for (const auto& [key, count] : b.contentCounts)
+        for (const auto& [key, refs] : b.contentFiles)
         {
-            if (a.contentCounts.find(key) != a.contentCounts.end())
+            if (a.contentFiles.find(key) != a.contentFiles.end())
             {
                 continue;
             }
+            uint64_t count = refs.size();
             result.onlyB.files += count;
             result.onlyB.bytes += count * key.size;
         }
@@ -2014,6 +2038,146 @@ private:
                 std::cout << " " << row.suffix;
             }
             std::cout << "\n";
+        }
+    }
+
+    static const OverlapDirData* findOverlapDirData(const std::vector<OverlapDirData>& overlapDirs, const fs::path& path)
+    {
+        for (const auto& dir : overlapDirs)
+        {
+            if (dir.path == path)
+            {
+                return &dir;
+            }
+        }
+        return nullptr;
+    }
+
+    OverlapRemoveStats removeOverlapCopies(
+        const OverlapResult& result,
+        const OverlapDirData& a,
+        const OverlapDirData& b,
+        bool dryRun,
+        std::set<std::string>& removedPaths) const
+    {
+        OverlapRemoveStats stats;
+        std::set<fs::path> touchedDirs;
+        for (const auto& [key, refsA] : a.contentFiles)
+        {
+            auto itB = b.contentFiles.find(key);
+            if (itB == b.contentFiles.end())
+            {
+                continue;
+            }
+
+            std::vector<const FileEntry*> candidates;
+            for (const auto& ref : refsA)
+            {
+                if (removedPaths.find(ref.path) == removedPaths.end())
+                {
+                    candidates.push_back(&ref);
+                }
+            }
+            for (const auto& ref : itB->second)
+            {
+                if (removedPaths.find(ref.path) == removedPaths.end())
+                {
+                    candidates.push_back(&ref);
+                }
+            }
+            if (candidates.size() < 2)
+            {
+                continue;
+            }
+
+            auto oldestIt = std::min_element(candidates.begin(), candidates.end(),
+                [](const FileEntry* lhs, const FileEntry* rhs)
+                {
+                    if (lhs->date != rhs->date)
+                    {
+                        return lhs->date < rhs->date;
+                    }
+                    return lhs->path < rhs->path;
+                });
+            if (oldestIt == candidates.end())
+            {
+                continue;
+            }
+            const FileEntry* oldest = *oldestIt;
+            for (const FileEntry* ref : candidates)
+            {
+                if (ref == oldest)
+                {
+                    continue;
+                }
+
+                bool inA = isPathWithin(result.a, fs::path(ref->path));
+                RemoveCopyStats& bucket = inA ? stats.a : stats.b;
+                bucket.files++;
+                bucket.bytes += ref->size;
+                removedPaths.insert(ref->path);
+
+                if (clVerbose)
+                {
+                    std::cout << (dryRun ? "Would remove " : "Removed ")
+                              << (inA ? "A " : "B ") << ref->path;
+                    if (clVerbose > 1)
+                    {
+                        std::cout << " kept " << oldest->path
+                                  << " removed-date=" << formatFileTime(ref->date)
+                                  << " kept-date=" << formatFileTime(oldest->date);
+                    }
+                    std::cout << "\n";
+                }
+                if (dryRun)
+                {
+                    continue;
+                }
+
+                std::error_code ec;
+                fs::remove(ref->path, ec);
+                if (ec)
+                {
+                    throw std::runtime_error("Failed to remove " + ref->path);
+                }
+                touchedDirs.insert(fs::path(ref->path).parent_path());
+            }
+        }
+
+        if (!dryRun)
+        {
+            for (const auto& dirPath : touchedDirs)
+            {
+                if (ut1::fsExists(dirPath / ".dirdb"))
+                {
+                    updateDirDb(dirPath);
+                }
+            }
+        }
+        return stats;
+    }
+
+    void printOverlapRemoveStats(const OverlapRemoveStats& stats, bool dryRun) const
+    {
+        (void)dryRun;
+        std::vector<OverlapRow> rows = {
+            {"remove from A:", std::string(), formatCountInt(stats.a.files), std::string(), formatOverlapBytes(stats.a.bytes), std::string()},
+            {"remove from B:", std::string(), formatCountInt(stats.b.files), std::string(), formatOverlapBytes(stats.b.bytes), std::string()}
+        };
+        size_t labelWidth = 0;
+        size_t fileWidth = 0;
+        size_t byteWidth = 0;
+        for (const auto& row : rows)
+        {
+            labelWidth = std::max(labelWidth, row.label.size());
+            fileWidth = std::max(fileWidth, row.files.size());
+            byteWidth = std::max(byteWidth, row.bytes.size());
+        }
+        for (const auto& row : rows)
+        {
+            std::cout << std::left << std::setw(static_cast<int>(labelWidth)) << row.label << " "
+                      << std::right << std::setw(static_cast<int>(byteWidth)) << row.bytes << ", "
+                      << std::setw(static_cast<int>(fileWidth)) << row.files << " files\n";
         }
     }
 
@@ -4177,7 +4341,7 @@ int main(int argc, char *argv[])
         {
             bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                 || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
-                || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
+                || cl("extract-first") || cl("extract-last") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                 || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench");
             if (otherOps)
             {
@@ -4264,7 +4428,7 @@ int main(int argc, char *argv[])
             bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                 || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained")
                 || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
-                || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
+                || cl("extract-first") || cl("extract-last") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                 || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench") || cl("hashrate");
             if (otherOps)
             {
@@ -4341,7 +4505,7 @@ int main(int argc, char *argv[])
 
             if (cl("find-overlapping-dirs"))
             {
-                mainDb.printOverlappingDirs(normalizedRoots, minSize, top);
+                mainDb.printOverlappingDirs(normalizedRoots, minSize, top, cl("remove-copies"), cl("dry-run"));
             }
             else if (cl("containment"))
             {
