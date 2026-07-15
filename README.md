@@ -90,7 +90,14 @@ Options:
                            bytes. (default=0)
      --top=N               Maximum number of overlapping directory pairs to print (with
                            --find-overlapping-dirs). (default=0)
-     --max-size=N          Maximum file size to include in size histogram. (default=0)
+     --min-size=N          Minimum file size for operations that support file filtering. (default=0)
+     --max-size=N          Maximum file size for operations that support file filtering. (default=0)
+     --only=PATTERNS       Only include filenames matching comma-separated fnmatch patterns.
+     --ionly=PATTERNS      Only include filenames matching comma-separated fnmatch patterns,
+                           case-insensitively.
+     --exclude=PATTERNS    Exclude filenames matching comma-separated fnmatch patterns.
+     --iexclude=PATTERNS   Exclude filenames matching comma-separated fnmatch patterns,
+                           case-insensitively.
   -p --progress            Print progress once per second.
   -W --width=N             Max width for progress line. (default=199)
   -v --verbose             Increase verbosity. Specify multiple times to be more verbose.

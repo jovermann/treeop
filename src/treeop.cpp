@@ -30,6 +30,7 @@
 #include <fstream>
 #include <algorithm>
 #include <cstdint>
+#include <fnmatch.h>
 
 static unsigned clVerbose = 0;
 
@@ -402,6 +403,68 @@ struct FileEntry
     uint64_t numLinks{};
 };
 
+struct FileFilter
+{
+    uint64_t minSize{};
+    uint64_t maxSize{};
+    std::vector<std::string> onlyPatterns;
+    std::vector<std::string> iOnlyPatterns;
+    std::vector<std::string> excludePatterns;
+    std::vector<std::string> iExcludePatterns;
+
+    bool matches(const FileEntry& file) const
+    {
+        if (file.size < minSize)
+        {
+            return false;
+        }
+        if (maxSize != 0 && file.size > maxSize)
+        {
+            return false;
+        }
+
+        std::string filename = fs::path(file.path).filename().string();
+        if ((!onlyPatterns.empty() || !iOnlyPatterns.empty())
+            && !matchesAny(onlyPatterns, filename, 0)
+            && !matchesAny(iOnlyPatterns, filename, FNM_CASEFOLD))
+        {
+            return false;
+        }
+        if (matchesAny(excludePatterns, filename, 0)
+            || matchesAny(iExcludePatterns, filename, FNM_CASEFOLD))
+        {
+            return false;
+        }
+        return true;
+    }
+
+private:
+    static bool matchesAny(const std::vector<std::string>& patterns, const std::string& filename, int flags)
+    {
+        for (const auto& pattern : patterns)
+        {
+            if (fnmatch(pattern.c_str(), filename.c_str(), flags) == 0)
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+static std::vector<std::string> parsePatterns(const ut1::CommandLineParser& cl, const std::string& optionName)
+{
+    std::vector<std::string> patterns;
+    for (const std::string& pattern : ut1::splitString(cl.getStr(optionName), ','))
+    {
+        if (!pattern.empty())
+        {
+            patterns.push_back(pattern);
+        }
+    }
+    return patterns;
+}
+
 struct DirDbData
 {
     fs::path path;
@@ -485,7 +548,7 @@ public:
     }
 
     /// Print per-root statistics.
-    void printStats(uint64_t minSize) const
+    void printStats(const FileFilter& filter) const
     {
         for (size_t i = 0; i < roots.size(); i++)
         {
@@ -496,7 +559,7 @@ public:
                     return isPathWithin(rootData.path, dir.path);
                 },
                 rootData.elapsedSeconds,
-                minSize);
+                filter);
             printHardlinkOutsideRootWarnings(rootData.path, treeStats.inodeCounts);
             std::cout << rootData.path.string() << "\n";
             printStatList(buildStatsLines(treeStats));
@@ -529,14 +592,14 @@ public:
                     return inAnyRoot && seenDirs.insert(dir.path).second;
                 },
                 elapsedSeconds,
-                minSize);
+                filter);
             std::cout << "total:\n";
             printStatList(buildStatsLines(treeStats));
         }
     }
 
     /// List all files with stored metadata.
-    void listFiles() const
+    void listFiles(const FileFilter& filter) const
     {
         size_t hashLen = getUniqueHashHexLen();
         std::vector<FileEntry> refs;
@@ -544,6 +607,10 @@ public:
         {
             for (const auto& file : dir.files)
             {
+                if (!filter.matches(file))
+                {
+                    continue;
+                }
                 refs.push_back(FileEntry{
                     (dir.path / file.path).string(),
                     file.size,
@@ -563,13 +630,17 @@ public:
     }
 
     /// List all redundant files grouped by content hash.
-    void listRedundant() const
+    void listRedundant(const FileFilter& filter) const
     {
         std::map<Hash128, std::vector<FileEntry>> byHash;
         for (const auto& dir : dirs)
         {
             for (const auto& file : dir.files)
             {
+                if (!filter.matches(file))
+                {
+                    continue;
+                }
                 byHash[file.hash].push_back(FileEntry{
                     (dir.path / file.path).string(),
                     file.size,
@@ -660,13 +731,17 @@ public:
     }
 
     /// List all hardlink groups (inode link count >= 2).
-    void listHardlinks() const
+    void listHardlinks(const FileFilter& filter) const
     {
         std::unordered_map<uint64_t, std::vector<FileEntry>> byInode;
         for (const auto& dir : dirs)
         {
             for (const auto& file : dir.files)
             {
+                if (!filter.matches(file))
+                {
+                    continue;
+                }
                 byInode[file.inode].push_back(FileEntry{
                     (dir.path / file.path).string(),
                     file.size,
@@ -706,7 +781,7 @@ public:
     }
 
     /// Print a size histogram over all files.
-    void printSizeHistogram(uint64_t batchSize, uint64_t maxSizeLimit, bool hasMaxSize) const
+    void printSizeHistogram(uint64_t batchSize, const FileFilter& filter) const
     {
         if (batchSize == 0)
         {
@@ -726,7 +801,7 @@ public:
         {
             for (const auto& file : dir.files)
             {
-                if (hasMaxSize && file.size > maxSizeLimit)
+                if (!filter.matches(file))
                 {
                     continue;
                 }
@@ -854,7 +929,7 @@ public:
 
     /// Print intersect stats and optional file lists/extractions.
     void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listFirst, bool listLast, bool listBoth,
-        const fs::path* extractFirst, const fs::path* extractLast, bool removeCopies, bool removeCopiesFromLast, bool dryRun, uint64_t minSize) const
+        const fs::path* extractFirst, const fs::path* extractLast, bool removeCopies, bool removeCopiesFromLast, bool dryRun, const FileFilter& filter) const
     {
         std::vector<std::map<ContentKey, std::vector<FileEntry>>> rootFiles(rootPaths.size());
         std::map<ContentKey, size_t> rootsWithKey;
@@ -869,7 +944,7 @@ public:
                 }
                 for (const auto& file : dir.files)
                 {
-                    if (file.size < minSize)
+                    if (!filter.matches(file))
                     {
                         continue;
                     }
@@ -1174,7 +1249,7 @@ public:
     /// Print containment relation of the last root in all previous roots.
     RemoveContainedDirStats printContainment(
         const std::vector<fs::path>& rootPaths,
-        uint64_t minSize,
+        const FileFilter& filter,
         bool listContainedFiles,
         bool listNotContainedFiles,
         bool showNotContained,
@@ -1189,12 +1264,12 @@ public:
 
         size_t lastIndex = rootPaths.size() - 1;
         std::vector<fs::path> firstRoots(rootPaths.begin(), rootPaths.begin() + static_cast<std::ptrdiff_t>(lastIndex));
-        std::set<ContentKey> firstRootKeys = collectRootsContentKeys(firstRoots, minSize);
-        printContainmentDirection(rootPaths[lastIndex], firstRoots, firstRootKeys, minSize, listContainedFiles, listNotContainedFiles, showNotContained);
+        std::set<ContentKey> firstRootKeys = collectRootsContentKeys(firstRoots, filter);
+        printContainmentDirection(rootPaths[lastIndex], firstRoots, firstRootKeys, filter, listContainedFiles, listNotContainedFiles, showNotContained);
 
         if (removeContainedDirs)
         {
-            std::set<ContentKey> allFirstRootKeys = collectRootsContentKeys(firstRoots, 0);
+            std::set<ContentKey> allFirstRootKeys = collectRootsContentKeys(firstRoots, FileFilter{});
             RemoveContainedDirStats stats = removeContainedDirsFromLastRoot(rootPaths[lastIndex], allFirstRootKeys, dryRun);
             if (gProgress)
             {
@@ -1206,7 +1281,7 @@ public:
 
         if (removeContainedFiles)
         {
-            RemoveCopyStats stats = removeContainedFilesFromLastRoot(rootPaths[lastIndex], firstRootKeys, minSize, dryRun);
+            RemoveCopyStats stats = removeContainedFilesFromLastRoot(rootPaths[lastIndex], firstRootKeys, filter, dryRun);
             if (gProgress)
             {
                 gProgress->finish();
@@ -1219,9 +1294,9 @@ public:
     }
 
     /// Find and print ranked overlapping directory pairs.
-    void printOverlappingDirs(const std::vector<fs::path>& rootPaths, uint64_t minSize, uint64_t top, bool removeCopies, bool dryRun) const
+    void printOverlappingDirs(const std::vector<fs::path>& rootPaths, const FileFilter& filter, uint64_t top, bool removeCopies, bool dryRun) const
     {
-        std::vector<OverlapDirData> overlapDirs = collectOverlapDirs(rootPaths, minSize);
+        std::vector<OverlapDirData> overlapDirs = collectOverlapDirs(rootPaths, filter);
         std::vector<OverlapResult> results;
         uint64_t totalPairs = 0;
         if (overlapDirs.size() > 1)
@@ -1328,11 +1403,11 @@ public:
     };
 
     /// Replace duplicate files with hardlinks to the oldest file.
-    HardlinkStats hardlinkCopies(uint64_t minSize, uint64_t maxHardlinks, bool dryRun) const
+    HardlinkStats hardlinkCopies(const FileFilter& filter, uint64_t maxHardlinks, bool dryRun) const
     {
         HardlinkStats stats;
         std::set<fs::path> touchedDirs;
-        forEachRedundancyGroup(minSize,
+        forEachRedundancyGroup(filter,
             [&](const std::vector<FileEntry>& files, const FileEntry& oldest)
             {
                 fs::path oldestPath(oldest.path);
@@ -1408,7 +1483,7 @@ public:
     }
 
     /// Break hardlinks by replacing each file with a private copy.
-    BreakHardlinkStats breakHardlinks(bool dryRun) const
+    BreakHardlinkStats breakHardlinks(const FileFilter& filter, bool dryRun) const
     {
         BreakHardlinkStats stats;
         std::set<fs::path> touchedDirs;
@@ -1418,6 +1493,10 @@ public:
         {
             for (const auto& file : dir.files)
             {
+                if (!filter.matches(file))
+                {
+                    continue;
+                }
                 inodeCounts[file.inode]++;
                 inodeDirs[file.inode].insert(dir.path);
             }
@@ -1441,6 +1520,10 @@ public:
         {
             for (const auto& file : dir.files)
             {
+                if (!filter.matches(file))
+                {
+                    continue;
+                }
                 auto remainingIt = remaining.find(file.inode);
                 if (remainingIt == remaining.end() || remainingIt->second == 0)
                 {
@@ -1486,11 +1569,11 @@ public:
     }
 
     /// Remove duplicate files, keeping the oldest file for each content hash.
-    RemoveCopyStats removeRedundantFiles(uint64_t minSize, bool dryRun) const
+    RemoveCopyStats removeRedundantFiles(const FileFilter& filter, bool dryRun) const
     {
         RemoveCopyStats stats;
         std::set<fs::path> touchedDirs;
-        forEachRedundancyGroup(minSize,
+        forEachRedundancyGroup(filter,
             [&](const std::vector<FileEntry>& files, const FileEntry& oldest)
             {
                 for (const auto& ref : files)
@@ -1576,7 +1659,7 @@ public:
     }
 
     /// Remove duplicate files within each directory independently, keeping the oldest file per content.
-    RemoveCopyStats removeDirInternalCopies(const std::vector<fs::path>& rootPaths, uint64_t minSize, bool dryRun)
+    RemoveCopyStats removeDirInternalCopies(const std::vector<fs::path>& rootPaths, const FileFilter& filter, bool dryRun)
     {
         RemoveCopyStats stats;
         std::set<fs::path> touchedDirs;
@@ -1599,7 +1682,7 @@ public:
             std::map<ContentKey, std::vector<const FileEntry*>> groups;
             for (const auto& file : dir.files)
             {
-                if (file.size < minSize)
+                if (!filter.matches(file))
                 {
                     continue;
                 }
@@ -1738,14 +1821,14 @@ private:
 
     using ContentFiles = std::map<ContentKey, std::vector<FileEntry>>;
 
-    ContentFiles collectContentFiles(uint64_t minSize) const
+    ContentFiles collectContentFiles(const FileFilter& filter) const
     {
         ContentFiles contentFiles;
         for (const auto& dir : dirs)
         {
             for (const auto& file : dir.files)
             {
-                if (file.size < minSize)
+                if (!filter.matches(file))
                 {
                     continue;
                 }
@@ -1765,9 +1848,9 @@ private:
     }
 
     template <typename GroupFn>
-    void forEachRedundancyGroup(uint64_t minSize, GroupFn&& fn) const
+    void forEachRedundancyGroup(const FileFilter& filter, GroupFn&& fn) const
     {
-        ContentFiles contentFiles = collectContentFiles(minSize);
+        ContentFiles contentFiles = collectContentFiles(filter);
         for (const auto& [key, files] : contentFiles)
         {
             if (files.size() < 2)
@@ -1799,7 +1882,7 @@ private:
     };
 
     template <typename IncludeDirFn>
-    TreeStats collectStats(IncludeDirFn&& includeDir, double elapsedSeconds, uint64_t minSize) const
+    TreeStats collectStats(IncludeDirFn&& includeDir, double elapsedSeconds, const FileFilter& filter) const
     {
         TreeStats stats;
         stats.elapsedSeconds = elapsedSeconds;
@@ -1815,7 +1898,7 @@ private:
             stats.dirCount++;
             for (const auto& file : dir.files)
             {
-                if (file.size < minSize)
+                if (!filter.matches(file))
                 {
                     continue;
                 }
@@ -1987,7 +2070,7 @@ private:
         return ContentKey{file.size, keyHash};
     }
 
-    uint64_t countRootFiles(const std::vector<fs::path>& rootPaths, uint64_t minSize) const
+    uint64_t countRootFiles(const std::vector<fs::path>& rootPaths, const FileFilter& filter) const
     {
         uint64_t total = 0;
         for (const auto& dir : dirs)
@@ -2007,7 +2090,7 @@ private:
             }
             for (const auto& file : dir.files)
             {
-                if (file.size >= minSize)
+                if (filter.matches(file))
                 {
                     total++;
                 }
@@ -2016,12 +2099,12 @@ private:
         return total;
     }
 
-    uint64_t countRootFiles(const fs::path& rootPath, uint64_t minSize) const
+    uint64_t countRootFiles(const fs::path& rootPath, const FileFilter& filter) const
     {
-        return countRootFiles(std::vector<fs::path>{rootPath}, minSize);
+        return countRootFiles(std::vector<fs::path>{rootPath}, filter);
     }
 
-    std::vector<OverlapDirData> collectOverlapDirs(const std::vector<fs::path>& rootPaths, uint64_t minSize) const
+    std::vector<OverlapDirData> collectOverlapDirs(const std::vector<fs::path>& rootPaths, const FileFilter& filter) const
     {
         std::vector<OverlapDirData> result;
         for (const auto& dir : dirs)
@@ -2044,7 +2127,7 @@ private:
             data.path = dir.path;
             for (const auto& file : dir.files)
             {
-                if (file.size < minSize)
+                if (!filter.matches(file))
                 {
                     continue;
                 }
@@ -2335,13 +2418,13 @@ private:
         }
     }
 
-    std::set<ContentKey> collectRootsContentKeys(const std::vector<fs::path>& rootPaths, uint64_t minSize) const
+    std::set<ContentKey> collectRootsContentKeys(const std::vector<fs::path>& rootPaths, const FileFilter& filter) const
     {
         std::set<ContentKey> keys;
         uint64_t processed = 0;
         if (gProgress)
         {
-            gProgress->onPhaseStart("containment: target keys", countRootFiles(rootPaths, minSize));
+            gProgress->onPhaseStart("containment: target keys", countRootFiles(rootPaths, filter));
         }
         for (const auto& dir : dirs)
         {
@@ -2360,7 +2443,7 @@ private:
             }
             for (const auto& file : dir.files)
             {
-                if (file.size < minSize)
+                if (!filter.matches(file))
                 {
                     continue;
                 }
@@ -2408,14 +2491,14 @@ private:
     std::map<fs::path, ContainmentStats> collectContainmentStats(
         const fs::path& sourceRoot,
         const std::set<ContentKey>& targetKeys,
-        uint64_t minSize) const
+        const FileFilter& filter) const
     {
         std::map<fs::path, ContainmentStats> byDir;
         byDir[fs::path(".")];
         uint64_t processed = 0;
         if (gProgress)
         {
-            gProgress->onPhaseStart("containment: dir stats", countRootFiles(sourceRoot, minSize));
+            gProgress->onPhaseStart("containment: dir stats", countRootFiles(sourceRoot, filter));
         }
         for (const auto& dir : dirs)
         {
@@ -2434,7 +2517,7 @@ private:
 
             for (const auto& file : dir.files)
             {
-                if (file.size < minSize)
+                if (!filter.matches(file))
                 {
                     continue;
                 }
@@ -2474,14 +2557,14 @@ private:
     std::vector<FileEntry> collectContainmentFiles(
         const fs::path& sourceRoot,
         const std::set<ContentKey>& targetKeys,
-        uint64_t minSize,
+        const FileFilter& filter,
         bool wantContained) const
     {
         std::vector<FileEntry> refs;
         uint64_t processed = 0;
         if (gProgress)
         {
-            gProgress->onPhaseStart(wantContained ? "containment: contained files" : "containment: not-contained files", countRootFiles(sourceRoot, minSize));
+            gProgress->onPhaseStart(wantContained ? "containment: contained files" : "containment: not-contained files", countRootFiles(sourceRoot, filter));
         }
         for (const auto& dir : dirs)
         {
@@ -2491,7 +2574,7 @@ private:
             }
             for (const auto& file : dir.files)
             {
-                if (file.size < minSize)
+                if (!filter.matches(file))
                 {
                     continue;
                 }
@@ -2648,7 +2731,7 @@ private:
         const std::set<ContentKey>& targetKeys,
         bool dryRun) const
     {
-        std::map<fs::path, ContainmentStats> byDir = collectContainmentStats(sourceRoot, targetKeys, 0);
+        std::map<fs::path, ContainmentStats> byDir = collectContainmentStats(sourceRoot, targetKeys, FileFilter{});
         std::vector<fs::path> dirsToRemove = collectTopContainedDirs(byDir);
         RemoveContainedDirStats stats;
         std::set<fs::path> touchedDirs;
@@ -2711,10 +2794,10 @@ private:
     RemoveCopyStats removeContainedFilesFromLastRoot(
         const fs::path& sourceRoot,
         const std::set<ContentKey>& targetKeys,
-        uint64_t minSize,
+        const FileFilter& filter,
         bool dryRun) const
     {
-        std::vector<FileEntry> refs = collectContainmentFiles(sourceRoot, targetKeys, minSize, true);
+        std::vector<FileEntry> refs = collectContainmentFiles(sourceRoot, targetKeys, filter, true);
         RemoveCopyStats stats;
         std::set<fs::path> touchedDirs;
 
@@ -2829,12 +2912,12 @@ private:
         const fs::path& sourceRoot,
         const std::vector<fs::path>& targetRoots,
         const std::set<ContentKey>& targetKeys,
-        uint64_t minSize,
+        const FileFilter& filter,
         bool listContainedFiles,
         bool listNotContainedFiles,
         bool showNotContained) const
     {
-        std::map<fs::path, ContainmentStats> byDir = collectContainmentStats(sourceRoot, targetKeys, minSize);
+        std::map<fs::path, ContainmentStats> byDir = collectContainmentStats(sourceRoot, targetKeys, filter);
         ContainmentStats total = byDir[fs::path(".")];
         std::vector<StatLine> stats = {
             {"files:", formatContainmentRatio(total.matchedFiles, total.files), std::string()},
@@ -2870,7 +2953,7 @@ private:
         }
         if (listContainedFiles)
         {
-            std::vector<FileEntry> containedFiles = collectContainmentFiles(sourceRoot, targetKeys, minSize, true);
+            std::vector<FileEntry> containedFiles = collectContainmentFiles(sourceRoot, targetKeys, filter, true);
             if (gProgress)
             {
                 gProgress->finish();
@@ -2880,7 +2963,7 @@ private:
         }
         if (listNotContainedFiles)
         {
-            std::vector<FileEntry> notContainedFiles = collectContainmentFiles(sourceRoot, targetKeys, minSize, false);
+            std::vector<FileEntry> notContainedFiles = collectContainmentFiles(sourceRoot, targetKeys, filter, false);
             if (gProgress)
             {
                 gProgress->finish();
@@ -4431,6 +4514,11 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "hashrate", "Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.");
     cl.addOption(' ', "bufsize", "Buffer size for reading (readbench and hashing).", "N", "1M");
     cl.addOption(' ', "min-size", "Minimum file size for operations that support file filtering.", "N", "0");
+    cl.addOption(' ', "max-size", "Maximum file size for operations that support file filtering.", "N", "0");
+    cl.addOption(' ', "only", "Only include filenames matching comma-separated fnmatch patterns.", "PATTERNS", "");
+    cl.addOption(' ', "ionly", "Only include filenames matching comma-separated fnmatch patterns, case-insensitively.", "PATTERNS", "");
+    cl.addOption(' ', "exclude", "Exclude filenames matching comma-separated fnmatch patterns.", "PATTERNS", "");
+    cl.addOption(' ', "iexclude", "Exclude filenames matching comma-separated fnmatch patterns, case-insensitively.", "PATTERNS", "");
     cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
     cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
@@ -4438,7 +4526,6 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
     cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
-    cl.addOption(' ', "max-size", "Maximum file size to include in size histogram.", "N", "0");
     cl.addOption(' ', "top", "Maximum number of overlapping directory pairs to print (with --find-overlapping-dirs).", "N", "0");
     cl.addOption('p', "progress", "Print progress once per second.");
     cl.addOption('W', "width", "Max width for progress line.", "N", "199");
@@ -4446,21 +4533,24 @@ int main(int argc, char *argv[])
 
     // Parse command line options.
     cl.parse(argc, argv);
-    uint64_t minSize = 0;
     uint64_t maxHardlinks = 0;
     uint64_t sizeHistogram = 0;
-    uint64_t maxSize = 0;
     uint64_t top = 0;
     unsigned progressCount = 0;
     uint64_t progressWidth = 0;
+    FileFilter fileFilter;
     try
     {
         clVerbose = cl.getCount("verbose");
         gBufSize = parseSizeOption(cl, "bufsize");
-        minSize = parseSizeOption(cl, "min-size");
+        fileFilter.minSize = parseSizeOption(cl, "min-size");
+        fileFilter.maxSize = parseSizeOption(cl, "max-size");
+        fileFilter.onlyPatterns = parsePatterns(cl, "only");
+        fileFilter.iOnlyPatterns = parsePatterns(cl, "ionly");
+        fileFilter.excludePatterns = parsePatterns(cl, "exclude");
+        fileFilter.iExcludePatterns = parsePatterns(cl, "iexclude");
         maxHardlinks = parseSizeOption(cl, "max-hardlinks");
         sizeHistogram = parseSizeOption(cl, "size-histogram");
-        maxSize = parseSizeOption(cl, "max-size");
         top = cl.getUInt("top");
         if (gBufSize == 0)
         {
@@ -4469,6 +4559,10 @@ int main(int argc, char *argv[])
         if (cl("size-histogram") && sizeHistogram == 0)
         {
             cl.error("--size-histogram must be greater than 0.");
+        }
+        if (fileFilter.maxSize != 0 && fileFilter.minSize > fileFilter.maxSize)
+        {
+            cl.error("--min-size must be less than or equal to --max-size.");
         }
         progressCount = cl.getCount("progress");
         progressWidth = cl.getUInt("width");
@@ -4647,33 +4741,33 @@ int main(int argc, char *argv[])
 
             if (cl("remove-dir-internal-copies"))
             {
-                auto stats = mainDb.removeDirInternalCopies(normalizedRoots, minSize, cl("dry-run"));
+                auto stats = mainDb.removeDirInternalCopies(normalizedRoots, fileFilter, cl("dry-run"));
                 std::cout << "remove-dir-internal-copies:\n";
                 mainDb.printRemoveCopyStats(stats);
             }
 
             if (cl("hardlink-copies"))
             {
-                auto stats = mainDb.hardlinkCopies(minSize, maxHardlinks, cl("dry-run"));
+                auto stats = mainDb.hardlinkCopies(fileFilter, maxHardlinks, cl("dry-run"));
                 std::cout << "hardlink-copies:\n";
                 mainDb.printHardlinkStats(stats);
             }
             if (cl("break-hardlinks"))
             {
-                auto stats = mainDb.breakHardlinks(cl("dry-run"));
+                auto stats = mainDb.breakHardlinks(fileFilter, cl("dry-run"));
                 std::cout << "break-hardlinks:\n";
                 mainDb.printBreakHardlinkStats(stats);
             }
 
             if (cl("find-overlapping-dirs"))
             {
-                mainDb.printOverlappingDirs(normalizedRoots, minSize, top, cl("remove-copies"), cl("dry-run"));
+                mainDb.printOverlappingDirs(normalizedRoots, fileFilter, top, cl("remove-copies"), cl("dry-run"));
             }
             else if (cl("containment"))
             {
                 mainDb.printContainment(
                     normalizedRoots,
-                    minSize,
+                    fileFilter,
                     cl("show-contained-files"),
                     cl("show-not-contained-files"),
                     cl("show-not-contained"),
@@ -4707,39 +4801,38 @@ int main(int argc, char *argv[])
                     cl("remove-copies"),
                     cl("remove-copies-from-last"),
                     cl("dry-run"),
-                    minSize);
+                    fileFilter);
             }
             else
             {
                 if (cl("remove-copies"))
                 {
-                    auto stats = mainDb.removeRedundantFiles(minSize, cl("dry-run"));
+                    auto stats = mainDb.removeRedundantFiles(fileFilter, cl("dry-run"));
                     std::cout << "remove-copies:\n";
                     mainDb.printRemoveCopyStats(stats);
                 }
 
                 if (cl("stats"))
                 {
-                    mainDb.printStats(minSize);
+                    mainDb.printStats(fileFilter);
                 }
 
                 if (cl("size-histogram"))
                 {
-                    bool hasMaxSize = maxSize != 0;
-                    mainDb.printSizeHistogram(sizeHistogram, maxSize, hasMaxSize);
+                    mainDb.printSizeHistogram(sizeHistogram, fileFilter);
                 }
 
                 if (cl("list-files"))
                 {
-                    mainDb.listFiles();
+                    mainDb.listFiles(fileFilter);
                 }
                 if (cl("list-hardlinks"))
                 {
-                    mainDb.listHardlinks();
+                    mainDb.listHardlinks(fileFilter);
                 }
                 if (cl("list-redundant"))
                 {
-                    mainDb.listRedundant();
+                    mainDb.listRedundant(fileFilter);
                 }
                 if (cl("list-dirs"))
                 {

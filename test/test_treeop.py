@@ -996,9 +996,80 @@ def test_stats_min_size_filters_stats_not_dirdb(tmp_path: Path):
     assert re.search(r"total-size:\s+10 bytes", out)
     assert (dir_a / ".dirdb").exists()
 
-    file_list = run_treeop(["--list-files", str(dir_a)], root)
-    assert "small.txt" in file_list
+    file_list = run_treeop(["--list-files", "--min-size", "5", str(dir_a)], root)
+    assert "small.txt" not in file_list
     assert "large.txt" in file_list
+
+
+def test_stats_max_size_filter(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "small.txt", "xx")
+    write_file(dir_a / "large.txt", "large-data")
+
+    out = run_treeop(["--stats", "--max-size", "5", str(dir_a)], root)
+    assert re.search(r"files:\s+1", out)
+    assert re.search(r"total-size:\s+2 bytes", out)
+
+
+def test_list_files_only_and_exclude_filters_filename(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    (dir_a / "sub").mkdir(parents=True)
+    write_file(dir_a / "photo.jpg", "jpg")
+    write_file(dir_a / "sub" / "nested.png", "png")
+    write_file(dir_a / "note.txt", "txt")
+    write_file(dir_a / "photo.jpg~", "backup")
+
+    out = run_treeop(["--list-files", "--only", "*.jpg,*.png", "--exclude", "*~", str(dir_a)], root)
+    assert "photo.jpg" in out
+    assert "nested.png" in out
+    assert "note.txt" not in out
+    assert "photo.jpg~" not in out
+
+
+def test_list_files_ionly_and_iexclude_filters_case_insensitively(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "PHOTO.JPG", "jpg")
+    write_file(dir_a / "diagram.PNG", "png")
+    write_file(dir_a / "note.TXT", "txt")
+    write_file(dir_a / "PHOTO.JPG~", "backup")
+
+    out = run_treeop(["--list-files", "--ionly", "*.jpg,*.png", "--iexclude", "*~", str(dir_a)], root)
+    assert "PHOTO.JPG" in out
+    assert "diagram.PNG" in out
+    assert "note.TXT" not in out
+    assert "PHOTO.JPG~" not in out
+
+
+def test_invalid_min_size_greater_than_max_size(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "hello")
+
+    result = run_treeop_result(["--stats", "--min-size", "10", "--max-size", "5", str(dir_a)], root)
+    assert result.returncode != 0
+    assert "--min-size must be less than or equal to --max-size." in result.stdout
 
 
 def test_break_hardlinks(tmp_path: Path):
@@ -1026,6 +1097,35 @@ def test_break_hardlinks(tmp_path: Path):
     assert file_a.stat().st_ino != file_b.stat().st_ino
 
 
+def test_break_hardlinks_min_size(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    root_dir = tmp_path / "root"
+    sub_dir = root_dir / "sub"
+    root_dir.mkdir()
+    sub_dir.mkdir()
+
+    small_a = root_dir / "small.txt"
+    small_b = sub_dir / "small_link.txt"
+    large_a = root_dir / "large.txt"
+    large_b = sub_dir / "large_link.txt"
+    write_file(small_a, "hi")
+    os.link(small_a, small_b)
+    write_file(large_a, "large!")
+    os.link(large_a, large_b)
+
+    out = run_treeop(["--break-hardlinks", "--min-size", "5", str(root_dir)], root)
+    assert "break-hardlinks:" in out
+    assert small_a.stat().st_ino == small_b.stat().st_ino
+    assert large_a.stat().st_ino != large_b.stat().st_ino
+
+
 def test_list_hardlinks(tmp_path: Path):
     if not supports_hardlinks(tmp_path):
         pytest.skip("Filesystem does not support hardlinks")
@@ -1048,6 +1148,36 @@ def test_list_hardlinks(tmp_path: Path):
     out = run_treeop(["--list-hardlinks", str(root_dir)], root)
     assert str(file_a) in out
     assert str(file_b) in out
+
+
+def test_list_hardlinks_min_size(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    root_dir = tmp_path / "root"
+    sub_dir = root_dir / "sub"
+    root_dir.mkdir()
+    sub_dir.mkdir()
+
+    small_a = root_dir / "small.txt"
+    small_b = sub_dir / "small_link.txt"
+    large_a = root_dir / "large.txt"
+    large_b = sub_dir / "large_link.txt"
+    write_file(small_a, "hi")
+    os.link(small_a, small_b)
+    write_file(large_a, "large!")
+    os.link(large_a, large_b)
+
+    out = run_treeop(["--list-hardlinks", "--min-size", "5", str(root_dir)], root)
+    assert str(small_a) not in out
+    assert str(small_b) not in out
+    assert str(large_a) in out
+    assert str(large_b) in out
 
 
 def test_list_dirs(tmp_path: Path):
@@ -1141,6 +1271,22 @@ def test_size_histogram_max_size(tmp_path: Path):
     out = run_treeop(["--size-histogram", "4", "--max-size", "4", str(dir_a)], root)
     assert re.search(r":\s+1\s+2 bytes", out)
     assert "10 bytes" not in out
+
+
+def test_size_histogram_min_size(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "small.txt", "ab")
+    write_file(dir_a / "large.txt", "x" * 10)
+
+    out = run_treeop(["--size-histogram", "4", "--min-size", "5", str(dir_a)], root)
+    assert re.search(r":\s+1\s+10 bytes", out)
+    assert "2 bytes" not in out
 
 
 def test_invalid_size_histogram_fails_before_processing_dirs(tmp_path: Path):
@@ -1331,6 +1477,29 @@ def test_list_redundant_alignment(tmp_path: Path):
 
     starts = [hash_start(line) for line in lines]
     assert all(start == starts[0] for start in starts)
+
+
+def test_list_redundant_min_size(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "small.txt", "hi")
+    write_file(dir_b / "small_copy.txt", "hi")
+    write_file(dir_a / "big.txt", "x" * 3000)
+    write_file(dir_b / "big_copy.txt", "x" * 3000)
+
+    out = run_treeop(["--list-redundant", "--min-size", "5", str(dir_a), str(dir_b)], root)
+    assert "small.txt" not in out
+    assert "small_copy.txt" not in out
+    assert "big.txt" in out
+    assert "big_copy.txt" in out
 
 
 def supports_hardlinks(tmp_path: Path) -> bool:
