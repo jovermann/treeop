@@ -653,14 +653,40 @@ def test_remove_dir_internal_copies_dry_run_verbose(tmp_path: Path):
 
     assert "remove-dir-internal-copies:" in out
     assert re.search(r"removed-files:\s+1", out)
+    assert re.search(r"^[0-9a-f]+: Would remove ", out, re.MULTILINE)
     assert f"Would remove {new}" in out
-    assert f"kept {old}" in out
+    assert "kept old.txt" in out
+    assert f"kept {old}" not in out
     assert "removed-date=" in out
     assert "kept-date=" in out
     assert "size=4 bytes" in out
-    assert re.search(r"hash=[0-9a-f]+", out)
+    assert "hash=" not in out
     assert old.exists()
     assert new.exists()
+
+
+def test_remove_dir_internal_copies_verbose_prints_kept_file(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    old = dir_a / "dupdir" / "old.txt"
+    new = dir_a / "dupdir" / "new.txt"
+    write_file(old, "same")
+    write_file(new, "same")
+    os.utime(old, (1000, 1000))
+    os.utime(new, (2000, 2000))
+
+    out = run_treeop(["--remove-dir-internal-copies", "--dry-run", "-v", str(dir_a)], root)
+
+    assert re.search(r"^[0-9a-f]+: Would remove ", out, re.MULTILINE)
+    assert f"Would remove {new}" in out
+    assert "kept old.txt" in out
+    assert "removed-date=" not in out
+    assert "size=4 bytes" not in out
 
 
 def test_remove_dir_internal_copies_actual(tmp_path: Path):

@@ -1719,18 +1719,18 @@ public:
                     fs::path fullPath = dir.path / ref->path;
                     if (clVerbose)
                     {
-                        std::cout << (dryRun ? "Would remove " : "Removed ") << fullPath.string();
+                        std::string hashHex = key.hash.toHex();
+                        size_t hashLen = getUniqueHashHexLen();
+                        std::cout << hashHex.substr(0, std::min(hashLen, hashHex.size())) << ": "
+                                  << (dryRun ? "Would remove " : "Removed ") << fullPath.string()
+                                  << " kept " << oldest->path;
                         if (clVerbose > 1)
                         {
-                            std::cout << " kept " << (dir.path / oldest->path).string()
-                                      << " removed-date=" << formatFileTime(ref->date)
+                            std::cout << " removed-date=" << formatFileTime(ref->date)
                                       << " kept-date=" << formatFileTime(oldest->date);
                             if (clVerbose > 2)
                             {
-                                std::string hashHex = ref->hash.toHex();
-                                size_t hashLen = getUniqueHashHexLen();
-                                std::cout << " size=" << ut1::getApproxSizeStr(ref->size, 1, true, false)
-                                          << " hash=" << hashHex.substr(0, std::min(hashLen, hashHex.size()));
+                                std::cout << " size=" << ut1::getApproxSizeStr(ref->size, 1, true, false);
                             }
                         }
                         std::cout << "\n";
