@@ -1277,12 +1277,19 @@ public:
             printOverlapResult(results[i]);
             if (removeCopies)
             {
-                const OverlapDirData* a = findOverlapDirData(overlapDirs, results[i].a);
-                const OverlapDirData* b = findOverlapDirData(overlapDirs, results[i].b);
-                if (a != nullptr && b != nullptr)
+                if (results[i].internalDuplicatesA.files > 0 || results[i].internalDuplicatesB.files > 0)
                 {
-                    OverlapRemoveStats stats = removeOverlapCopies(results[i], *a, *b, dryRun, removedPaths);
-                    printOverlapRemoveStats(stats, dryRun);
+                    printOverlapRemoveStats({}, dryRun);
+                }
+                else
+                {
+                    const OverlapDirData* a = findOverlapDirData(overlapDirs, results[i].a);
+                    const OverlapDirData* b = findOverlapDirData(overlapDirs, results[i].b);
+                    if (a != nullptr && b != nullptr)
+                    {
+                        OverlapRemoveStats stats = removeOverlapCopies(results[i], *a, *b, dryRun, removedPaths);
+                        printOverlapRemoveStats(stats, dryRun);
+                    }
                 }
             }
             if (i + 1 < limit)
@@ -1568,6 +1575,127 @@ public:
         printStatList(lines);
     }
 
+    /// Remove duplicate files within each directory independently, keeping the oldest file per content.
+    RemoveCopyStats removeDirInternalCopies(const std::vector<fs::path>& rootPaths, uint64_t minSize, bool dryRun)
+    {
+        RemoveCopyStats stats;
+        std::set<fs::path> touchedDirs;
+        for (auto& dir : dirs)
+        {
+            bool inAnyRoot = false;
+            for (const auto& rootPath : rootPaths)
+            {
+                if (isPathWithin(rootPath, dir.path))
+                {
+                    inAnyRoot = true;
+                    break;
+                }
+            }
+            if (!inAnyRoot)
+            {
+                continue;
+            }
+
+            std::map<ContentKey, std::vector<const FileEntry*>> groups;
+            for (const auto& file : dir.files)
+            {
+                if (file.size < minSize)
+                {
+                    continue;
+                }
+                groups[contentKeyForFile(file)].push_back(&file);
+            }
+
+            std::set<std::string> removedPaths;
+            for (const auto& [key, refs] : groups)
+            {
+                if (refs.size() < 2)
+                {
+                    continue;
+                }
+                auto oldestIt = std::min_element(refs.begin(), refs.end(),
+                    [](const FileEntry* lhs, const FileEntry* rhs)
+                    {
+                        if (lhs->date != rhs->date)
+                        {
+                            return lhs->date < rhs->date;
+                        }
+                        return lhs->path < rhs->path;
+                    });
+                if (oldestIt == refs.end())
+                {
+                    continue;
+                }
+                const FileEntry* oldest = *oldestIt;
+                for (const FileEntry* ref : refs)
+                {
+                    if (ref == oldest)
+                    {
+                        continue;
+                    }
+                    fs::path fullPath = dir.path / ref->path;
+                    if (clVerbose)
+                    {
+                        std::cout << (dryRun ? "Would remove " : "Removed ") << fullPath.string();
+                        if (clVerbose > 1)
+                        {
+                            std::cout << " kept " << (dir.path / oldest->path).string()
+                                      << " removed-date=" << formatFileTime(ref->date)
+                                      << " kept-date=" << formatFileTime(oldest->date);
+                            if (clVerbose > 2)
+                            {
+                                std::string hashHex = ref->hash.toHex();
+                                size_t hashLen = getUniqueHashHexLen();
+                                std::cout << " size=" << ut1::getApproxSizeStr(ref->size, 1, true, false)
+                                          << " hash=" << hashHex.substr(0, std::min(hashLen, hashHex.size()));
+                            }
+                        }
+                        std::cout << "\n";
+                    }
+
+                    stats.files++;
+                    stats.bytes += ref->size;
+                    removedPaths.insert(ref->path);
+                    if (dryRun)
+                    {
+                        continue;
+                    }
+
+                    std::error_code ec;
+                    fs::remove(fullPath, ec);
+                    if (ec)
+                    {
+                        throw std::runtime_error("Failed to remove " + fullPath.string());
+                    }
+                    touchedDirs.insert(dir.path);
+                }
+            }
+
+            if (!dryRun && !removedPaths.empty())
+            {
+                auto newEnd = std::remove_if(dir.files.begin(), dir.files.end(),
+                    [&](const FileEntry& file)
+                    {
+                        return removedPaths.find(file.path) != removedPaths.end();
+                    });
+                dir.files.erase(newEnd, dir.files.end());
+            }
+        }
+
+        if (!dryRun)
+        {
+            for (auto& dir : dirs)
+            {
+                if (touchedDirs.find(dir.path) != touchedDirs.end() && ut1::fsExists(dir.path / ".dirdb"))
+                {
+                    dir = updateDirDb(dir.path);
+                }
+            }
+        }
+
+        return stats;
+    }
+
 private:
     /// Extract the basename used for same-filename matching.
     static std::string keyNameForPath(const std::string& path)
@@ -1804,6 +1932,7 @@ private:
         fs::path path;
         std::map<ContentKey, std::vector<FileEntry>> contentFiles;
         OverlapBucketStats total;
+        OverlapBucketStats internalDuplicates;
     };
 
     struct OverlapResult
@@ -1815,6 +1944,8 @@ private:
         OverlapBucketStats onlyB;
         OverlapBucketStats totalA;
         OverlapBucketStats totalB;
+        OverlapBucketStats internalDuplicatesA;
+        OverlapBucketStats internalDuplicatesB;
         double sharedPercentFiles{};
         double sharedPercentBytes{};
     };
@@ -1931,6 +2062,15 @@ private:
             }
             if (data.total.files > 0)
             {
+                for (const auto& [key, refs] : data.contentFiles)
+                {
+                    if (refs.size() > 1)
+                    {
+                        uint64_t duplicates = static_cast<uint64_t>(refs.size() - 1);
+                        data.internalDuplicates.files += duplicates;
+                        data.internalDuplicates.bytes += duplicates * key.size;
+                    }
+                }
                 result.push_back(std::move(data));
             }
         }
@@ -1969,6 +2109,8 @@ private:
         result.b = b.path;
         result.totalA = a.total;
         result.totalB = b.total;
+        result.internalDuplicatesA = a.internalDuplicates;
+        result.internalDuplicatesB = b.internalDuplicates;
 
         for (const auto& [key, refs] : a.contentFiles)
         {
@@ -2004,6 +2146,18 @@ private:
     {
         std::cout << "A: " << result.a.string() << "\n";
         std::cout << "B: " << result.b.string() << "\n";
+        if (result.internalDuplicatesA.files > 0)
+        {
+            std::cout << "warning: A contains internal duplicates: "
+                      << formatOverlapBytes(result.internalDuplicatesA.bytes) << " / "
+                      << formatCountInt(result.internalDuplicatesA.files) << " files\n";
+        }
+        if (result.internalDuplicatesB.files > 0)
+        {
+            std::cout << "warning: B contains internal duplicates: "
+                      << formatOverlapBytes(result.internalDuplicatesB.bytes) << " / "
+                      << formatCountInt(result.internalDuplicatesB.files) << " files\n";
+        }
         std::vector<OverlapRow> rows = {
             {"shared:", formatPercentFixed(percentOf(result.shared.files, result.totalA.files)), formatCountInt(result.shared.files),
                 formatPercentFixed(percentOf(result.shared.bytes, result.totalA.bytes)), formatOverlapBytes(result.shared.bytes), std::string()},
@@ -4268,6 +4422,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "extract-last", "Extract files only in the last root into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "remove-copies", "Delete duplicate files (with --intersect removes from later roots; otherwise keeps oldest).");
     cl.addOption(' ', "remove-copies-from-last", "Delete files only from the last root when content exists in earlier roots (with --intersect).");
+    cl.addOption(' ', "remove-dir-internal-copies", "Delete duplicate files within each directory independently, keeping the oldest file.");
     cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
     cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
     cl.addOption(' ', "break-hardlinks", "Break all hardlinks by replacing files with private copies.");
@@ -4330,7 +4485,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -4459,7 +4614,7 @@ int main(int argc, char *argv[])
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
-                    || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
+                || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("hashrate");
                 if (otherOps)
                 {
@@ -4488,6 +4643,13 @@ int main(int argc, char *argv[])
             if (gProgress)
             {
                 gProgress->finish();
+            }
+
+            if (cl("remove-dir-internal-copies"))
+            {
+                auto stats = mainDb.removeDirInternalCopies(normalizedRoots, minSize, cl("dry-run"));
+                std::cout << "remove-dir-internal-copies:\n";
+                mainDb.printRemoveCopyStats(stats);
             }
 
             if (cl("hardlink-copies"))

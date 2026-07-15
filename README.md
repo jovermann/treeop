@@ -77,6 +77,9 @@ Options:
      --extract-b=DIR       Extract files only in B into DIR when used with --intersect.
      --remove-copies       Delete files from later roots when content exists in earlier roots (with
                            --intersect).
+     --remove-dir-internal-copies
+                           Delete duplicate files within each directory independently, keeping the
+                           oldest file.
   -d --dry-run             Show what would change, but do not modify files.
      --new-dirdb           Force creation of new .dirdb files (overwrite existing).
   -u --update-dirdb        Update .dirdb files, reusing hashes when inode/size/mtime match.

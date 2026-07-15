@@ -609,6 +609,120 @@ def test_find_overlapping_dirs_prints_only_best_direction_per_pair(tmp_path: Pat
     assert f"B: {dir_a / 'large'}" in out
 
 
+def test_find_overlapping_dirs_warns_and_skips_remove_when_internal_duplicates(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "dupdir" / "one.txt", "same")
+    write_file(dir_a / "dupdir" / "two.txt", "same")
+    write_file(dir_b / "copydir" / "copy.txt", "same")
+
+    out = run_treeop(["--find-overlapping-dirs", "--remove-copies", "--dry-run", "--top", "1", str(dir_a), str(dir_b)], root)
+
+    assert "warning: B contains internal duplicates:" in out or "warning: A contains internal duplicates:" in out
+    assert re.search(r"remove from A:\s+0 bytes,\s+0 files", out)
+    assert re.search(r"remove from B:\s+0 bytes,\s+0 files", out)
+    assert (dir_a / "dupdir" / "one.txt").exists()
+    assert (dir_a / "dupdir" / "two.txt").exists()
+    assert (dir_b / "copydir" / "copy.txt").exists()
+
+
+def test_remove_dir_internal_copies_dry_run_verbose(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    old = dir_a / "dupdir" / "old.txt"
+    new = dir_a / "dupdir" / "new.txt"
+    write_file(old, "same")
+    write_file(new, "same")
+    os.utime(old, (1000, 1000))
+    os.utime(new, (2000, 2000))
+
+    out = run_treeop(["--remove-dir-internal-copies", "--dry-run", "-vvv", str(dir_a)], root)
+
+    assert "remove-dir-internal-copies:" in out
+    assert re.search(r"removed-files:\s+1", out)
+    assert f"Would remove {new}" in out
+    assert f"kept {old}" in out
+    assert "removed-date=" in out
+    assert "kept-date=" in out
+    assert "size=4 bytes" in out
+    assert re.search(r"hash=[0-9a-f]+", out)
+    assert old.exists()
+    assert new.exists()
+
+
+def test_remove_dir_internal_copies_actual(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    old = dir_a / "dupdir" / "old.txt"
+    new = dir_a / "dupdir" / "new.txt"
+    write_file(old, "same")
+    write_file(new, "same")
+    os.utime(old, (1000, 1000))
+    os.utime(new, (2000, 2000))
+
+    out = run_treeop(["--remove-dir-internal-copies", str(dir_a)], root)
+
+    assert "remove-dir-internal-copies:" in out
+    assert re.search(r"removed-files:\s+1", out)
+    assert old.exists()
+    assert not new.exists()
+
+
+def test_remove_dir_internal_copies_runs_before_overlap_remove_copies(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    a_old = dir_a / "dupdir" / "old.txt"
+    a_new = dir_a / "dupdir" / "new.txt"
+    b_copy = dir_b / "copydir" / "copy.txt"
+    write_file(a_old, "same")
+    write_file(a_new, "same")
+    write_file(b_copy, "same")
+    os.utime(a_old, (1000, 1000))
+    os.utime(a_new, (2000, 2000))
+    os.utime(b_copy, (3000, 3000))
+
+    out = run_treeop([
+        "--remove-dir-internal-copies",
+        "--find-overlapping-dirs",
+        "--remove-copies",
+        "--top",
+        "1",
+        str(dir_a),
+        str(dir_b),
+    ], root)
+
+    assert "warning:" not in out
+    assert re.search(r"remove from B:\s+\d+ bytes,\s+1 files", out)
+    assert a_old.exists()
+    assert not a_new.exists()
+    assert not b_copy.exists()
+
+
 def test_find_overlapping_dirs_remove_copies_dry_run_and_verbose(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
