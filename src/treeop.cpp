@@ -4484,48 +4484,64 @@ int main(int argc, char *argv[])
         "\n$programName version $version ($compileDate) *** Copyright (c) 2026 Johannes Overmann *** https://github.com/jovermann/treeop",
         "0.2.1");
 
-    cl.addHeader("\nOptions:\n");
+    cl.addHeader("\nAnalysis operations:\n");
     cl.addOption('i', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
     cl.addOption('c', "containment", "Show how much of the last dir is contained in the previous dirs.");
+    cl.addOption(' ', "find-overlapping-dirs", "Find and rank overlapping directory pairs within the specified trees.");
+    cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
+    cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
+
+    cl.addHeader("\nListing operations:\n");
+    cl.addOption('l', "list-files", "List all files with stored meta-data.");
+    cl.addOption(' ', "list-redundant", "List redundant files grouped by content hash.");
+    cl.addOption(' ', "list-hardlinks", "List hardlinked files grouped by inode.");
+    cl.addOption(' ', "list-dirs", "List all directories with file counts and total size.");
+
+    cl.addHeader("\nContainment options:\n");
     cl.addOption(' ', "show-contained-files", "List files in the last dir that are contained in the previous dirs (with --containment).");
     cl.addOption(' ', "show-not-contained-files", "List files in the last dir that are not contained in the previous dirs (with --containment).");
     cl.addOption(' ', "show-not-contained", "Show mostly-not-contained and not-contained dir sections (with --containment).");
     cl.addOption(' ', "remove-contained-dirs", "Delete dirs from the last root that are completely contained in previous roots (with --containment).");
     cl.addOption(' ', "remove-contained-files", "Delete files from the last root that are contained in previous roots (with --containment).");
-    cl.addOption(' ', "find-overlapping-dirs", "Find and rank overlapping directory pairs within the specified trees.");
-    cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
-    cl.addOption('l', "list-files", "List all files with stored meta-data.");
-    cl.addOption(' ', "list-redundant", "List redundant files grouped by content hash.");
-    cl.addOption(' ', "list-hardlinks", "List hardlinked files grouped by inode.");
-    cl.addOption(' ', "list-dirs", "List all directories with file counts and total size.");
+
+    cl.addHeader("\nIntersection options:\n");
     cl.addOption(' ', "list-first", "List files only in the first roots when used with --intersect.");
     cl.addOption(' ', "list-last", "List files only in the last root when used with --intersect.");
     cl.addOption(' ', "list-both", "List files in both the first roots and the last root when used with --intersect.");
     cl.addOption(' ', "extract-first", "Extract files only in the first roots into DIR when used with --intersect.", "DIR", "");
     cl.addOption(' ', "extract-last", "Extract files only in the last root into DIR when used with --intersect.", "DIR", "");
+
+    cl.addHeader("\nDuplicate and hardlink operations:\n");
     cl.addOption(' ', "remove-copies", "Delete duplicate files (with --intersect removes from later roots; otherwise keeps oldest).");
     cl.addOption(' ', "remove-copies-from-last", "Delete files only from the last root when content exists in earlier roots (with --intersect).");
     cl.addOption(' ', "remove-dir-internal-copies", "Delete duplicate files within each directory independently, keeping the oldest file.");
     cl.addOption(' ', "same-filename", "Treat files as identical only if content and filename match.");
     cl.addOption(' ', "hardlink-copies", "Replace duplicate files with hardlinks to the oldest file.");
     cl.addOption(' ', "break-hardlinks", "Break all hardlinks by replacing files with private copies.");
-    cl.addOption(' ', "remove-empty-dirs", "Remove empty directories (ignoring .dirdb files).");
-    cl.addOption(' ', "readbench", "Read all files to measure filesystem read performance.");
-    cl.addOption(' ', "hashrate", "Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.");
-    cl.addOption(' ', "bufsize", "Buffer size for reading (readbench and hashing).", "N", "1M");
+    cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
+
+    cl.addHeader("\nFilters:\n");
     cl.addOption(' ', "min-size", "Minimum file size for operations that support file filtering.", "N", "0");
     cl.addOption(' ', "max-size", "Maximum file size for operations that support file filtering.", "N", "0");
     cl.addOption(' ', "only", "Only include filenames matching comma-separated fnmatch patterns.", "PATTERNS", "");
     cl.addOption(' ', "ionly", "Only include filenames matching comma-separated fnmatch patterns, case-insensitively.", "PATTERNS", "");
     cl.addOption(' ', "exclude", "Exclude filenames matching comma-separated fnmatch patterns.", "PATTERNS", "");
     cl.addOption(' ', "iexclude", "Exclude filenames matching comma-separated fnmatch patterns, case-insensitively.", "PATTERNS", "");
-    cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
-    cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
+
+    cl.addHeader("\nDatabase and tree maintenance:\n");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
     cl.addOption('u', "update-dirdb", "Update .dirdb files, reusing hashes when inode/size/mtime match.");
     cl.addOption(' ', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
+    cl.addOption(' ', "remove-empty-dirs", "Remove empty directories (ignoring .dirdb files).");
+
+    cl.addHeader("\nBenchmarks:\n");
+    cl.addOption(' ', "readbench", "Read all files to measure filesystem read performance.");
+    cl.addOption(' ', "hashrate", "Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.");
+    cl.addOption(' ', "bufsize", "Buffer size for reading (readbench and hashing).", "N", "1M");
+
+    cl.addHeader("\nGeneral:\n");
+    cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
-    cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
     cl.addOption(' ', "top", "Maximum number of overlapping directory pairs to print (with --find-overlapping-dirs).", "N", "0");
     cl.addOption('p', "progress", "Print progress once per second.");
     cl.addOption('W', "width", "Max width for progress line.", "N", "199");
