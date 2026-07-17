@@ -474,10 +474,19 @@ struct DirDbData
     double hashSeconds{};
 };
 
+struct ExtensionStat
+{
+    uint64_t files{};
+    uint64_t bytes{};
+};
+
+using ExtensionStats = std::map<std::string, ExtensionStat>;
+
 struct RemoveCopyStats
 {
     uint64_t files{};
     uint64_t bytes{};
+    ExtensionStats extensions;
 };
 
 struct RemoveContainedDirStats
@@ -625,8 +634,9 @@ public:
             [](const FileEntry& a, const FileEntry& b)
             {
                 return a.path < b.path;
-            });
+        });
         printListRows(refs, clVerbose > 1, hashLen);
+        printExtensionStats(collectExtensionStats(refs));
     }
 
     /// List all redundant files grouped by content hash.
@@ -655,6 +665,7 @@ public:
         size_t hashLen = getUniqueHashHexLen();
         ListRowWidths widths;
         std::vector<std::vector<FileEntry>> groups;
+        std::vector<FileEntry> listedRefs;
         groups.reserve(byHash.size());
         for (auto& [hash, files] : byHash)
         {
@@ -671,6 +682,7 @@ public:
             {
                 updateListRowWidths(ref, clVerbose > 1, hashLen, widths);
             }
+            listedRefs.insert(listedRefs.end(), files.begin(), files.end());
             groups.push_back(std::move(files));
         }
 
@@ -684,6 +696,7 @@ public:
         {
             printListRowsWithWidths(group, clVerbose > 1, hashLen, widths);
         }
+        printExtensionStats(collectExtensionStats(listedRefs));
     }
 
     /// List all directories with file counts and total size.
@@ -776,8 +789,9 @@ public:
                     return a.inode < b.inode;
                 }
                 return a.path < b.path;
-            });
+        });
         printListRows(refs, true, hashLen);
+        printExtensionStats(collectExtensionStats(refs));
     }
 
     /// Print a size histogram over all files.
@@ -1062,6 +1076,10 @@ public:
 
         std::cout << "total:\n";
         printStatList(totalStats);
+        if (removeAny)
+        {
+            printExtensionStats(removedStats.extensions);
+        }
 
         size_t lastIndex = rootPaths.size() - 1;
         const auto& lastFiles = rootFiles[lastIndex];
@@ -1126,6 +1144,7 @@ public:
                     }
                 }
                 printListRows(refs, clVerbose > 1, hashLen);
+                printExtensionStats(collectExtensionStats(refs));
             }
             else
             {
@@ -1161,6 +1180,7 @@ public:
                     refs.insert(refs.end(), listRefs.begin(), listRefs.end());
                 }
                 printListRows(refs, clVerbose > 1, hashLen);
+                printExtensionStats(collectExtensionStats(refs));
             }
             else
             {
@@ -1214,6 +1234,7 @@ public:
                     }
                 }
                 printListRows(refs, clVerbose > 1, hashLen);
+                printExtensionStats(collectExtensionStats(refs));
             }
             else
             {
@@ -1394,12 +1415,14 @@ public:
         uint64_t createdLinks{};
         uint64_t removedFiles{};
         uint64_t removedBytes{};
+        ExtensionStats extensions;
     };
 
     struct BreakHardlinkStats
     {
         uint64_t files{};
         uint64_t bytes{};
+        ExtensionStats extensions;
     };
 
     /// Replace duplicate files with hardlinks to the oldest file.
@@ -1465,6 +1488,7 @@ public:
                     stats.createdLinks++;
                     stats.removedFiles++;
                     stats.removedBytes += ref.size;
+                    addExtensionStat(stats.extensions, ref.path, ref.size);
                 }
             });
 
@@ -1536,6 +1560,7 @@ public:
                     std::cout << "Would break hardlink " << target.string() << "\n";
                     stats.files++;
                     stats.bytes += file.size;
+                    addExtensionStat(stats.extensions, target.string(), file.size);
                     continue;
                 }
                 std::string errorMsg;
@@ -1550,6 +1575,7 @@ public:
                 }
                 stats.files++;
                 stats.bytes += file.size;
+                addExtensionStat(stats.extensions, target.string(), file.size);
                 touchedDirs.insert(target.parent_path());
             }
         }
@@ -1588,6 +1614,7 @@ public:
                     }
                     stats.files++;
                     stats.bytes += ref.size;
+                    addExtensionStat(stats.extensions, ref.path, ref.size);
                     if (dryRun)
                     {
                         continue;
@@ -1625,6 +1652,7 @@ public:
             {"removed-bytes:", ut1::getApproxSizeStr(stats.removedBytes, 3, true, false), std::string()}
         };
         printStatList(lines);
+        printExtensionStats(stats.extensions);
     }
 
     /// Print break-hardlinks statistics.
@@ -1635,6 +1663,7 @@ public:
             {"broken-bytes:", ut1::getApproxSizeStr(stats.bytes, 3, true, false), std::string()}
         };
         printStatList(lines);
+        printExtensionStats(stats.extensions);
     }
 
     /// Print remove-copies statistics.
@@ -1645,6 +1674,7 @@ public:
             {"removed-bytes:", ut1::getApproxSizeStr(stats.bytes, 3, true, false), std::string()}
         };
         printStatList(lines);
+        printExtensionStats(stats.extensions);
     }
 
     /// Print remove-contained-dirs statistics.
@@ -1738,6 +1768,7 @@ public:
 
                     stats.files++;
                     stats.bytes += ref->size;
+                    addExtensionStat(stats.extensions, ref->path, ref->size);
                     removedPaths.insert(ref->path);
                     if (dryRun)
                     {
@@ -2352,6 +2383,7 @@ private:
                 RemoveCopyStats& bucket = inA ? stats.a : stats.b;
                 bucket.files++;
                 bucket.bytes += ref->size;
+                addExtensionStat(bucket.extensions, ref->path, ref->size);
                 removedPaths.insert(ref->path);
 
                 if (clVerbose)
@@ -2416,6 +2448,9 @@ private:
                       << std::right << std::setw(static_cast<int>(byteWidth)) << row.bytes << ", "
                       << std::setw(static_cast<int>(fileWidth)) << row.files << " files\n";
         }
+        ExtensionStats extensions = stats.a.extensions;
+        mergeExtensionStats(extensions, stats.b.extensions);
+        printExtensionStats(extensions);
     }
 
     std::set<ContentKey> collectRootsContentKeys(const std::vector<fs::path>& rootPaths, const FileFilter& filter) const
@@ -2816,6 +2851,7 @@ private:
 
             stats.files++;
             stats.bytes += ref.size;
+            addExtensionStat(stats.extensions, fullPath.string(), ref.size);
             if (gProgress)
             {
                 gProgress->onPhaseProgress(++processed);
@@ -2900,6 +2936,7 @@ private:
         if (clVerbose > 0)
         {
             printListRows(refs, clVerbose > 1, getUniqueHashHexLen());
+            printExtensionStats(collectExtensionStats(refs));
             return;
         }
         for (const auto& ref : refs)
@@ -3038,6 +3075,79 @@ private:
             updateListRowWidths(ref, showInodeLinks, hashLen, widths);
         }
         printListRowsWithWidths(refs, showInodeLinks, hashLen, widths);
+    }
+
+    static std::string extensionLabelForPath(const std::string& path)
+    {
+        std::string extension = fs::path(path).extension().string();
+        if (extension.empty())
+        {
+            return "(none)";
+        }
+        return extension;
+    }
+
+    static void addExtensionStat(ExtensionStats& stats, const std::string& path, uint64_t size)
+    {
+        ExtensionStat& stat = stats[extensionLabelForPath(path)];
+        stat.files++;
+        stat.bytes += size;
+    }
+
+    static ExtensionStats collectExtensionStats(const std::vector<FileEntry>& refs)
+    {
+        ExtensionStats stats;
+        for (const auto& ref : refs)
+        {
+            addExtensionStat(stats, ref.path, ref.size);
+        }
+        return stats;
+    }
+
+    static void mergeExtensionStats(ExtensionStats& target, const ExtensionStats& source)
+    {
+        for (const auto& [extension, stat] : source)
+        {
+            ExtensionStat& targetStat = target[extension];
+            targetStat.files += stat.files;
+            targetStat.bytes += stat.bytes;
+        }
+    }
+
+    static void printExtensionStats(const ExtensionStats& stats)
+    {
+        if (!clVerbose)
+        {
+            return;
+        }
+
+        std::cout << "extension-stats:\n";
+        if (stats.empty())
+        {
+            std::cout << "  (none)\n";
+            return;
+        }
+
+        size_t extensionWidth = 0;
+        size_t filesWidth = 0;
+        size_t bytesWidth = 0;
+        std::map<std::string, std::string> bytesStrings;
+        for (const auto& [extension, stat] : stats)
+        {
+            extensionWidth = std::max(extensionWidth, extension.size());
+            filesWidth = std::max(filesWidth, formatCountInt(stat.files).size());
+            std::string bytes = ut1::getApproxSizeStr(stat.bytes, 3, true, false);
+            bytesWidth = std::max(bytesWidth, bytes.size());
+            bytesStrings.emplace(extension, std::move(bytes));
+        }
+
+        for (const auto& [extension, stat] : stats)
+        {
+            std::cout << "  " << std::left << std::setw(static_cast<int>(extensionWidth)) << extension
+                      << std::right << ": "
+                      << std::setw(static_cast<int>(filesWidth)) << formatCountInt(stat.files) << " files, "
+                      << std::setw(static_cast<int>(bytesWidth)) << bytesStrings.at(extension) << "\n";
+        }
     }
 
     /// Print aligned statistics lines.
@@ -3187,6 +3297,7 @@ private:
                         }
                         stats.files++;
                         stats.bytes += ref.size;
+                        addExtensionStat(stats.extensions, ref.path, ref.size);
                         if (dryRun)
                         {
                             continue;

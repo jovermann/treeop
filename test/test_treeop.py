@@ -869,6 +869,29 @@ def test_remove_copies_dry_run(tmp_path: Path):
     assert re.search(r"removed-files:\s+1", out)
 
 
+def test_remove_copies_verbose_prints_extension_stats(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "same.txt", "hello")
+    write_file(dir_b / "same.txt", "hello")
+    write_file(dir_a / "same.jpg", "image")
+    write_file(dir_b / "same.jpg", "image")
+
+    out = run_treeop(["--intersect", "--remove-copies", "--dry-run", "-v", str(dir_a), str(dir_b)], root)
+
+    assert "extension-stats:" in out
+    assert re.search(r"\.txt\s*:\s*1 files,\s*5 bytes", out)
+    assert re.search(r"\.jpg\s*:\s*1 files,\s*5 bytes", out)
+
+
 def test_remove_copies_actual(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
@@ -1061,6 +1084,27 @@ def test_list_files_only_and_exclude_filters_filename(tmp_path: Path):
     assert "nested.png" in out
     assert "note.txt" not in out
     assert "photo.jpg~" not in out
+
+
+def test_list_files_verbose_prints_extension_stats(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "one.txt", "abc")
+    write_file(dir_a / "two.txt", "defg")
+    write_file(dir_a / "image.jpg", "jpeg")
+    write_file(dir_a / "README", "plain")
+
+    out = run_treeop(["--list-files", "-v", str(dir_a)], root)
+
+    assert "extension-stats:" in out
+    assert re.search(r"\.txt\s*:\s*2 files,\s*7 bytes", out)
+    assert re.search(r"\.jpg\s*:\s*1 files,\s*4 bytes", out)
+    assert re.search(r"\(none\)\s*:\s*1 files,\s*5 bytes", out)
 
 
 def test_list_files_ionly_and_iexclude_filters_case_insensitively(tmp_path: Path):
