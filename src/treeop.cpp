@@ -554,6 +554,7 @@ public:
             processDirTree(rootData.path, forceCreate, update);
             rootData.elapsedSeconds = ut1::getTimeSec() - start;
         }
+        uniqueHashHexLen = computeUniqueHashHexLen();
     }
 
     /// Print per-root statistics.
@@ -3469,8 +3470,15 @@ private:
         }
     }
 
-    /// Compute the minimal hex prefix length to distinguish all hashes.
+    /// Return the cached minimal hex prefix length to distinguish all hashes.
     size_t getUniqueHashHexLen() const
+    {
+        assert(uniqueHashHexLen != 0);
+        return uniqueHashHexLen;
+    }
+
+    /// Compute the minimal hex prefix length to distinguish all hashes.
+    size_t computeUniqueHashHexLen() const
     {
         std::vector<Hash128> hashes;
         for (const auto& dir : dirs)
@@ -3683,6 +3691,7 @@ private:
 
     std::vector<RootData> roots;
     std::vector<DirDbData> dirs;
+    size_t uniqueHashHexLen = 0;
     bool sameFilename{};
 };
 
