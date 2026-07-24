@@ -4,13 +4,24 @@
 # (See accompanying file LICENSE or copy at https://www.boost.org/LICENSE_1_0.txt)
 
 WARNING_FLAGS ?= -Weverything -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-padded -Wno-shorten-64-to-32 -Wno-missing-prototypes -Wno-sign-conversion -Wno-implicit-int-conversion -Wno-poison-system-directories -fcomment-block-commands=n -Wno-string-conversion -Wno-covered-switch-default -Wno-unsafe-buffer-usage -Wno-implicit-int-float-conversion -Wno-extra-semi-stmt
-CXXFLAGS ?= -O3 -Wall
 CPPFLAGS ?= -pedantic
 CXXSTD ?= -std=c++23 # C++23 for ranges
+BUILD ?= release
+CXXFLAGS_COMMON ?= -Wall
+CXXFLAGS_DEBUG ?= -O0 -g
+CXXFLAGS_RELEASE ?= -O3 -DNDEBUG
 PYTEST ?= pytest-3
 
-BUILDDIR=build
-UNIT_TEST_BUILDDIR=build-unit-test
+ifeq ($(BUILD),debug)
+CXXFLAGS ?= $(CXXFLAGS_COMMON) $(CXXFLAGS_DEBUG)
+else ifeq ($(BUILD),release)
+CXXFLAGS ?= $(CXXFLAGS_COMMON) $(CXXFLAGS_RELEASE)
+else
+$(error Unknown BUILD='$(BUILD)', expected debug or release)
+endif
+
+BUILDDIR=build-$(BUILD)
+UNIT_TEST_BUILDDIR=build-unit-test-$(BUILD)
 SOURCES = $(wildcard src/*.cpp)
 OBJECTS = $(SOURCES:%.cpp=$(BUILDDIR)/%.o)
 DEPENDS := $(SOURCES:%.cpp=$(BUILDDIR)/%.d)
@@ -24,15 +35,15 @@ $(TARGET): $(OBJECTS)
 	$(CXX) $^ -o $@
 	@echo "Done."
 
-build/%.o: %.cpp build/%.d
+$(BUILDDIR)/%.o: %.cpp $(BUILDDIR)/%.d
 	$(CXX) $(CXXSTD) $(CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
-build/%.d: %.cpp Makefile
+$(BUILDDIR)/%.d: %.cpp Makefile
 	@mkdir -p $(@D)
 	$(CXX) $(CXXSTD) $(CPPFLAGS) -MM -MQ $@ $< -o $@
 
 clean:
-	rm -rf build $(UNIT_TEST_BUILDDIR) $(TARGET) unit_test
+	rm -rf build build-* build-unit-test $(TARGET) unit_test
 	find . -name '*~' -delete
 
 uint_test: clean
@@ -52,7 +63,7 @@ test: $(TARGET)
 
 warnings:
 	$(MAKE) clean
-	$(MAKE) CXXFLAGS="-O3 $(WARNING_FLAGS)" $(TARGET)
+	$(MAKE) CXXFLAGS="$(CXXFLAGS_RELEASE) $(WARNING_FLAGS)" $(TARGET)
 
 .PHONY: clean default unit_test test warnings
 
