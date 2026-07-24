@@ -6,6 +6,14 @@
 WARNING_FLAGS ?= -Weverything -Wno-c++98-compat -Wno-c++98-compat-pedantic -Wno-padded -Wno-shorten-64-to-32 -Wno-missing-prototypes -Wno-sign-conversion -Wno-implicit-int-conversion -Wno-poison-system-directories -fcomment-block-commands=n -Wno-string-conversion -Wno-covered-switch-default -Wno-unsafe-buffer-usage -Wno-implicit-int-float-conversion -Wno-extra-semi-stmt
 CPPFLAGS ?= -pedantic
 CXXSTD ?= -std=c++23 # C++23 for ranges
+UNAME_S := $(shell uname -s)
+ifeq ($(origin CXX),default)
+ifeq ($(UNAME_S),Linux)
+CXX = clang++-18
+else
+CXX = g++
+endif
+endif
 BUILD ?= release
 CXXFLAGS_COMMON ?= -Wall
 CXXFLAGS_DEBUG ?= -O0 -g
