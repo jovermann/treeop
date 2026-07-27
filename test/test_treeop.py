@@ -1,5 +1,7 @@
 import os
+import pty
 import re
+import select
 import subprocess
 import time
 from pathlib import Path
@@ -45,6 +47,59 @@ def run_treeop_result(args, cwd: Path):
         capture_output=True,
         check=False,
     )
+
+
+def run_treeop_pty(args, cwd: Path, input_after_title: bytes):
+    bin_path = treeop_bin()
+    if "TREEOP_BIN" not in os.environ:
+        subprocess.run(["make"], cwd=cwd, check=True, capture_output=True, text=True)
+    if not bin_path.exists():
+        subprocess.run(["make"], cwd=cwd, check=True, capture_output=True, text=True)
+        if not bin_path.exists():
+            raise FileNotFoundError(f"treeop binary not found after make: {bin_path}")
+
+    master_fd, slave_fd = pty.openpty()
+    proc = subprocess.Popen(
+        [str(bin_path)] + args,
+        cwd=cwd,
+        stdin=slave_fd,
+        stdout=slave_fd,
+        stderr=slave_fd,
+        close_fds=True,
+    )
+    os.close(slave_fd)
+    out = bytearray()
+    sent = False
+    deadline = time.time() + 10
+    try:
+        while time.time() < deadline:
+            ready, _, _ = select.select([master_fd], [], [], 0.1)
+            if ready:
+                try:
+                    chunk = os.read(master_fd, 4096)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                out.extend(chunk)
+                if (not sent) and b"treeop interactive remove-dir-internal-copies" in out:
+                    os.write(master_fd, input_after_title)
+                    sent = True
+            if proc.poll() is not None:
+                break
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+            raise TimeoutError(bytes(out).decode("utf-8", errors="replace"))
+        if proc.returncode != 0:
+            raise subprocess.CalledProcessError(
+                proc.returncode,
+                [str(bin_path)] + args,
+                output=bytes(out).decode("utf-8", errors="replace"),
+            )
+        return bytes(out).decode("utf-8", errors="replace")
+    finally:
+        os.close(master_fd)
 
 
 def write_file(path: Path, content: str):
@@ -710,6 +765,49 @@ def test_remove_dir_internal_copies_actual(tmp_path: Path):
     assert re.search(r"removed-files:\s+1", out)
     assert old.exists()
     assert not new.exists()
+
+
+def test_remove_dir_internal_copies_interactive_dry_run(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    old = dir_a / "dupdir" / "old.txt"
+    new = dir_a / "dupdir" / "new.txt"
+    write_file(old, "x" * 1234)
+    write_file(new, "x" * 1234)
+    os.utime(old, (1000, 1000))
+    os.utime(new, (2000, 2000))
+
+    out = run_treeop_pty(
+        ["--remove-dir-internal-copies", "--interactive", "--dry-run", str(dir_a)],
+        root,
+        b"tt\033[Brq",
+    )
+
+    assert "treeop interactive remove-dir-internal-copies (dry-run)" in out
+    assert "  Group  Hash      Size            Date                 File" in out
+    assert "1_234" in out
+    assert "\x1b[37m  Group" in out
+    assert "\x1b[32m" in out
+    assert "\x1b[44;37m" in out
+    assert "\x1b[41;37m" in out
+    assert "\x1b[46;30m" in out
+    assert "1970-01-01 00:33:20" in out
+    assert "redundant-files: 2  redundant-bytes: 2_468" in out
+    assert "redundant-files: 0  redundant-bytes: 0" in out
+    assert "40;30" in out
+    assert "107;97" in out
+    assert "color matrix: t returns to file list, q quits" in out
+    assert f"Would remove {new}" in out
+    assert "No redundant files remain." in out
+    assert "remove-dir-internal-copies:" in out
+    assert re.search(r"removed-files:\s+1", out)
+    assert old.exists()
+    assert new.exists()
 
 
 def test_remove_dir_internal_copies_runs_before_overlap_remove_copies(tmp_path: Path):

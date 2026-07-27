@@ -81,6 +81,7 @@ Options:
                            Delete duplicate files within each directory independently, keeping the
                            oldest file.
   -d --dry-run             Show what would change, but do not modify files.
+  -i --interactive         Open an interactive TUI for --remove-dir-internal-copies.
      --new-dirdb           Force creation of new .dirdb files (overwrite existing).
   -u --update-dirdb        Update .dirdb files, reusing hashes when inode/size/mtime match.
      --remove-dirdb        Recursively remove all .dirdb files under specified dirs.

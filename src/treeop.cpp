@@ -31,6 +31,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <fnmatch.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+#include <unistd.h>
 
 static unsigned clVerbose = 0;
 
@@ -502,6 +505,107 @@ static DirDbData updateDirDb(const fs::path& dirPath);
 static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool dryRun);
 /// Check whether a directory is empty aside from an optional .dirdb file.
 static bool isDirEmpty(const fs::path& dir, bool& hasDirDb);
+
+class TerminalRawMode
+{
+public:
+    explicit TerminalRawMode(int fd_)
+        : fd(fd_)
+    {
+        if (!isatty(fd))
+        {
+            throw std::runtime_error("--interactive requires a terminal.");
+        }
+        if (tcgetattr(fd, &oldTermios) != 0)
+        {
+            throw std::runtime_error("Failed to read terminal settings.");
+        }
+        termios raw = oldTermios;
+        raw.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
+        raw.c_cc[VMIN] = 1;
+        raw.c_cc[VTIME] = 0;
+        if (tcsetattr(fd, TCSAFLUSH, &raw) != 0)
+        {
+            throw std::runtime_error("Failed to enable terminal raw mode.");
+        }
+        enabled = true;
+    }
+
+    ~TerminalRawMode()
+    {
+        std::cout << "\033[?25h";
+        std::cout.flush();
+        if (enabled)
+        {
+            tcsetattr(fd, TCSAFLUSH, &oldTermios);
+        }
+    }
+
+    TerminalRawMode(const TerminalRawMode&) = delete;
+    TerminalRawMode& operator=(const TerminalRawMode&) = delete;
+
+private:
+    int fd = -1;
+    termios oldTermios{};
+    bool enabled = false;
+};
+
+static size_t terminalHeight()
+{
+    winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
+    {
+        return ws.ws_row;
+    }
+    return 24;
+}
+
+static size_t terminalWidth()
+{
+    winsize ws{};
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+    {
+        return ws.ws_col;
+    }
+    return 120;
+}
+
+static std::string fitTerminalLine(const std::string& line, size_t width)
+{
+    if (width == 0 || line.size() <= width)
+    {
+        return line;
+    }
+    if (width <= 3)
+    {
+        return line.substr(0, width);
+    }
+    return line.substr(0, width - 3) + "...";
+}
+
+static std::string formatU64WithUnderscores(uint64_t value)
+{
+    std::string digits = std::to_string(value);
+    std::string out;
+    out.reserve(digits.size() + digits.size() / 3);
+    for (size_t i = 0; i < digits.size(); i++)
+    {
+        if (i > 0 && (digits.size() - i) % 3 == 0)
+        {
+            out.push_back('_');
+        }
+        out.push_back(digits[i]);
+    }
+    return out;
+}
+
+static constexpr const char* kAnsiReset = "\033[0m";
+static constexpr const char* kAnsiGray = "\033[90m";
+static constexpr const char* kAnsiWhite = "\033[37m";
+static constexpr const char* kAnsiGreen = "\033[32m";
+static constexpr const char* kAnsiSelected = "\033[44;37m";
+static constexpr const char* kAnsiTitleBar = "\033[41;37m";
+static constexpr const char* kAnsiStatusBar = "\033[46;30m";
 
 class MainDb
 {
@@ -1796,6 +1900,387 @@ public:
                 dir.files.erase(newEnd, dir.files.end());
             }
         }
+
+        if (!dryRun)
+        {
+            for (auto& dir : dirs)
+            {
+                if (touchedDirs.find(dir.path) != touchedDirs.end() && ut1::fsExists(dir.path / ".dirdb"))
+                {
+                    dir = updateDirDb(dir.path);
+                }
+            }
+        }
+
+        return stats;
+    }
+
+    /// Interactively remove duplicate files within each directory.
+    RemoveCopyStats removeDirInternalCopiesInteractive(const std::vector<fs::path>& rootPaths, const FileFilter& filter, bool dryRun)
+    {
+        struct InteractiveEntry
+        {
+            size_t dirIndex{};
+            std::string relPath;
+            fs::path fullPath;
+            FileEntry file;
+            size_t groupIndex{};
+            bool oldest{};
+            std::string hash;
+        };
+
+        auto collectEntries = [&]() {
+            struct PendingGroup
+            {
+                std::vector<InteractiveEntry> entries;
+                std::string firstPath;
+            };
+
+            std::vector<PendingGroup> pendingGroups;
+            size_t groupIndex = 0;
+            for (size_t dirIndex = 0; dirIndex < dirs.size(); dirIndex++)
+            {
+                auto& dir = dirs[dirIndex];
+                bool inAnyRoot = false;
+                for (const auto& rootPath : rootPaths)
+                {
+                    if (isPathWithin(rootPath, dir.path))
+                    {
+                        inAnyRoot = true;
+                        break;
+                    }
+                }
+                if (!inAnyRoot)
+                {
+                    continue;
+                }
+
+                std::map<ContentKey, std::vector<const FileEntry*>> groups;
+                for (const auto& file : dir.files)
+                {
+                    if (!filter.matches(file))
+                    {
+                        continue;
+                    }
+                    groups[contentKeyForFile(file)].push_back(&file);
+                }
+
+                for (const auto& [key, refs] : groups)
+                {
+                    if (refs.size() < 2)
+                    {
+                        continue;
+                    }
+                    auto oldestIt = std::min_element(refs.begin(), refs.end(),
+                        [](const FileEntry* lhs, const FileEntry* rhs)
+                        {
+                            if (lhs->date != rhs->date)
+                            {
+                                return lhs->date < rhs->date;
+                            }
+                            return lhs->path < rhs->path;
+                        });
+                    if (oldestIt == refs.end())
+                    {
+                        continue;
+                    }
+
+                    std::vector<const FileEntry*> sortedRefs = refs;
+                    std::sort(sortedRefs.begin(), sortedRefs.end(),
+                        [](const FileEntry* lhs, const FileEntry* rhs)
+                        {
+                            if (lhs->date != rhs->date)
+                            {
+                                return lhs->date < rhs->date;
+                            }
+                            return lhs->path < rhs->path;
+                        });
+
+                    PendingGroup pending;
+                    pending.firstPath = (dir.path / sortedRefs.front()->path).string();
+                    std::string hashHex = key.hash.toHex();
+                    size_t hashLen = getUniqueHashHexLen();
+                    std::string shortHash = hashHex.substr(0, std::min(hashLen, hashHex.size()));
+                    for (const FileEntry* ref : sortedRefs)
+                    {
+                        pending.entries.push_back(InteractiveEntry{
+                            dirIndex,
+                            ref->path,
+                            dir.path / ref->path,
+                            *ref,
+                            groupIndex,
+                            ref == *oldestIt,
+                            shortHash
+                        });
+                    }
+                    pendingGroups.push_back(std::move(pending));
+                    groupIndex++;
+                }
+            }
+
+            std::sort(pendingGroups.begin(), pendingGroups.end(),
+                [](const PendingGroup& lhs, const PendingGroup& rhs)
+                {
+                    return lhs.firstPath < rhs.firstPath;
+                });
+
+            std::vector<InteractiveEntry> entries;
+            for (const auto& group : pendingGroups)
+            {
+                entries.insert(entries.end(), group.entries.begin(), group.entries.end());
+            }
+            return entries;
+        };
+
+        auto eraseInMemory = [&](size_t dirIndex, const std::string& relPath) {
+            auto& files = dirs[dirIndex].files;
+            auto newEnd = std::remove_if(files.begin(), files.end(),
+                [&](const FileEntry& file)
+                {
+                    return file.path == relPath;
+                });
+            files.erase(newEnd, files.end());
+        };
+
+        enum class Key
+        {
+            Other,
+            Up,
+            Down,
+            Remove,
+            ToggleColors,
+            Quit
+        };
+
+        auto readKey = []() {
+            char c = 0;
+            if (read(STDIN_FILENO, &c, 1) != 1)
+            {
+                return Key::Quit;
+            }
+            if (c == 'q' || c == 'Q' || c == 3)
+            {
+                return Key::Quit;
+            }
+            if (c == 'r' || c == 'R')
+            {
+                return Key::Remove;
+            }
+            if (c == 't' || c == 'T')
+            {
+                return Key::ToggleColors;
+            }
+            if (c == '\033')
+            {
+                char seq[2]{};
+                if (read(STDIN_FILENO, &seq[0], 1) != 1 || read(STDIN_FILENO, &seq[1], 1) != 1)
+                {
+                    return Key::Other;
+                }
+                if (seq[0] == '[' && seq[1] == 'A')
+                {
+                    return Key::Up;
+                }
+                if (seq[0] == '[' && seq[1] == 'B')
+                {
+                    return Key::Down;
+                }
+                return Key::Other;
+            }
+            if (c == 'k')
+            {
+                return Key::Up;
+            }
+            if (c == 'j')
+            {
+                return Key::Down;
+            }
+            return Key::Other;
+        };
+
+        TerminalRawMode rawMode(STDIN_FILENO);
+        RemoveCopyStats stats;
+        std::set<fs::path> touchedDirs;
+        std::vector<InteractiveEntry> entries = collectEntries();
+        size_t selected = 0;
+        size_t scroll = 0;
+        bool showColorMatrix = false;
+        std::string status = dryRun ? "dry-run: r previews removal, q quits" : "r removes selected file, q quits";
+
+        auto formatRedundantStatus = [&]() {
+            uint64_t redundantBytes = 0;
+            for (const auto& entry : entries)
+            {
+                redundantBytes += entry.file.size;
+            }
+            return "redundant-files: " + formatU64WithUnderscores(entries.size())
+                + "  redundant-bytes: " + formatU64WithUnderscores(redundantBytes);
+        };
+
+        auto formatMetaColumns = [](const InteractiveEntry& entry) {
+            std::string date = formatFileTime(entry.file.date).substr(0, 19);
+            std::ostringstream meta;
+            meta << std::setw(5) << (entry.groupIndex + 1) << "  "
+                 << std::left << std::setw(8) << entry.hash << std::right << "  "
+                 << std::setw(14) << formatU64WithUnderscores(entry.file.size) << "  "
+                 << date << "  ";
+            return meta.str();
+        };
+
+        auto render = [&]() {
+            size_t height = terminalHeight();
+            size_t width = terminalWidth();
+            size_t listHeight = height > 6 ? height - 6 : 1;
+            if (selected < scroll)
+            {
+                scroll = selected;
+            }
+            if (selected >= scroll + listHeight)
+            {
+                scroll = selected - listHeight + 1;
+            }
+
+            std::cout << "\033[?25l\033[2J\033[H";
+            std::string title = "treeop interactive remove-dir-internal-copies";
+            if (dryRun)
+            {
+                title += " (dry-run)";
+            }
+            std::cout << kAnsiTitleBar << fitTerminalLine(title, width) << kAnsiReset << "\n";
+            std::cout << kAnsiGray << "Up/Down: move  r: remove  t: colors  q: quit" << kAnsiReset << "\n";
+            if (showColorMatrix)
+            {
+                const std::vector<int> foregrounds = {30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97};
+                const std::vector<int> backgrounds = {40, 41, 42, 43, 44, 45, 46, 47, 100, 101, 102, 103, 104, 105, 106, 107};
+                size_t printedRows = 0;
+                for (int bg : backgrounds)
+                {
+                    if (printedRows >= listHeight + 1)
+                    {
+                        break;
+                    }
+                    std::ostringstream row;
+                    row << "bg " << bg << " ";
+                    std::cout << kAnsiGray << fitTerminalLine(row.str(), width) << kAnsiReset;
+                    for (int fg : foregrounds)
+                    {
+                        std::string cell = std::to_string(bg) + ";" + std::to_string(fg);
+                        std::cout << "\033[" << bg << ";" << fg << "m" << std::setw(8) << cell << kAnsiReset;
+                    }
+                    std::cout << "\n";
+                    printedRows++;
+                }
+                std::cout << kAnsiStatusBar << fitTerminalLine(formatRedundantStatus(), width) << kAnsiReset << "\n";
+                std::cout << kAnsiStatusBar << fitTerminalLine(status, width) << kAnsiReset << "\n";
+                std::cout.flush();
+                return;
+            }
+            if (entries.empty())
+            {
+                std::cout << "\n" << kAnsiGray << "No redundant files remain.\n";
+                std::cout << kAnsiStatusBar << fitTerminalLine(formatRedundantStatus(), width) << kAnsiReset << "\n";
+                std::cout << kAnsiStatusBar << fitTerminalLine(status, width) << kAnsiReset << "\n";
+                std::cout.flush();
+                return;
+            }
+
+            const std::string header = fitTerminalLine("  Group  Hash      Size            Date                 File", width);
+            std::cout << kAnsiWhite << header << kAnsiReset << "\n";
+            for (size_t row = 0; row < listHeight && scroll + row < entries.size(); row++)
+            {
+                const auto& entry = entries[scroll + row];
+                const bool isSelected = scroll + row == selected;
+                const std::string prefix = isSelected ? "> " : "  ";
+                const std::string meta = formatMetaColumns(entry);
+                const size_t visiblePrefix = prefix.size() + meta.size();
+                const size_t filenameWidth = width > visiblePrefix ? width - visiblePrefix : 0;
+                const std::string filename = fitTerminalLine(entry.fullPath.string(), filenameWidth);
+                if (isSelected)
+                {
+                    std::cout << kAnsiSelected << prefix << meta << filename << kAnsiReset << "\n";
+                }
+                else
+                {
+                    std::cout << kAnsiGray << prefix << meta << kAnsiGreen << filename << kAnsiReset << "\n";
+                }
+            }
+            std::cout << kAnsiStatusBar << fitTerminalLine(formatRedundantStatus(), width) << kAnsiReset << "\n";
+            std::cout << kAnsiStatusBar << fitTerminalLine(status, width) << kAnsiReset << "\n";
+            std::cout.flush();
+        };
+
+        while (true)
+        {
+            if (selected >= entries.size() && !entries.empty())
+            {
+                selected = entries.size() - 1;
+            }
+            render();
+            Key key = readKey();
+            if (key == Key::Quit)
+            {
+                break;
+            }
+            if (key == Key::ToggleColors)
+            {
+                showColorMatrix = !showColorMatrix;
+                status = showColorMatrix ? "color matrix: t returns to file list, q quits" : "returned to file list";
+                continue;
+            }
+            if (entries.empty())
+            {
+                continue;
+            }
+            if (key == Key::Up)
+            {
+                if (selected > 0)
+                {
+                    selected--;
+                }
+                continue;
+            }
+            if (key == Key::Down)
+            {
+                if (selected + 1 < entries.size())
+                {
+                    selected++;
+                }
+                continue;
+            }
+            if (key == Key::Remove)
+            {
+                const InteractiveEntry entry = entries[selected];
+                if (dryRun)
+                {
+                    status = "Would remove " + entry.fullPath.string();
+                }
+                else
+                {
+                    std::error_code ec;
+                    fs::remove(entry.fullPath, ec);
+                    if (ec)
+                    {
+                        status = "Warning: failed to remove " + entry.fullPath.string();
+                        continue;
+                    }
+                    touchedDirs.insert(dirs[entry.dirIndex].path);
+                    status = "Removed " + entry.fullPath.string();
+                }
+
+                stats.files++;
+                stats.bytes += entry.file.size;
+                addExtensionStat(stats.extensions, entry.fullPath.string(), entry.file.size);
+                eraseInMemory(entry.dirIndex, entry.relPath);
+                entries = collectEntries();
+                if (selected >= entries.size() && selected > 0)
+                {
+                    selected--;
+                }
+            }
+        }
+
+        std::cout << "\033[?25h\033[2J\033[H";
+        std::cout.flush();
 
         if (!dryRun)
         {
@@ -4605,7 +5090,7 @@ int main(int argc, char *argv[])
         "0.2.1");
 
     cl.addHeader("\nAnalysis operations:\n");
-    cl.addOption('i', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
+    cl.addOption(' ', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
     cl.addOption('c', "containment", "Show how much of the last dir is contained in the previous dirs.");
     cl.addOption(' ', "find-overlapping-dirs", "Find and rank overlapping directory pairs within the specified trees.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
@@ -4661,6 +5146,7 @@ int main(int argc, char *argv[])
 
     cl.addHeader("\nGeneral:\n");
     cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
+    cl.addOption('i', "interactive", "Open an interactive TUI for --remove-dir-internal-copies.");
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
     cl.addOption(' ', "top", "Maximum number of overlapping directory pairs to print (with --find-overlapping-dirs).", "N", "0");
     cl.addOption('p', "progress", "Print progress once per second.");
@@ -4800,6 +5286,10 @@ int main(int argc, char *argv[])
         {
             cl.error("Cannot combine --remove-copies with --remove-copies-from-last.");
         }
+        if (cl("interactive") && !cl("remove-dir-internal-copies"))
+        {
+            cl.error("--interactive requires --remove-dir-internal-copies.");
+        }
         if (cl("containment") && cl("intersect"))
         {
             cl.error("Cannot combine --containment with --intersect.");
@@ -4877,7 +5367,9 @@ int main(int argc, char *argv[])
 
             if (cl("remove-dir-internal-copies"))
             {
-                auto stats = mainDb.removeDirInternalCopies(normalizedRoots, fileFilter, cl("dry-run"));
+                auto stats = cl("interactive")
+                    ? mainDb.removeDirInternalCopiesInteractive(normalizedRoots, fileFilter, cl("dry-run"))
+                    : mainDb.removeDirInternalCopies(normalizedRoots, fileFilter, cl("dry-run"));
                 std::cout << "remove-dir-internal-copies:\n";
                 mainDb.printRemoveCopyStats(stats);
             }
