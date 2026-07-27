@@ -8,6 +8,7 @@
 #include "MiscUtils.hpp"
 #include "UnitTest.hpp"
 #include "CommandLineParser.hpp"
+#include "Tui.hpp"
 #include "Hash.hpp"
 #include "HashSha3.hpp"
 #include <exception>
@@ -31,9 +32,6 @@
 #include <algorithm>
 #include <cstdint>
 #include <fnmatch.h>
-#include <sys/ioctl.h>
-#include <termios.h>
-#include <unistd.h>
 
 static unsigned clVerbose = 0;
 
@@ -506,106 +504,9 @@ static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool
 /// Check whether a directory is empty aside from an optional .dirdb file.
 static bool isDirEmpty(const fs::path& dir, bool& hasDirDb);
 
-class TerminalRawMode
-{
-public:
-    explicit TerminalRawMode(int fd_)
-        : fd(fd_)
-    {
-        if (!isatty(fd))
-        {
-            throw std::runtime_error("--interactive requires a terminal.");
-        }
-        if (tcgetattr(fd, &oldTermios) != 0)
-        {
-            throw std::runtime_error("Failed to read terminal settings.");
-        }
-        termios raw = oldTermios;
-        raw.c_lflag &= static_cast<tcflag_t>(~(ICANON | ECHO));
-        raw.c_cc[VMIN] = 1;
-        raw.c_cc[VTIME] = 0;
-        if (tcsetattr(fd, TCSAFLUSH, &raw) != 0)
-        {
-            throw std::runtime_error("Failed to enable terminal raw mode.");
-        }
-        enabled = true;
-    }
-
-    ~TerminalRawMode()
-    {
-        std::cout << "\033[?25h";
-        std::cout.flush();
-        if (enabled)
-        {
-            tcsetattr(fd, TCSAFLUSH, &oldTermios);
-        }
-    }
-
-    TerminalRawMode(const TerminalRawMode&) = delete;
-    TerminalRawMode& operator=(const TerminalRawMode&) = delete;
-
-private:
-    int fd = -1;
-    termios oldTermios{};
-    bool enabled = false;
-};
-
-static size_t terminalHeight()
-{
-    winsize ws{};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_row > 0)
-    {
-        return ws.ws_row;
-    }
-    return 24;
-}
-
-static size_t terminalWidth()
-{
-    winsize ws{};
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
-    {
-        return ws.ws_col;
-    }
-    return 120;
-}
-
-static std::string fitTerminalLine(const std::string& line, size_t width)
-{
-    if (width == 0 || line.size() <= width)
-    {
-        return line;
-    }
-    if (width <= 3)
-    {
-        return line.substr(0, width);
-    }
-    return line.substr(0, width - 3) + "...";
-}
-
-static std::string formatU64WithUnderscores(uint64_t value)
-{
-    std::string digits = std::to_string(value);
-    std::string out;
-    out.reserve(digits.size() + digits.size() / 3);
-    for (size_t i = 0; i < digits.size(); i++)
-    {
-        if (i > 0 && (digits.size() - i) % 3 == 0)
-        {
-            out.push_back('_');
-        }
-        out.push_back(digits[i]);
-    }
-    return out;
-}
-
-static constexpr const char* kAnsiReset = "\033[0m";
-static constexpr const char* kAnsiGray = "\033[90m";
-static constexpr const char* kAnsiWhite = "\033[37m";
-static constexpr const char* kAnsiGreen = "\033[32m";
-static constexpr const char* kAnsiSelected = "\033[44;37m";
-static constexpr const char* kAnsiTitleBar = "\033[41;37m";
-static constexpr const char* kAnsiStatusBar = "\033[46;30m";
+static const char* const ansiSelected = ut1::tui::ansiWhiteOnBlue;
+static const char* const ansiTitleBar = ut1::tui::ansiWhiteOnRed;
+static const char* const ansiStatusBar = ut1::tui::ansiBlackOnCyan;
 
 class MainDb
 {
@@ -2047,17 +1948,20 @@ public:
             Other,
             Up,
             Down,
+            PageUp,
+            PageDown,
             Remove,
             ToggleColors,
             Quit
         };
 
         auto readKey = []() {
-            char c = 0;
-            if (read(STDIN_FILENO, &c, 1) != 1)
+            int byte = ut1::tui::readStdinByte();
+            if (byte < 0)
             {
                 return Key::Quit;
             }
+            char c = static_cast<char>(byte);
             if (c == 'q' || c == 'Q' || c == 3)
             {
                 return Key::Quit;
@@ -2073,10 +1977,14 @@ public:
             if (c == '\033')
             {
                 char seq[2]{};
-                if (read(STDIN_FILENO, &seq[0], 1) != 1 || read(STDIN_FILENO, &seq[1], 1) != 1)
+                int first = ut1::tui::readStdinByte();
+                int second = ut1::tui::readStdinByte();
+                if (first < 0 || second < 0)
                 {
                     return Key::Other;
                 }
+                seq[0] = static_cast<char>(first);
+                seq[1] = static_cast<char>(second);
                 if (seq[0] == '[' && seq[1] == 'A')
                 {
                     return Key::Up;
@@ -2084,6 +1992,14 @@ public:
                 if (seq[0] == '[' && seq[1] == 'B')
                 {
                     return Key::Down;
+                }
+                if (seq[0] == '[' && (seq[1] == '5' || seq[1] == '6'))
+                {
+                    int third = ut1::tui::readStdinByte();
+                    if (third == '~')
+                    {
+                        return seq[1] == '5' ? Key::PageUp : Key::PageDown;
+                    }
                 }
                 return Key::Other;
             }
@@ -2098,7 +2014,7 @@ public:
             return Key::Other;
         };
 
-        TerminalRawMode rawMode(STDIN_FILENO);
+        ut1::tui::TerminalRawMode rawMode(0);
         RemoveCopyStats stats;
         std::set<fs::path> touchedDirs;
         std::vector<InteractiveEntry> entries = collectEntries();
@@ -2107,14 +2023,23 @@ public:
         bool showColorMatrix = false;
         std::string status = dryRun ? "dry-run: r previews removal, q quits" : "r removes selected file, q quits";
 
+        auto visibleListHeight = []() {
+            size_t height = ut1::tui::terminalHeight();
+            return height > 6 ? height - 6 : size_t(1);
+        };
+
+        auto halfPageStep = [&]() {
+            return std::max<size_t>(1, visibleListHeight() / 2);
+        };
+
         auto formatRedundantStatus = [&]() {
             uint64_t redundantBytes = 0;
             for (const auto& entry : entries)
             {
                 redundantBytes += entry.file.size;
             }
-            return "redundant-files: " + formatU64WithUnderscores(entries.size())
-                + "  redundant-bytes: " + formatU64WithUnderscores(redundantBytes);
+            return "redundant-files: " + ut1::formatU64WithUnderscores(entries.size())
+                + "  redundant-bytes: " + ut1::formatU64WithUnderscores(redundantBytes);
         };
 
         auto formatMetaColumns = [](const InteractiveEntry& entry) {
@@ -2122,15 +2047,14 @@ public:
             std::ostringstream meta;
             meta << std::setw(5) << (entry.groupIndex + 1) << "  "
                  << std::left << std::setw(8) << entry.hash << std::right << "  "
-                 << std::setw(14) << formatU64WithUnderscores(entry.file.size) << "  "
+                 << std::setw(14) << ut1::formatU64WithUnderscores(entry.file.size) << "  "
                  << date << "  ";
             return meta.str();
         };
 
         auto render = [&]() {
-            size_t height = terminalHeight();
-            size_t width = terminalWidth();
-            size_t listHeight = height > 6 ? height - 6 : 1;
+            size_t width = ut1::tui::terminalWidth();
+            size_t listHeight = visibleListHeight();
             if (selected < scroll)
             {
                 scroll = selected;
@@ -2146,46 +2070,27 @@ public:
             {
                 title += " (dry-run)";
             }
-            std::cout << kAnsiTitleBar << fitTerminalLine(title, width) << kAnsiReset << "\n";
-            std::cout << kAnsiGray << "Up/Down: move  r: remove  t: colors  q: quit" << kAnsiReset << "\n";
+            std::cout << ansiTitleBar << ut1::tui::fitTerminalLine(title, width) << ut1::tui::ansiReset << "\n";
+            std::cout << ut1::tui::ansiGray << "Up/Down: move  PgUp/PgDn: page  r: remove  t: colors  q: quit" << ut1::tui::ansiReset << "\n";
             if (showColorMatrix)
             {
-                const std::vector<int> foregrounds = {30, 31, 32, 33, 34, 35, 36, 37, 90, 91, 92, 93, 94, 95, 96, 97};
-                const std::vector<int> backgrounds = {40, 41, 42, 43, 44, 45, 46, 47, 100, 101, 102, 103, 104, 105, 106, 107};
-                size_t printedRows = 0;
-                for (int bg : backgrounds)
-                {
-                    if (printedRows >= listHeight + 1)
-                    {
-                        break;
-                    }
-                    std::ostringstream row;
-                    row << "bg " << bg << " ";
-                    std::cout << kAnsiGray << fitTerminalLine(row.str(), width) << kAnsiReset;
-                    for (int fg : foregrounds)
-                    {
-                        std::string cell = std::to_string(bg) + ";" + std::to_string(fg);
-                        std::cout << "\033[" << bg << ";" << fg << "m" << std::setw(8) << cell << kAnsiReset;
-                    }
-                    std::cout << "\n";
-                    printedRows++;
-                }
-                std::cout << kAnsiStatusBar << fitTerminalLine(formatRedundantStatus(), width) << kAnsiReset << "\n";
-                std::cout << kAnsiStatusBar << fitTerminalLine(status, width) << kAnsiReset << "\n";
+                ut1::tui::printAnsiColorMatrix(std::cout, listHeight + 1);
+                std::cout << ansiStatusBar << ut1::tui::fitTerminalLine(formatRedundantStatus(), width) << ut1::tui::ansiReset << "\n";
+                std::cout << ansiStatusBar << ut1::tui::fitTerminalLine(status, width) << ut1::tui::ansiReset << "\n";
                 std::cout.flush();
                 return;
             }
             if (entries.empty())
             {
-                std::cout << "\n" << kAnsiGray << "No redundant files remain.\n";
-                std::cout << kAnsiStatusBar << fitTerminalLine(formatRedundantStatus(), width) << kAnsiReset << "\n";
-                std::cout << kAnsiStatusBar << fitTerminalLine(status, width) << kAnsiReset << "\n";
+                std::cout << "\n" << ut1::tui::ansiGray << "No redundant files remain.\n";
+                std::cout << ansiStatusBar << ut1::tui::fitTerminalLine(formatRedundantStatus(), width) << ut1::tui::ansiReset << "\n";
+                std::cout << ansiStatusBar << ut1::tui::fitTerminalLine(status, width) << ut1::tui::ansiReset << "\n";
                 std::cout.flush();
                 return;
             }
 
-            const std::string header = fitTerminalLine("  Group  Hash      Size            Date                 File", width);
-            std::cout << kAnsiWhite << header << kAnsiReset << "\n";
+            const std::string header = ut1::tui::fitTerminalLine("  Group  Hash      Size            Date                 File", width);
+            std::cout << ut1::tui::ansiWhite << header << ut1::tui::ansiReset << "\n";
             for (size_t row = 0; row < listHeight && scroll + row < entries.size(); row++)
             {
                 const auto& entry = entries[scroll + row];
@@ -2194,18 +2099,18 @@ public:
                 const std::string meta = formatMetaColumns(entry);
                 const size_t visiblePrefix = prefix.size() + meta.size();
                 const size_t filenameWidth = width > visiblePrefix ? width - visiblePrefix : 0;
-                const std::string filename = fitTerminalLine(entry.fullPath.string(), filenameWidth);
+                const std::string filename = ut1::tui::fitTerminalLine(entry.fullPath.string(), filenameWidth);
                 if (isSelected)
                 {
-                    std::cout << kAnsiSelected << prefix << meta << filename << kAnsiReset << "\n";
+                    std::cout << ansiSelected << prefix << meta << filename << ut1::tui::ansiReset << "\n";
                 }
                 else
                 {
-                    std::cout << kAnsiGray << prefix << meta << kAnsiGreen << filename << kAnsiReset << "\n";
+                    std::cout << ut1::tui::ansiGray << prefix << meta << ut1::tui::ansiGreen << filename << ut1::tui::ansiReset << "\n";
                 }
             }
-            std::cout << kAnsiStatusBar << fitTerminalLine(formatRedundantStatus(), width) << kAnsiReset << "\n";
-            std::cout << kAnsiStatusBar << fitTerminalLine(status, width) << kAnsiReset << "\n";
+            std::cout << ansiStatusBar << ut1::tui::fitTerminalLine(formatRedundantStatus(), width) << ut1::tui::ansiReset << "\n";
+            std::cout << ansiStatusBar << ut1::tui::fitTerminalLine(status, width) << ut1::tui::ansiReset << "\n";
             std::cout.flush();
         };
 
@@ -2245,6 +2150,18 @@ public:
                 {
                     selected++;
                 }
+                continue;
+            }
+            if (key == Key::PageUp)
+            {
+                size_t step = halfPageStep();
+                selected = step > selected ? 0 : selected - step;
+                continue;
+            }
+            if (key == Key::PageDown)
+            {
+                size_t step = halfPageStep();
+                selected = std::min(entries.size() - 1, selected + step);
                 continue;
             }
             if (key == Key::Remove)

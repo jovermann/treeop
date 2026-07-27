@@ -810,6 +810,34 @@ def test_remove_dir_internal_copies_interactive_dry_run(tmp_path: Path):
     assert new.exists()
 
 
+def test_remove_dir_internal_copies_interactive_page_down(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    for i in range(12):
+        old = dir_a / "dupdir" / f"{i:02d}-old.txt"
+        new = dir_a / "dupdir" / f"{i:02d}-new.txt"
+        write_file(old, f"same-{i}")
+        write_file(new, f"same-{i}")
+        os.utime(old, (1000 + i, 1000 + i))
+        os.utime(new, (2000 + i, 2000 + i))
+
+    out = run_treeop_pty(
+        ["--remove-dir-internal-copies", "--interactive", "--dry-run", str(dir_a)],
+        root,
+        b"\033[6~rq",
+    )
+
+    assert "PgUp/PgDn: page" in out
+    assert f"Would remove {dir_a / 'dupdir' / '04-new.txt'}" in out
+    assert re.search(r"removed-files:\s+1", out)
+    assert (dir_a / "dupdir" / "04-new.txt").exists()
+
+
 def test_remove_dir_internal_copies_runs_before_overlap_remove_copies(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
