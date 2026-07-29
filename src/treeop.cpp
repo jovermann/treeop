@@ -1324,33 +1324,79 @@ public:
     void printOverlappingDirs(const std::vector<fs::path>& rootPaths, const FileFilter& filter, uint64_t top, bool removeCopies, bool dryRun) const
     {
         std::vector<OverlapDirData> overlapDirs = collectOverlapDirs(rootPaths, filter);
-        std::vector<OverlapResult> results;
-        uint64_t totalPairs = 0;
-        if (overlapDirs.size() > 1)
+        std::map<ContentKey, std::vector<size_t>> dirsByContent;
+        for (size_t i = 0; i < overlapDirs.size(); i++)
         {
-            totalPairs = static_cast<uint64_t>(overlapDirs.size()) * static_cast<uint64_t>(overlapDirs.size() - 1) / 2;
-            results.reserve(static_cast<size_t>(totalPairs));
+            for (const auto& [key, refs] : overlapDirs[i].contentFiles)
+            {
+                (void)refs;
+                dirsByContent[key].push_back(i);
+            }
         }
+
+        std::set<std::pair<size_t, size_t>> candidatePairs;
+        for (const auto& [key, dirIndexes] : dirsByContent)
+        {
+            (void)key;
+            if (dirIndexes.size() < 2)
+            {
+                continue;
+            }
+            for (size_t i = 0; i < dirIndexes.size(); i++)
+            {
+                for (size_t j = i + 1; j < dirIndexes.size(); j++)
+                {
+                    candidatePairs.insert({dirIndexes[i], dirIndexes[j]});
+                }
+            }
+        }
+
+        std::vector<OverlapResult> results;
+        uint64_t totalPairs = static_cast<uint64_t>(candidatePairs.size());
+        if (totalPairs > 0 && top > 0)
+        {
+            results.reserve(static_cast<size_t>(std::min<uint64_t>(top, totalPairs)));
+        }
+
+        auto addOverlapResult = [&](OverlapResult result)
+        {
+            if (top == 0)
+            {
+                results.push_back(std::move(result));
+                return;
+            }
+            if (results.size() < top)
+            {
+                results.push_back(std::move(result));
+                if (results.size() == top)
+                {
+                    std::sort(results.begin(), results.end(), overlapRanksBefore);
+                }
+                return;
+            }
+            if (overlapRanksBefore(result, results.back()))
+            {
+                results.back() = std::move(result);
+                std::sort(results.begin(), results.end(), overlapRanksBefore);
+            }
+        };
 
         if (gProgress)
         {
             gProgress->onPhaseStart("overlap: compare dirs", totalPairs);
         }
         uint64_t processed = 0;
-        for (size_t i = 0; i < overlapDirs.size(); i++)
+        for (const auto& [i, j] : candidatePairs)
         {
-            for (size_t j = i + 1; j < overlapDirs.size(); j++)
+            OverlapResult forward = buildOverlapResult(overlapDirs[i], overlapDirs[j]);
+            OverlapResult backward = buildOverlapResult(overlapDirs[j], overlapDirs[i]);
+            if (forward.shared.bytes > 0 || backward.shared.bytes > 0)
             {
-                OverlapResult forward = buildOverlapResult(overlapDirs[i], overlapDirs[j]);
-                OverlapResult backward = buildOverlapResult(overlapDirs[j], overlapDirs[i]);
-                if (forward.shared.bytes > 0 || backward.shared.bytes > 0)
-                {
-                    results.push_back(overlapRanksBefore(backward, forward) ? std::move(backward) : std::move(forward));
-                }
-                if (gProgress)
-                {
-                    gProgress->onPhaseProgress(++processed);
-                }
+                addOverlapResult(overlapRanksBefore(backward, forward) ? std::move(backward) : std::move(forward));
+            }
+            if (gProgress)
+            {
+                gProgress->onPhaseProgress(++processed);
             }
         }
         if (gProgress)
@@ -1816,8 +1862,25 @@ public:
         return stats;
     }
 
+    /// Interactively remove duplicate files, keeping the oldest file per content in the initial selection.
+    RemoveCopyStats removeRedundantFilesInteractive(const FileFilter& filter, bool dryRun)
+    {
+        return removeCopiesInteractive(std::vector<fs::path>{}, filter, dryRun, false, "remove-copies");
+    }
+
     /// Interactively remove duplicate files within each directory.
     RemoveCopyStats removeDirInternalCopiesInteractive(const std::vector<fs::path>& rootPaths, const FileFilter& filter, bool dryRun)
+    {
+        return removeCopiesInteractive(rootPaths, filter, dryRun, true, "remove-dir-internal-copies");
+    }
+
+    /// Interactively remove duplicate files from redundancy groups.
+    RemoveCopyStats removeCopiesInteractive(
+        const std::vector<fs::path>& rootPaths,
+        const FileFilter& filter,
+        bool dryRun,
+        bool dirInternal,
+        const std::string& operationName)
     {
         struct InteractiveEntry
         {
@@ -1839,6 +1902,102 @@ public:
 
             std::vector<PendingGroup> pendingGroups;
             size_t groupIndex = 0;
+            if (!dirInternal)
+            {
+                struct GlobalRef
+                {
+                    size_t dirIndex{};
+                    const FileEntry* file{};
+                };
+
+                std::map<ContentKey, std::vector<GlobalRef>> groups;
+                for (size_t dirIndex = 0; dirIndex < dirs.size(); dirIndex++)
+                {
+                    const auto& dir = dirs[dirIndex];
+                    for (const auto& file : dir.files)
+                    {
+                        if (!filter.matches(file))
+                        {
+                            continue;
+                        }
+                        groups[contentKeyForFile(file)].push_back(GlobalRef{dirIndex, &file});
+                    }
+                }
+
+                for (const auto& [key, refs] : groups)
+                {
+                    if (refs.size() < 2)
+                    {
+                        continue;
+                    }
+                    auto oldestIt = std::min_element(refs.begin(), refs.end(),
+                        [&](const GlobalRef& lhs, const GlobalRef& rhs)
+                        {
+                            const auto& lhsFile = *lhs.file;
+                            const auto& rhsFile = *rhs.file;
+                            fs::path lhsPath = dirs[lhs.dirIndex].path / lhsFile.path;
+                            fs::path rhsPath = dirs[rhs.dirIndex].path / rhsFile.path;
+                            if (lhsFile.date != rhsFile.date)
+                            {
+                                return lhsFile.date < rhsFile.date;
+                            }
+                            return lhsPath < rhsPath;
+                        });
+                    if (oldestIt == refs.end())
+                    {
+                        continue;
+                    }
+
+                    std::vector<GlobalRef> sortedRefs = refs;
+                    std::sort(sortedRefs.begin(), sortedRefs.end(),
+                        [&](const GlobalRef& lhs, const GlobalRef& rhs)
+                        {
+                            const auto& lhsFile = *lhs.file;
+                            const auto& rhsFile = *rhs.file;
+                            fs::path lhsPath = dirs[lhs.dirIndex].path / lhsFile.path;
+                            fs::path rhsPath = dirs[rhs.dirIndex].path / rhsFile.path;
+                            if (lhsFile.date != rhsFile.date)
+                            {
+                                return lhsFile.date < rhsFile.date;
+                            }
+                            return lhsPath < rhsPath;
+                        });
+
+                    PendingGroup pending;
+                    pending.firstPath = (dirs[sortedRefs.front().dirIndex].path / sortedRefs.front().file->path).string();
+                    std::string hashHex = key.hash.toHex();
+                    size_t hashLen = getUniqueHashHexLen();
+                    std::string shortHash = hashHex.substr(0, std::min(hashLen, hashHex.size()));
+                    for (const GlobalRef& ref : sortedRefs)
+                    {
+                        pending.entries.push_back(InteractiveEntry{
+                            ref.dirIndex,
+                            ref.file->path,
+                            dirs[ref.dirIndex].path / ref.file->path,
+                            *ref.file,
+                            groupIndex,
+                            ref.dirIndex == oldestIt->dirIndex && ref.file->path == oldestIt->file->path,
+                            shortHash
+                        });
+                    }
+                    pendingGroups.push_back(std::move(pending));
+                    groupIndex++;
+                }
+
+                std::sort(pendingGroups.begin(), pendingGroups.end(),
+                    [](const PendingGroup& lhs, const PendingGroup& rhs)
+                    {
+                        return lhs.firstPath < rhs.firstPath;
+                    });
+
+                std::vector<InteractiveEntry> entries;
+                for (const auto& group : pendingGroups)
+                {
+                    entries.insert(entries.end(), group.entries.begin(), group.entries.end());
+                }
+                return entries;
+            }
+
             for (size_t dirIndex = 0; dirIndex < dirs.size(); dirIndex++)
             {
                 auto& dir = dirs[dirIndex];
@@ -2065,7 +2224,7 @@ public:
             }
 
             std::cout << "\033[?25l\033[2J\033[H";
-            std::string title = "treeop interactive remove-dir-internal-copies";
+            std::string title = "treeop interactive " + operationName;
             if (dryRun)
             {
                 title += " (dry-run)";
@@ -5063,7 +5222,7 @@ int main(int argc, char *argv[])
 
     cl.addHeader("\nGeneral:\n");
     cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
-    cl.addOption('i', "interactive", "Open an interactive TUI for --remove-dir-internal-copies.");
+    cl.addOption('i', "interactive", "Open an interactive TUI for --remove-copies or --remove-dir-internal-copies.");
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
     cl.addOption(' ', "top", "Maximum number of overlapping directory pairs to print (with --find-overlapping-dirs).", "N", "0");
     cl.addOption('p', "progress", "Print progress once per second.");
@@ -5203,9 +5362,13 @@ int main(int argc, char *argv[])
         {
             cl.error("Cannot combine --remove-copies with --remove-copies-from-last.");
         }
-        if (cl("interactive") && !cl("remove-dir-internal-copies"))
+        if (cl("interactive") && !(cl("remove-dir-internal-copies") || cl("remove-copies")))
         {
-            cl.error("--interactive requires --remove-dir-internal-copies.");
+            cl.error("--interactive requires --remove-copies or --remove-dir-internal-copies.");
+        }
+        if (cl("interactive") && cl("remove-copies") && !cl("remove-dir-internal-copies") && (cl("intersect") || cl("find-overlapping-dirs")))
+        {
+            cl.error("--interactive with --remove-copies is only supported without --intersect or --find-overlapping-dirs.");
         }
         if (cl("containment") && cl("intersect"))
         {
@@ -5352,7 +5515,9 @@ int main(int argc, char *argv[])
             {
                 if (cl("remove-copies"))
                 {
-                    auto stats = mainDb.removeRedundantFiles(fileFilter, cl("dry-run"));
+                    auto stats = cl("interactive")
+                        ? mainDb.removeRedundantFilesInteractive(fileFilter, cl("dry-run"))
+                        : mainDb.removeRedundantFiles(fileFilter, cl("dry-run"));
                     std::cout << "remove-copies:\n";
                     mainDb.printRemoveCopyStats(stats);
                 }

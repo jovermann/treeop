@@ -82,7 +82,7 @@ def run_treeop_pty(args, cwd: Path, input_after_title: bytes):
                 if not chunk:
                     break
                 out.extend(chunk)
-                if (not sent) and b"treeop interactive remove-dir-internal-copies" in out:
+                if (not sent) and b"treeop interactive" in out:
                     os.write(master_fd, input_after_title)
                     sent = True
             if proc.poll() is not None:
@@ -642,6 +642,26 @@ def test_find_overlapping_dirs_omits_zero_shared_bytes(tmp_path: Path):
     assert "shared:" not in out
 
 
+def test_find_overlapping_abbreviated_option(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "x" / "one.txt", "one")
+    write_file(dir_b / "y" / "copy.txt", "one")
+
+    out = run_treeop(["--find-overlapping", "--top", "1", str(dir_a), str(dir_b)], root)
+
+    assert "overlapping-dirs:" in out
+    assert f"A: {dir_a / 'x'}" in out or f"A: {dir_b / 'y'}" in out
+
+
 def test_find_overlapping_dirs_prints_only_best_direction_per_pair(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
@@ -1081,6 +1101,39 @@ def test_remove_copies_without_intersect(tmp_path: Path):
     assert (dir_a / "same.txt").exists()
     assert not (dir_b / "same.txt").exists()
     assert re.search(r"removed-files:\s+1", out)
+
+
+def test_remove_copies_interactive_dry_run(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    old = dir_a / "same.txt"
+    new = dir_b / "same.txt"
+    write_file(old, "hello")
+    write_file(new, "hello")
+    os.utime(old, (1000, 1000))
+    os.utime(new, (2000, 2000))
+
+    out = run_treeop_pty(
+        ["--remove-copies", "--interactive", "--dry-run", str(dir_a), str(dir_b)],
+        root,
+        b"\033[Brq",
+    )
+
+    assert "treeop interactive remove-copies (dry-run)" in out
+    assert f"Would remove {new}" in out
+    assert "No redundant files remain." in out
+    assert "remove-copies:" in out
+    assert re.search(r"removed-files:\s+1", out)
+    assert old.exists()
+    assert new.exists()
 
 
 def test_stats_hardlinked_and_redundant(tmp_path: Path):
