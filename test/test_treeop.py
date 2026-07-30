@@ -817,7 +817,7 @@ def test_remove_dir_internal_copies_interactive_dry_run(tmp_path: Path):
     assert "\x1b[41;37m" in out
     assert "\x1b[46;30m" in out
     assert "1970-01-01 00:33:20" in out
-    assert "redundant-files: 2  redundant-bytes: 2_468" in out
+    assert "redundant-files: 1  redundant-bytes: 1_234" in out
     assert "redundant-files: 0  redundant-bytes: 0" in out
     assert "40;30" in out
     assert "107;97" in out
@@ -1128,6 +1128,7 @@ def test_remove_copies_interactive_dry_run(tmp_path: Path):
     )
 
     assert "treeop interactive remove-copies (dry-run)" in out
+    assert "redundant-files: 1  redundant-bytes: 5" in out
     assert f"Would remove {new}" in out
     assert "No redundant files remain." in out
     assert "remove-copies:" in out

@@ -2192,12 +2192,26 @@ public:
         };
 
         auto formatRedundantStatus = [&]() {
-            uint64_t redundantBytes = 0;
+            std::map<size_t, std::pair<uint64_t, uint64_t>> groupCountsAndSize;
             for (const auto& entry : entries)
             {
-                redundantBytes += entry.file.size;
+                auto& group = groupCountsAndSize[entry.groupIndex];
+                group.first++;
+                group.second = entry.file.size;
             }
-            return "redundant-files: " + ut1::formatU64WithUnderscores(entries.size())
+
+            uint64_t redundantFiles = 0;
+            uint64_t redundantBytes = 0;
+            for (const auto& [groupIndex, group] : groupCountsAndSize)
+            {
+                (void)groupIndex;
+                if (group.first > 1)
+                {
+                    redundantFiles += group.first - 1;
+                    redundantBytes += (group.first - 1) * group.second;
+                }
+            }
+            return "redundant-files: " + ut1::formatU64WithUnderscores(redundantFiles)
                 + "  redundant-bytes: " + ut1::formatU64WithUnderscores(redundantBytes);
         };
 
