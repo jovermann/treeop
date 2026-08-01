@@ -389,7 +389,7 @@ def test_containment_requires_at_least_two_dirs_before_processing(tmp_path: Path
 
     result = run_treeop_result(["--containment", str(dir_a)], root)
     assert result.returncode != 0
-    assert "--containment requires at least two directories." in result.stdout
+    assert "--containment requires at least two paths." in result.stdout
     assert not (dir_a / ".dirdb").exists()
 
 
@@ -1352,6 +1352,44 @@ def test_list_files_only_and_exclude_filters_filename(tmp_path: Path):
     assert "nested.png" in out
     assert "note.txt" not in out
     assert "photo.jpg~" not in out
+
+
+def test_file_argument_selects_only_that_file_in_parent_dir(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "selected.jpg", "jpg")
+    write_file(dir_a / "skipped.jpg", "other")
+
+    out = run_treeop(["--list-files", str(dir_a / "selected.jpg")], root)
+    assert "selected.jpg" in out
+    assert "skipped.jpg" not in out
+
+
+def test_mixed_file_and_dir_arguments_apply_file_selection_per_dir(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    write_file(dir_a / "selected.txt", "shared-selected")
+    write_file(dir_b / "selected-copy.txt", "shared-selected")
+    write_file(dir_a / "unselected.txt", "shared-unselected")
+    write_file(dir_b / "unselected-copy.txt", "shared-unselected")
+
+    out = run_treeop(["--list-redundant", str(dir_a / "selected.txt"), str(dir_b)], root)
+    assert "selected.txt" in out
+    assert "selected-copy.txt" in out
+    assert "unselected.txt" not in out
+    assert "unselected-copy.txt" not in out
 
 
 def test_list_files_verbose_prints_extension_stats(tmp_path: Path):

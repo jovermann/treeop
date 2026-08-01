@@ -404,6 +404,20 @@ struct FileEntry
     uint64_t numLinks{};
 };
 
+static bool isPathWithinPath(const fs::path& root, const fs::path& path)
+{
+    auto rootIt = root.begin();
+    auto pathIt = path.begin();
+    for (; rootIt != root.end() && pathIt != path.end(); ++rootIt, ++pathIt)
+    {
+        if (*rootIt != *pathIt)
+        {
+            return false;
+        }
+    }
+    return rootIt == root.end();
+}
+
 struct FileFilter
 {
     uint64_t minSize{};
@@ -412,8 +426,10 @@ struct FileFilter
     std::vector<std::string> iOnlyPatterns;
     std::vector<std::string> excludePatterns;
     std::vector<std::string> iExcludePatterns;
+    std::vector<fs::path> selectedDirRoots;
+    std::map<fs::path, std::set<std::string>> selectedFilesByDir;
 
-    bool matches(const FileEntry& file) const
+    bool matches(const FileEntry& file, const fs::path& dirPath = {}) const
     {
         if (file.size < minSize)
         {
@@ -436,6 +452,26 @@ struct FileFilter
         {
             return false;
         }
+        if (!selectedDirRoots.empty() || !selectedFilesByDir.empty())
+        {
+            if (dirPath.empty())
+            {
+                return true;
+            }
+            for (const auto& rootPath : selectedDirRoots)
+            {
+                if (isPathWithinPath(rootPath, dirPath))
+                {
+                    return true;
+                }
+            }
+            auto selectedIt = selectedFilesByDir.find(dirPath);
+            if (selectedIt != selectedFilesByDir.end() && selectedIt->second.find(file.path) != selectedIt->second.end())
+            {
+                return true;
+            }
+            return false;
+        }
         return true;
     }
 
@@ -451,6 +487,12 @@ private:
         }
         return false;
     }
+};
+
+struct InputRoot
+{
+    fs::path path;
+    bool recursive{};
 };
 
 static std::vector<std::string> parsePatterns(const ut1::CommandLineParser& cl, const std::string& optionName)
@@ -514,6 +556,7 @@ public:
     struct RootData
     {
         fs::path path;
+        bool recursive{};
         double elapsedSeconds{};
     };
 
@@ -540,7 +583,17 @@ public:
     {
         for (auto& path : rootDirs)
         {
-            roots.push_back(RootData{std::move(path), 0.0});
+            roots.push_back(RootData{std::move(path), true, 0.0});
+        }
+    }
+
+    /// Initialize the database with roots that may be recursive or single-directory only.
+    explicit MainDb(std::vector<InputRoot> rootDirs, bool sameFilename_)
+        : sameFilename(sameFilename_)
+    {
+        for (auto& root : rootDirs)
+        {
+            roots.push_back(RootData{std::move(root.path), root.recursive, 0.0});
         }
     }
 
@@ -556,7 +609,14 @@ public:
         for (auto& rootData : roots)
         {
             double start = ut1::getTimeSec();
-            processDirTree(rootData.path, forceCreate, update);
+            if (rootData.recursive)
+            {
+                processDirTree(rootData.path, forceCreate, update);
+            }
+            else
+            {
+                addDir(loadOrCreateDirDb(rootData.path, forceCreate, update));
+            }
             rootData.elapsedSeconds = ut1::getTimeSec() - start;
         }
         uniqueHashHexLen = computeUniqueHashHexLen();
@@ -622,7 +682,7 @@ public:
         {
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -653,7 +713,7 @@ public:
         {
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -757,7 +817,7 @@ public:
         {
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -821,7 +881,7 @@ public:
         {
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -964,7 +1024,7 @@ public:
                 }
                 for (const auto& file : dir.files)
                 {
-                    if (!filter.matches(file))
+                    if (!filter.matches(file, dir.path))
                     {
                         continue;
                     }
@@ -1477,7 +1537,7 @@ public:
             }
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -1506,7 +1566,7 @@ public:
             data.path = dir.path;
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -1687,7 +1747,7 @@ public:
         {
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -1714,7 +1774,7 @@ public:
         {
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -1882,7 +1942,7 @@ public:
             std::map<ContentKey, std::vector<const FileEntry*>> groups;
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -2036,7 +2096,7 @@ public:
                     const auto& dir = dirs[dirIndex];
                     for (const auto& file : dir.files)
                     {
-                        if (!liveFilter.matches(file))
+                        if (!liveFilter.matches(file, dir.path))
                         {
                             continue;
                         }
@@ -2138,7 +2198,7 @@ public:
                 std::map<ContentKey, std::vector<const FileEntry*>> groups;
                 for (const auto& file : dir.files)
                 {
-                    if (!liveFilter.matches(file))
+                    if (!liveFilter.matches(file, dir.path))
                     {
                         continue;
                     }
@@ -2592,7 +2652,7 @@ private:
         {
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -2662,7 +2722,7 @@ private:
             stats.dirCount++;
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -2854,7 +2914,7 @@ private:
             }
             for (const auto& file : dir.files)
             {
-                if (filter.matches(file))
+                if (filter.matches(file, dir.path))
                 {
                     total++;
                 }
@@ -2891,7 +2951,7 @@ private:
             data.path = dir.path;
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -3211,7 +3271,7 @@ private:
             }
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -3285,7 +3345,7 @@ private:
 
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -3342,7 +3402,7 @@ private:
             }
             for (const auto& file : dir.files)
             {
-                if (!filter.matches(file))
+                if (!filter.matches(file, dir.path))
                 {
                     continue;
                 }
@@ -4273,16 +4333,7 @@ private:
     /// Check if a path is within a root path.
     static bool isPathWithin(const fs::path& root, const fs::path& path)
     {
-        auto rootIt = root.begin();
-        auto pathIt = path.begin();
-        for (; rootIt != root.end() && pathIt != path.end(); ++rootIt, ++pathIt)
-        {
-            if (*rootIt != *pathIt)
-            {
-                return false;
-            }
-        }
-        return rootIt == root.end();
+        return isPathWithinPath(root, path);
     }
 
     /// Format a percentage with one decimal place.
@@ -5269,32 +5320,33 @@ static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bo
     return createDirDb(dirPath);
 }
 
+/// Remove the .dirdb file in a single directory.
+static void removeDirDbInDir(const fs::path& dirPath, bool dryRun)
+{
+    fs::path dbPath = dirPath / ".dirdb";
+    if (ut1::fsExists(dbPath))
+    {
+        if (dryRun || clVerbose)
+        {
+            std::cout << (dryRun ? "Would remove " : "Removed ") << dbPath.string() << "\n";
+        }
+        if (dryRun)
+        {
+            return;
+        }
+        std::error_code ec;
+        fs::remove(dbPath, ec);
+        if (ec)
+        {
+            throw std::runtime_error("Failed to remove " + dbPath.string());
+        }
+    }
+}
+
 /// Recursively remove .dirdb files under a root directory.
 static void removeDirDbTree(const fs::path& root, bool dryRun)
 {
-    auto removeIfExists = [](const fs::path& dirPath, bool dryRunFlag)
-    {
-        fs::path dbPath = dirPath / ".dirdb";
-        if (ut1::fsExists(dbPath))
-        {
-            if (dryRunFlag || clVerbose)
-            {
-                std::cout << (dryRunFlag ? "Would remove " : "Removed ") << dbPath.string() << "\n";
-            }
-            if (dryRunFlag)
-            {
-                return;
-            }
-            std::error_code ec;
-            fs::remove(dbPath, ec);
-            if (ec)
-            {
-                throw std::runtime_error("Failed to remove " + dbPath.string());
-            }
-        }
-    };
-
-    removeIfExists(root, dryRun);
+    removeDirDbInDir(root, dryRun);
 
     std::error_code ec;
     fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
@@ -5313,7 +5365,7 @@ static void removeDirDbTree(const fs::path& root, bool dryRun)
         }
         if (ut1::fsIsDirectory(it->path(), false))
         {
-            removeIfExists(it->path(), dryRun);
+            removeDirDbInDir(it->path(), dryRun);
         }
         it.increment(ec);
     }
@@ -5482,19 +5534,66 @@ int main(int argc, char *argv[])
 
         if (cl.getArgs().empty())
         {
-            cl.error("Please specify at least one directory.");
+            cl.error("Please specify at least one path.");
         }
 
-        // Check all args to avoid late errors.
+        std::vector<fs::path> normalizedRoots;
+        std::vector<InputRoot> inputRoots;
+        std::map<fs::path, size_t> inputRootIndexByPath;
+        bool hasFileArgs = false;
+
+        auto addInputRoot = [&](const fs::path& rootPath, bool recursive)
+        {
+            auto [it, inserted] = inputRootIndexByPath.emplace(rootPath, inputRoots.size());
+            if (inserted)
+            {
+                normalizedRoots.push_back(rootPath);
+                inputRoots.push_back(InputRoot{rootPath, recursive});
+                return;
+            }
+            if (recursive)
+            {
+                inputRoots[it->second].recursive = true;
+            }
+        };
+
+        // Normalize input paths. Directory arguments select recursive roots; regular-file
+        // arguments select that basename in their parent directory.
         for (const std::string& path : cl.getArgs())
         {
             if (!ut1::fsExists(path))
             {
                 cl.error("Path '" + path + "' does not exist.");
             }
-            if (!ut1::fsIsDirectory(path))
+            bool isDir = ut1::fsIsDirectory(path);
+            bool isRegular = ut1::fsIsRegular(path);
+            if (!isDir && !isRegular)
             {
-                cl.error("Path '" + path + "' is not a directory.");
+                cl.error("Path '" + path + "' is neither a directory nor a regular file.");
+            }
+
+            fs::path normalizedPath = normalizePath(path);
+            if (isDir)
+            {
+                addInputRoot(normalizedPath, true);
+            }
+            else
+            {
+                hasFileArgs = true;
+                fs::path parentPath = normalizePath(normalizedPath.parent_path());
+                addInputRoot(parentPath, false);
+                fileFilter.selectedFilesByDir[parentPath].insert(normalizedPath.filename().string());
+            }
+        }
+
+        if (hasFileArgs)
+        {
+            for (const auto& root : inputRoots)
+            {
+                if (root.recursive)
+                {
+                    fileFilter.selectedDirRoots.push_back(root.path);
+                }
             }
         }
 
@@ -5581,20 +5680,21 @@ int main(int argc, char *argv[])
         }
         if (cl("containment") && cl.getArgs().size() < 2)
         {
-            cl.error("--containment requires at least two directories.");
-        }
-
-        std::vector<fs::path> normalizedRoots;
-        for (const std::string& path : cl.getArgs())
-        {
-            normalizedRoots.push_back(normalizePath(path));
+            cl.error("--containment requires at least two paths.");
         }
 
         if (cl("remove-dirdb"))
         {
-            for (const auto& path : normalizedRoots)
+            for (const auto& root : inputRoots)
             {
-                removeDirDbTree(path, cl("dry-run"));
+                if (root.recursive)
+                {
+                    removeDirDbTree(root.path, cl("dry-run"));
+                }
+                else
+                {
+                    removeDirDbInDir(root.path, cl("dry-run"));
+                }
             }
         }
         else
@@ -5608,6 +5708,10 @@ int main(int argc, char *argv[])
                 if (otherOps)
                 {
                     cl.error("--readbench cannot be combined with other operations.");
+                }
+                if (hasFileArgs)
+                {
+                    cl.error("--readbench requires directory arguments.");
                 }
 
                 ReadBenchStats stats = runReadBench(normalizedRoots);
@@ -5625,7 +5729,7 @@ int main(int argc, char *argv[])
                 return 0;
             }
 
-            MainDb mainDb(normalizedRoots, cl("same-filename"));
+            MainDb mainDb(inputRoots, cl("same-filename"));
 
             // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.
             mainDb.processRoots(cl("new-dirdb"), cl("update-dirdb"));
@@ -5680,7 +5784,7 @@ int main(int argc, char *argv[])
             {
                 if (normalizedRoots.size() < 2)
                 {
-                    cl.error("--intersect requires at least two directories.");
+                    cl.error("--intersect requires at least two paths.");
                 }
                 std::optional<fs::path> extractFirst;
                 std::optional<fs::path> extractLast;
