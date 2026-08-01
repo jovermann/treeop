@@ -1447,6 +1447,124 @@ public:
         }
     }
 
+    /// Find and print directories ranked by bytes whose content appears elsewhere.
+    void printRedundantDirs(const std::vector<fs::path>& rootPaths, const FileFilter& filter, uint64_t top) const
+    {
+        struct RedundantDirData
+        {
+            fs::path path;
+            uint64_t redundantFiles{};
+            uint64_t redundantBytes{};
+            uint64_t totalFiles{};
+            uint64_t totalBytes{};
+        };
+
+        std::map<ContentKey, std::unordered_set<uint64_t>> inodesByContent;
+        for (const auto& dir : dirs)
+        {
+            bool inAnyRoot = false;
+            for (const auto& rootPath : rootPaths)
+            {
+                if (isPathWithin(rootPath, dir.path))
+                {
+                    inAnyRoot = true;
+                    break;
+                }
+            }
+            if (!inAnyRoot)
+            {
+                continue;
+            }
+            for (const auto& file : dir.files)
+            {
+                if (!filter.matches(file))
+                {
+                    continue;
+                }
+                inodesByContent[contentKeyForFile(file)].insert(file.inode);
+            }
+        }
+
+        std::vector<RedundantDirData> result;
+        for (const auto& dir : dirs)
+        {
+            bool inAnyRoot = false;
+            for (const auto& rootPath : rootPaths)
+            {
+                if (isPathWithin(rootPath, dir.path))
+                {
+                    inAnyRoot = true;
+                    break;
+                }
+            }
+            if (!inAnyRoot)
+            {
+                continue;
+            }
+
+            RedundantDirData data;
+            data.path = dir.path;
+            for (const auto& file : dir.files)
+            {
+                if (!filter.matches(file))
+                {
+                    continue;
+                }
+                data.totalFiles++;
+                data.totalBytes += file.size;
+                auto inodeIt = inodesByContent.find(contentKeyForFile(file));
+                if (inodeIt != inodesByContent.end() && inodeIt->second.size() > 1)
+                {
+                    data.redundantFiles++;
+                    data.redundantBytes += file.size;
+                }
+            }
+            if (data.redundantBytes > 0)
+            {
+                result.push_back(std::move(data));
+            }
+        }
+
+        std::sort(result.begin(), result.end(),
+            [](const RedundantDirData& a, const RedundantDirData& b)
+            {
+                if (a.redundantBytes != b.redundantBytes)
+                {
+                    return a.redundantBytes > b.redundantBytes;
+                }
+                if (a.redundantFiles != b.redundantFiles)
+                {
+                    return a.redundantFiles > b.redundantFiles;
+                }
+                return a.path < b.path;
+            });
+
+        size_t limit = result.size();
+        if (top > 0)
+        {
+            limit = std::min(limit, static_cast<size_t>(top));
+        }
+
+        std::cout << "redundant-dirs:\n";
+        if (limit == 0)
+        {
+            std::cout << "  (none)\n";
+            return;
+        }
+
+        for (size_t i = 0; i < limit; i++)
+        {
+            const auto& data = result[i];
+            std::cout << formatOverlapBytes(data.redundantBytes) << " / "
+                      << formatCountInt(data.redundantFiles) << " files redundant"
+                      << " (" << formatPercentFixed(percentOf(data.redundantBytes, data.totalBytes)) << " / "
+                      << formatPercentFixed(percentOf(data.redundantFiles, data.totalFiles)) << ")"
+                      << " of " << formatOverlapBytes(data.totalBytes) << " / "
+                      << formatCountInt(data.totalFiles) << " files total"
+                      << "  " << data.path.string() << "\n";
+        }
+    }
+
     /// Print the minimum hash length needed to distinguish distinct contents.
     void printUniqueHashLen() const
     {
@@ -5222,6 +5340,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "intersect", "Determine intersections of two or more dirs. Print unique/shared statistics per dir.");
     cl.addOption('c', "containment", "Show how much of the last dir is contained in the previous dirs.");
     cl.addOption(' ', "find-overlapping-dirs", "Find and rank overlapping directory pairs within the specified trees.");
+    cl.addOption(' ', "find-redundant-dirs", "Find and rank dirs by bytes whose content appears elsewhere.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
 
@@ -5277,7 +5396,7 @@ int main(int argc, char *argv[])
     cl.addOption('d', "dry-run", "Show what would change, but do not modify files.");
     cl.addOption('i', "interactive", "Open an interactive TUI for --remove-copies or --remove-dir-internal-copies.");
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
-    cl.addOption(' ', "top", "Maximum number of overlapping directory pairs to print (with --find-overlapping-dirs).", "N", "0");
+    cl.addOption(' ', "top", "Maximum number of results to print (with --find-overlapping-dirs or --find-redundant-dirs).", "N", "0");
     cl.addOption('p', "progress", "Print progress once per second.");
     cl.addOption('W', "width", "Max width for progress line.", "N", "199");
     cl.addOption('v', "verbose", "Increase verbosity. Specify multiple times to be more verbose.");
@@ -5330,7 +5449,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -5340,7 +5459,7 @@ int main(int argc, char *argv[])
         if (cl("hashrate"))
         {
             bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                 || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench");
             if (otherOps)
@@ -5419,17 +5538,21 @@ int main(int argc, char *argv[])
         {
             cl.error("--interactive requires --remove-copies or --remove-dir-internal-copies.");
         }
-        if (cl("interactive") && cl("remove-copies") && !cl("remove-dir-internal-copies") && (cl("intersect") || cl("find-overlapping-dirs")))
+        if (cl("interactive") && cl("remove-copies") && !cl("remove-dir-internal-copies") && (cl("intersect") || cl("find-overlapping-dirs") || cl("find-redundant-dirs")))
         {
-            cl.error("--interactive with --remove-copies is only supported without --intersect or --find-overlapping-dirs.");
+            cl.error("--interactive with --remove-copies is only supported without --intersect, --find-overlapping-dirs, or --find-redundant-dirs.");
         }
         if (cl("containment") && cl("intersect"))
         {
             cl.error("Cannot combine --containment with --intersect.");
         }
-        if (cl("top") && !cl("find-overlapping-dirs"))
+        if (cl("top") && !(cl("find-overlapping-dirs") || cl("find-redundant-dirs")))
         {
-            cl.error("--top requires --find-overlapping-dirs.");
+            cl.error("--top requires --find-overlapping-dirs or --find-redundant-dirs.");
+        }
+        if (cl("find-overlapping-dirs") && cl("find-redundant-dirs"))
+        {
+            cl.error("Cannot combine --find-overlapping-dirs with --find-redundant-dirs.");
         }
         if (cl("find-overlapping-dirs"))
         {
@@ -5441,6 +5564,19 @@ int main(int argc, char *argv[])
             if (otherOps)
             {
                 cl.error("--find-overlapping-dirs cannot be combined with other operations.");
+            }
+        }
+        if (cl("find-redundant-dirs"))
+        {
+            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+                || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained")
+                || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies")
+                || cl("hardlink-copies") || cl("break-hardlinks") || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs")
+                || cl("readbench") || cl("hashrate");
+            if (otherOps)
+            {
+                cl.error("--find-redundant-dirs cannot be combined with other operations.");
             }
         }
         if (cl("containment") && cl.getArgs().size() < 2)
@@ -5466,7 +5602,7 @@ int main(int argc, char *argv[])
             if (cl("readbench"))
             {
                 bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
-                    || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
+                    || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("hashrate");
                 if (otherOps)
@@ -5523,6 +5659,10 @@ int main(int argc, char *argv[])
             if (cl("find-overlapping-dirs"))
             {
                 mainDb.printOverlappingDirs(normalizedRoots, fileFilter, top, cl("remove-copies"), cl("dry-run"));
+            }
+            else if (cl("find-redundant-dirs"))
+            {
+                mainDb.printRedundantDirs(normalizedRoots, fileFilter, top);
             }
             else if (cl("containment"))
             {

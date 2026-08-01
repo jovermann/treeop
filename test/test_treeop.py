@@ -709,6 +709,61 @@ def test_find_overlapping_dirs_warns_and_skips_remove_when_internal_duplicates(t
     assert (dir_b / "copydir" / "copy.txt").exists()
 
 
+def test_find_redundant_dirs_top_sorts_by_redundant_bytes(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_c = tmp_path / "c"
+    dir_d = tmp_path / "d"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    dir_c.mkdir()
+    dir_d.mkdir()
+
+    write_file(dir_a / "many" / "large.txt", "abcde")
+    write_file(dir_a / "many" / "small.txt", "xy")
+    write_file(dir_b / "large_copy" / "large.txt", "abcde")
+    write_file(dir_c / "small_copy" / "small.txt", "xy")
+    write_file(dir_d / "unique" / "unique.txt", "unique")
+
+    out = run_treeop(["--find-redundant-dirs", "--top", "2", str(dir_a), str(dir_b), str(dir_c), str(dir_d)], root)
+
+    assert "redundant-dirs:" in out
+    assert f"7 bytes / 2 files redundant" in out
+    assert f"5 bytes / 1 files redundant" in out
+    assert f"{dir_a / 'many'}" in out
+    assert f"{dir_b / 'large_copy'}" in out
+    assert f"{dir_c / 'small_copy'}" not in out
+    assert f"{dir_d / 'unique'}" not in out
+    assert out.index(str(dir_a / "many")) < out.index(str(dir_b / "large_copy"))
+
+
+def test_find_redundant_dirs_honors_min_size(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "mixed" / "large.txt", "abcde")
+    write_file(dir_a / "mixed" / "small.txt", "xy")
+    write_file(dir_b / "copies" / "large.txt", "abcde")
+    write_file(dir_b / "copies" / "small.txt", "xy")
+
+    out = run_treeop(["--find-redundant-dirs", "--min-size", "5", str(dir_a), str(dir_b)], root)
+
+    assert f"5 bytes / 1 files redundant" in out
+    assert f"7 bytes / 2 files redundant" not in out
+
+
 def test_remove_dir_internal_copies_dry_run_verbose(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
@@ -978,7 +1033,7 @@ def test_find_overlapping_dirs_remove_copies_actual_preserves_oldest(tmp_path: P
     assert not b_new.exists()
 
 
-def test_top_requires_find_overlapping_dirs(tmp_path: Path):
+def test_top_requires_find_operation(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
     if not bin_path.exists():
@@ -990,7 +1045,7 @@ def test_top_requires_find_overlapping_dirs(tmp_path: Path):
     result = run_treeop_result(["--top", "1", str(dir_a)], root)
 
     assert result.returncode != 0
-    assert "--top requires --find-overlapping-dirs." in result.stdout
+    assert "--top requires --find-overlapping-dirs or --find-redundant-dirs." in result.stdout
     assert not (dir_a / ".dirdb").exists()
 
 
