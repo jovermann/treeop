@@ -1137,6 +1137,39 @@ def test_remove_copies_interactive_dry_run(tmp_path: Path):
     assert new.exists()
 
 
+def test_remove_copies_interactive_adjusts_min_size(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+
+    write_file(dir_a / "small.txt", "x")
+    write_file(dir_b / "small.txt", "x")
+    write_file(dir_a / "large.txt", "yy")
+    write_file(dir_b / "large.txt", "yy")
+
+    out = run_treeop_pty(
+        ["--remove-copies", "--interactive", "--dry-run", str(dir_a), str(dir_b)],
+        root,
+        b"mmq",
+    )
+
+    assert "m/M: min-size" in out
+    assert "redundant-files: 2  redundant-bytes: 3  min-size: 0" in out
+    assert "min-size increased to 1" in out
+    assert "min-size increased to 2" in out
+    assert "redundant-files: 1  redundant-bytes: 2  min-size: 2" in out
+    assert (dir_a / "small.txt").exists()
+    assert (dir_b / "small.txt").exists()
+    assert (dir_a / "large.txt").exists()
+    assert (dir_b / "large.txt").exists()
+
+
 def test_stats_hardlinked_and_redundant(tmp_path: Path):
     if not supports_hardlinks(tmp_path):
         pytest.skip("Filesystem does not support hardlinks")

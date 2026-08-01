@@ -1893,6 +1893,8 @@ public:
             std::string hash;
         };
 
+        FileFilter liveFilter = filter;
+
         auto collectEntries = [&]() {
             struct PendingGroup
             {
@@ -1916,7 +1918,7 @@ public:
                     const auto& dir = dirs[dirIndex];
                     for (const auto& file : dir.files)
                     {
-                        if (!filter.matches(file))
+                        if (!liveFilter.matches(file))
                         {
                             continue;
                         }
@@ -2018,7 +2020,7 @@ public:
                 std::map<ContentKey, std::vector<const FileEntry*>> groups;
                 for (const auto& file : dir.files)
                 {
-                    if (!filter.matches(file))
+                    if (!liveFilter.matches(file))
                     {
                         continue;
                     }
@@ -2110,6 +2112,8 @@ public:
             PageUp,
             PageDown,
             Remove,
+            IncreaseMinSize,
+            DecreaseMinSize,
             ToggleColors,
             Quit
         };
@@ -2128,6 +2132,14 @@ public:
             if (c == 'r' || c == 'R')
             {
                 return Key::Remove;
+            }
+            if (c == 'm')
+            {
+                return Key::IncreaseMinSize;
+            }
+            if (c == 'M')
+            {
+                return Key::DecreaseMinSize;
             }
             if (c == 't' || c == 'T')
             {
@@ -2182,6 +2194,22 @@ public:
         bool showColorMatrix = false;
         std::string status = dryRun ? "dry-run: r previews removal, q quits" : "r removes selected file, q quits";
 
+        auto refreshEntries = [&]() {
+            entries = collectEntries();
+            if (selected >= entries.size() && selected > 0)
+            {
+                selected--;
+            }
+            if (selected >= entries.size())
+            {
+                selected = 0;
+            }
+            if (scroll >= entries.size())
+            {
+                scroll = entries.empty() ? 0 : entries.size() - 1;
+            }
+        };
+
         auto visibleListHeight = []() {
             size_t height = ut1::tui::terminalHeight();
             return height > 6 ? height - 6 : size_t(1);
@@ -2212,7 +2240,8 @@ public:
                 }
             }
             return "redundant-files: " + ut1::formatU64WithUnderscores(redundantFiles)
-                + "  redundant-bytes: " + ut1::formatU64WithUnderscores(redundantBytes);
+                + "  redundant-bytes: " + ut1::formatU64WithUnderscores(redundantBytes)
+                + "  min-size: " + ut1::formatU64WithUnderscores(liveFilter.minSize);
         };
 
         auto formatMetaColumns = [](const InteractiveEntry& entry) {
@@ -2244,7 +2273,7 @@ public:
                 title += " (dry-run)";
             }
             std::cout << ansiTitleBar << ut1::tui::fitTerminalLine(title, width) << ut1::tui::ansiReset << "\n";
-            std::cout << ut1::tui::ansiGray << "Up/Down: move  PgUp/PgDn: page  r: remove  t: colors  q: quit" << ut1::tui::ansiReset << "\n";
+            std::cout << ut1::tui::ansiGray << "Up/Down: move  PgUp/PgDn: page  m/M: min-size  r: remove  t: colors  q: quit" << ut1::tui::ansiReset << "\n";
             if (showColorMatrix)
             {
                 ut1::tui::printAnsiColorMatrix(std::cout, listHeight + 1);
@@ -2305,6 +2334,20 @@ public:
                 status = showColorMatrix ? "color matrix: t returns to file list, q quits" : "returned to file list";
                 continue;
             }
+            if (key == Key::IncreaseMinSize)
+            {
+                liveFilter.minSize = liveFilter.minSize == 0 ? 1 : (liveFilter.minSize <= UINT64_MAX / 2 ? liveFilter.minSize * 2 : UINT64_MAX);
+                refreshEntries();
+                status = "min-size increased to " + ut1::formatU64WithUnderscores(liveFilter.minSize);
+                continue;
+            }
+            if (key == Key::DecreaseMinSize)
+            {
+                liveFilter.minSize = liveFilter.minSize <= 1 ? 0 : liveFilter.minSize / 2;
+                refreshEntries();
+                status = "min-size decreased to " + ut1::formatU64WithUnderscores(liveFilter.minSize);
+                continue;
+            }
             if (entries.empty())
             {
                 continue;
@@ -2361,11 +2404,7 @@ public:
                 stats.bytes += entry.file.size;
                 addExtensionStat(stats.extensions, entry.fullPath.string(), entry.file.size);
                 eraseInMemory(entry.dirIndex, entry.relPath);
-                entries = collectEntries();
-                if (selected >= entries.size() && selected > 0)
-                {
-                    selected--;
-                }
+                refreshEntries();
             }
         }
 
