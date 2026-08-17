@@ -167,6 +167,31 @@ def test_intersect_min_size_filters_file_sets(tmp_path: Path):
     assert "small-shared.txt" not in out
 
 
+def test_intersect_file_arg_parent_does_not_include_child_dir_arg(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    bin_path = treeop_bin()
+    if not bin_path.exists():
+        return
+
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+    write_file(parent / "selected.txt", "parent-only")
+    write_file(child / "child.txt", "child-only")
+
+    out = run_treeop(["--intersect", str(parent / "selected.txt"), str(child)], root)
+    parent_section = out.split(f"{parent}:\n", 1)[1].split("----------------------------------------", 1)[0]
+    child_section = out.split(f"{child}:\n", 1)[1].split("----------------------------------------", 1)[0]
+    total_section = out.split("total:\n", 1)[1]
+
+    assert re.search(r"unique-files:\s+1", parent_section)
+    assert re.search(r"shared-files:\s+0", parent_section)
+    assert re.search(r"unique-files:\s+1", child_section)
+    assert re.search(r"shared-files:\s+0", child_section)
+    assert re.search(r"unique-files:\s+2", total_section)
+    assert re.search(r"shared-files:\s+0", total_section)
+
+
 def test_containment_reports_nested_complete_mostly_and_missing_dirs(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()

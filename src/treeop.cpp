@@ -495,6 +495,11 @@ struct InputRoot
     bool recursive{};
 };
 
+static bool inputRootContainsDir(const InputRoot& root, const fs::path& dirPath)
+{
+    return root.recursive ? isPathWithinPath(root.path, dirPath) : root.path == dirPath;
+}
+
 static std::vector<std::string> parsePatterns(const ut1::CommandLineParser& cl, const std::string& optionName)
 {
     std::vector<std::string> patterns;
@@ -1008,7 +1013,7 @@ public:
     }
 
     /// Print intersect stats and optional file lists/extractions.
-    void printIntersectStats(const std::vector<fs::path>& rootPaths, bool listFirst, bool listLast, bool listBoth,
+    void printIntersectStats(const std::vector<InputRoot>& rootPaths, bool listFirst, bool listLast, bool listBoth,
         const fs::path* extractFirst, const fs::path* extractLast, bool removeCopies, bool removeCopiesFromLast, bool dryRun, const FileFilter& filter) const
     {
         std::vector<std::map<ContentKey, std::vector<FileEntry>>> rootFiles(rootPaths.size());
@@ -1018,7 +1023,7 @@ public:
         {
             for (size_t i = 0; i < rootPaths.size(); i++)
             {
-                if (!isPathWithin(rootPaths[i], dir.path))
+                if (!inputRootContainsDir(rootPaths[i], dir.path))
                 {
                     continue;
                 }
@@ -1088,7 +1093,7 @@ public:
                 {"shared-size:", ut1::getApproxSizeStr(sharedStats.bytes, 3, true, false), std::string()}
             };
 
-            std::cout << rootPaths[i].string() << ":\n";
+            std::cout << rootPaths[i].path.string() << ":\n";
             printStatList(stats);
             printBlockSeparator();
         }
@@ -1173,7 +1178,7 @@ public:
             {
                 for (size_t i = 0; i < lastIndex; i++)
                 {
-                    copyIntersectFiles(rootPaths[i], *extractFirst, rootFiles[i], lastFiles, dryRun, true);
+                    copyIntersectFiles(rootPaths[i].path, *extractFirst, rootFiles[i], lastFiles, dryRun, true);
                 }
             }
             if (extractLast)
@@ -1183,7 +1188,7 @@ public:
                 {
                     firstFiles.emplace(key, std::vector<FileEntry>{});
                 }
-                copyIntersectFiles(rootPaths[lastIndex], *extractLast, lastFiles, firstFiles, dryRun, false);
+                copyIntersectFiles(rootPaths[lastIndex].path, *extractLast, lastFiles, firstFiles, dryRun, false);
             }
 
         size_t hashLen = 0;
@@ -5797,7 +5802,7 @@ int main(int argc, char *argv[])
                     extractLast = normalizePath(cl.getStr("extract-last"));
                 }
                 mainDb.printIntersectStats(
-                    normalizedRoots,
+                    inputRoots,
                     cl("list-first"),
                     cl("list-last"),
                     cl("list-both"),
