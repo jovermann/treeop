@@ -8,6 +8,7 @@
 #include "Tui.hpp"
 #include <iomanip>
 #include <iostream>
+#include <poll.h>
 #include <stdexcept>
 #include <string>
 #include <sys/ioctl.h>
@@ -20,6 +21,7 @@ namespace tui
 {
 
 const char* const ansiReset = "\033[0m";
+const char* const ansiBold = "\033[1m";
 const char* const ansiBlack = "\033[30m";
 const char* const ansiRed = "\033[31m";
 const char* const ansiGreen = "\033[32m";
@@ -105,14 +107,58 @@ std::string fitTerminalLine(const std::string& line, size_t width)
     return line.substr(0, width - 3) + "...";
 }
 
-int readStdinByte()
+int readStdinByte(int timeoutMs)
 {
+    pollfd pfd{STDIN_FILENO, POLLIN, 0};
+    if (poll(&pfd, 1, timeoutMs) <= 0)
+    {
+        return -1;
+    }
     char c = 0;
     if (read(STDIN_FILENO, &c, 1) != 1)
     {
         return -1;
     }
     return static_cast<unsigned char>(c);
+}
+
+int readKey(int timeoutMs)
+{
+    int key = readStdinByte(timeoutMs);
+    if (key != 27)
+    {
+        return key;
+    }
+    int second = readStdinByte(20);
+    if ((second != '[') && (second != 'O'))
+    {
+        return 27;
+    }
+    int third = readStdinByte(20);
+    if (third == 'A')
+    {
+        return keyUp;
+    }
+    if (third == 'B')
+    {
+        return keyDown;
+    }
+    return 27;
+}
+
+void clearScreen()
+{
+    std::cout << "\033[H\033[2J";
+}
+
+void enterAlternateScreen()
+{
+    std::cout << "\033[?1049h\033[?25l" << std::flush;
+}
+
+void leaveAlternateScreen()
+{
+    std::cout << "\033[?1049l\033[?25h" << std::flush;
 }
 
 void printAnsiColorMatrix(std::ostream& os, size_t maxRows)

@@ -19,6 +19,7 @@ namespace tui
 
 /// ANSI SGR escape sequence that resets foreground, background, and attributes.
 extern const char* const ansiReset;
+extern const char* const ansiBold;
 
 /// Simple foreground colors without background: standard 30-37 colors.
 extern const char* const ansiBlack;
@@ -80,8 +81,23 @@ size_t terminalWidth();
 /// Uses "..." when there is room; callers should apply ANSI colors after this.
 std::string fitTerminalLine(const std::string& line, size_t width);
 
-/// Read one byte from stdin. Returns -1 on EOF or read error.
-int readStdinByte();
+/// Read one byte from stdin. Returns -1 on timeout, EOF, or read error.
+/// A negative timeout waits indefinitely.
+int readStdinByte(int timeoutMs = -1);
+
+/// Decoded special-key values returned by readKey().
+constexpr int keyUp   = 0x100;
+constexpr int keyDown = 0x101;
+
+/// Read a key and decode common ANSI cursor-up/down sequences.
+int readKey(int timeoutMs = -1);
+
+/// Clear the terminal and move the cursor to the upper-left corner.
+void clearScreen();
+
+/// Enter/leave the terminal's alternate screen buffer.
+void enterAlternateScreen();
+void leaveAlternateScreen();
 
 /// Print a matrix of ANSI background/foreground color combinations.
 ///
