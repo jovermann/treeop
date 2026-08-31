@@ -1286,6 +1286,47 @@ def test_stats_hardlinked_and_redundant(tmp_path: Path):
     assert stat_value("hardlinked-size:") == 6
 
 
+def test_scan_hashes_cross_root_hardlinks_once(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    file_a = dir_a / "shared.bin"
+    file_a.write_bytes(b"x" * (1024 * 1024))
+    os.link(file_a, dir_b / "shared.bin")
+
+    out = run_treeop(["--stats", str(dir_a), str(dir_b)], root)
+
+    # One per-root line plus the aggregate total; hashing both roots would produce three.
+    assert out.count("hash-size:") == 2
+    assert "hash-size:              1.000 MB" in out
+
+
+def test_scan_seeds_inode_hash_cache_from_dirdb(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    file_a = dir_a / "shared.bin"
+    file_a.write_bytes(b"x" * (1024 * 1024))
+
+    # The database records one link; a later incremental backup makes that stale.
+    run_treeop([str(dir_a)], root)
+    os.link(file_a, dir_b / "shared.bin")
+    out = run_treeop(["--stats", str(dir_a), str(dir_b)], root)
+
+    assert "hash-size:" not in out
+    assert (dir_b / ".dirdb").exists()
+
+
 def test_stats_total_for_multiple_roots(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
@@ -2060,6 +2101,26 @@ def test_new_dirdb(tmp_path: Path):
     assert second_hash != first_hash
 
 
+def test_make_dirs_writable_for_new_dirdb(tmp_path: Path):
+    if os.geteuid() == 0:
+        pytest.skip("Root bypasses directory write permissions")
+
+    root = Path(__file__).resolve().parents[1]
+    dir_a = tmp_path / "a"
+    dir_a.mkdir()
+    write_file(dir_a / "file.txt", "one")
+    dir_a.chmod(0o555)
+
+    result = run_treeop_result([str(dir_a)], root)
+    assert result.returncode != 0
+    assert not (dir_a / ".dirdb").exists()
+
+    run_treeop(["--make-dirs-writable", str(dir_a)], root)
+
+    assert (dir_a / ".dirdb").exists()
+    assert dir_a.stat().st_mode & 0o200
+
+
 def test_remove_dirdb(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
@@ -2079,6 +2140,160 @@ def test_remove_dirdb(tmp_path: Path):
     run_treeop(["--remove-dirdb", str(dir_a)], root)
     assert not (dir_a / ".dirdb").exists()
     assert not (dir_b / ".dirdb").exists()
+
+
+def test_remove_corrupt_dirdbs(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    bad = tree / "a-bad"
+    good = tree / "b-good"
+    deep_bad = good / "deep-bad"
+    write_file(bad / "file.txt", "bad")
+    write_file(good / "file.txt", "good")
+    write_file(deep_bad / "file.txt", "deep bad")
+    run_treeop([str(tree)], root)
+    (bad / ".dirdb").write_bytes(b"broken")
+    (deep_bad / ".dirdb").write_bytes(b"also broken")
+
+    out = run_treeop([
+        "--remove-corrupt-dirdbs", "--dry-run", "--max-depth", "1", str(tree),
+    ], root)
+
+    assert f"Corrupt {bad / '.dirdb'}:" in out
+    assert f"Would remove {bad / '.dirdb'}" in out
+    assert str(deep_bad / ".dirdb") not in out
+    assert "removed-corrupt-dirdbs: 1" in out
+    assert (bad / ".dirdb").exists()
+    assert (good / ".dirdb").exists()
+
+    out = run_treeop(["--remove-corrupt-dirdbs", "-v", str(tree)], root)
+
+    assert f"Removed {bad / '.dirdb'}" in out
+    assert f"Removed {deep_bad / '.dirdb'}" in out
+    assert "removed-corrupt-dirdbs: 2" in out
+    assert not (bad / ".dirdb").exists()
+    assert not (deep_bad / ".dirdb").exists()
+    assert (tree / ".dirdb").exists()
+    assert (good / ".dirdb").exists()
+
+
+def test_normal_processing_regenerates_corrupt_dirdb(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "file.txt", "content")
+    run_treeop([str(tree)], root)
+    db_path = tree / ".dirdb"
+
+    db_path.write_bytes(b"broken")
+    out = run_treeop(["--list-files", str(tree)], root)
+    assert f"Warning: Removing corrupt {db_path}:" in out
+    assert "file.txt" in out
+    assert db_path.read_bytes() != b"broken"
+
+    db_path.write_bytes(b"broken again")
+    out = run_treeop(["--update-dirdb", str(tree)], root)
+    assert f"Warning: Removing corrupt {db_path}:" in out
+    assert db_path.read_bytes() != b"broken again"
+
+    out = run_treeop(["--list-files", str(tree)], root)
+    assert "Warning: Removing corrupt" not in out
+    assert "file.txt" in out
+
+
+def test_remove_dirs_that_contain_file(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    failed = tree / "failed"
+    nested = failed / "nested"
+    failed_two = tree / "failed-two"
+    good = tree / "good"
+    nested.mkdir(parents=True)
+    failed_two.mkdir(parents=True)
+    good.mkdir(parents=True)
+    write_file(failed / "BACKUP.FAILED", "stamp")
+    write_file(nested / "BACKUP.FAILED", "nested stamp")
+    write_file(failed_two / "OTHER.FAILED", "stamp")
+    write_file(good / "data.txt", "keep")
+    write_file(good / ".dirdb", "not a valid database")
+
+    out = run_treeop([
+        "--remove-dirs-that-contain-file", "*.FAILED",
+        "--dry-run", "--progress", str(tree),
+    ], root)
+
+    assert f"Would remove dir {failed}" in out
+    assert f"Would remove dir {failed_two}" in out
+    assert f"Would remove dir {nested}" not in out
+    assert "removed-dirs: 2" in out
+    removal_lines = [line for line in out.splitlines() if line.startswith("Would remove dir ")]
+    assert removal_lines == sorted(removal_lines)
+    assert failed.exists()
+    assert failed_two.exists()
+    assert (good / ".dirdb").read_text(encoding="utf-8") == "not a valid database"
+
+    out = run_treeop([
+        "--remove-dirs-that-contain-file", "*.FAILED",
+        "-v", str(tree),
+    ], root)
+
+    assert f"Removed dir {failed}" in out
+    assert f"Removed dir {failed_two}" in out
+    assert not failed.exists()
+    assert not failed_two.exists()
+    assert good.exists()
+    assert not (tree / ".dirdb").exists()
+    assert (good / ".dirdb").read_text(encoding="utf-8") == "not a valid database"
+
+
+def test_remove_dirs_that_contain_file_is_standalone(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    tree.mkdir()
+
+    result = run_treeop_result([
+        "--remove-dirs-that-contain-file", "FAILED",
+        "--stats", str(tree),
+    ], root)
+
+    assert result.returncode != 0
+    assert "cannot be combined with other operations" in result.stdout
+
+
+def test_remove_dirs_that_contain_file_respects_max_depth(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    shallow_failed = tree / "shallow-failed"
+    deep_parent = tree / "deep-parent"
+    deep_failed = deep_parent / "deep-failed"
+    write_file(shallow_failed / "BACKUP.FAILED", "remove")
+    write_file(deep_failed / "BACKUP.FAILED", "too deep")
+
+    out = run_treeop([
+        "--remove-dirs-that-contain-file", "BACKUP.FAILED",
+        "--max-depth", "1", "--dry-run", str(tree),
+    ], root)
+
+    assert f"Would remove dir {shallow_failed}" in out
+    assert str(deep_failed) not in out
+    assert "removed-dirs: 1" in out
+    assert shallow_failed.exists()
+    assert deep_failed.exists()
+
+
+def test_max_depth_limits_dirdb_tree_processing(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    child = tree / "child"
+    grandchild = child / "grandchild"
+    write_file(tree / "root.txt", "root")
+    write_file(child / "child.txt", "child")
+    write_file(grandchild / "grandchild.txt", "grandchild")
+
+    run_treeop(["--max-depth", "1", str(tree)], root)
+
+    assert (tree / ".dirdb").exists()
+    assert (child / ".dirdb").exists()
+    assert not (grandchild / ".dirdb").exists()
 
 
 def test_readbench(tmp_path: Path):

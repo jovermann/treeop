@@ -34,12 +34,25 @@
 #include <fnmatch.h>
 
 static unsigned clVerbose = 0;
+static bool gMakeDirsWritable = false;
+static std::optional<uint64_t> gMaxDepth;
 
 using FileSize = uint64_t;
 using NumFiles = size_t;
 using DirIndex = size_t;
 using FileIndex = size_t;
 namespace fs = std::filesystem;
+
+/// Apply the global depth limit to a directory yielded by a recursive iterator.
+static bool includeRecursiveDirectory(fs::recursive_directory_iterator& it)
+{
+    uint64_t depth = static_cast<uint64_t>(it.depth()) + 1;
+    if (gMaxDepth && depth >= *gMaxDepth)
+    {
+        it.disable_recursion_pending();
+    }
+    return !gMaxDepth || depth <= *gMaxDepth;
+}
 
 static uint64_t parseSizeOption(const ut1::CommandLineParser& cl, const std::string& optionName)
 {
@@ -544,9 +557,43 @@ struct RemoveContainedDirStats
     uint64_t bytes{};
 };
 
-static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update);
-static DirDbData createDirDb(const fs::path& dirPath);
-static DirDbData updateDirDb(const fs::path& dirPath);
+struct InodeHashCache
+{
+    struct Value
+    {
+        Hash128 hash{};
+        uint64_t size{};
+        uint64_t date{};
+    };
+
+    bool enabled{true};
+    bool hasDevice{};
+    dev_t device{};
+    std::unordered_map<uint64_t, Value> hashes;
+
+    /// Observe a file's device, permanently disabling reuse if devices differ.
+    bool observeDevice(dev_t fileDevice)
+    {
+        if (!enabled)
+        {
+            return false;
+        }
+        if (!hasDevice)
+        {
+            device = fileDevice;
+            hasDevice = true;
+        }
+        else if (device != fileDevice)
+        {
+            hashes.clear();
+            enabled = false;
+        }
+        return enabled;
+    }
+};
+
+static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update, InodeHashCache* inodeCache);
+static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache = nullptr);
 static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool dryRun);
 /// Check whether a directory is empty aside from an optional .dirdb file.
 static bool isDirEmpty(const fs::path& dir, bool& hasDirDb);
@@ -611,16 +658,17 @@ public:
     /// Load or create .dirdb files for all roots and record elapsed time.
     void processRoots(bool forceCreate, bool update)
     {
+        InodeHashCache inodeCache;
         for (auto& rootData : roots)
         {
             double start = ut1::getTimeSec();
             if (rootData.recursive)
             {
-                processDirTree(rootData.path, forceCreate, update);
+                processDirTree(rootData.path, forceCreate, update, &inodeCache);
             }
             else
             {
-                addDir(loadOrCreateDirDb(rootData.path, forceCreate, update));
+                addDir(loadOrCreateDirDb(rootData.path, forceCreate, update, &inodeCache));
             }
             rootData.elapsedSeconds = ut1::getTimeSec() - start;
         }
@@ -3537,6 +3585,10 @@ private:
 
     static uint64_t countDirsInTree(const fs::path& root)
     {
+        if (gMaxDepth && *gMaxDepth == 0)
+        {
+            return 1;
+        }
         uint64_t count = 1;
         std::error_code ec;
         for (fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec), end;
@@ -3553,7 +3605,10 @@ private:
             }
             if (ut1::fsIsDirectory(it->path(), false))
             {
-                count++;
+                if (includeRecursiveDirectory(it))
+                {
+                    count++;
+                }
             }
         }
         return count;
@@ -4237,9 +4292,13 @@ private:
     }
 
     /// Walk a directory tree and load or create .dirdb files.
-    void processDirTree(const fs::path& root, bool forceCreate, bool update)
+    void processDirTree(const fs::path& root, bool forceCreate, bool update, InodeHashCache* inodeCache)
     {
-        addDir(loadOrCreateDirDb(root, forceCreate, update));
+        addDir(loadOrCreateDirDb(root, forceCreate, update, inodeCache));
+        if (gMaxDepth && *gMaxDepth == 0)
+        {
+            return;
+        }
 
         std::error_code ec;
         fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
@@ -4261,7 +4320,10 @@ private:
             }
             if (ut1::fsIsDirectory(it->path(), false))
             {
-                addDir(loadOrCreateDirDb(it->path(), forceCreate, update));
+                if (includeRecursiveDirectory(it))
+                {
+                    addDir(loadOrCreateDirDb(it->path(), forceCreate, update, inodeCache));
+                }
             }
             it.increment(ec);
         }
@@ -4563,12 +4625,15 @@ static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
             }
             if (ut1::fsIsDirectory(it->path(), false))
             {
-                if (gProgress)
+                if (includeRecursiveDirectory(it))
                 {
-                    gProgress->onDirStart(it->path());
-                    gProgress->onDirDone();
+                    if (gProgress)
+                    {
+                        gProgress->onDirStart(it->path());
+                        gProgress->onDirDone();
+                    }
+                    stats.dirs++;
                 }
-                stats.dirs++;
                 it.increment(ec);
                 continue;
             }
@@ -4684,7 +4749,10 @@ static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool
         }
         if (ut1::fsIsDirectory(it->path(), false))
         {
-            dirs.push_back(it->path());
+            if (includeRecursiveDirectory(it))
+            {
+                dirs.push_back(it->path());
+            }
         }
     }
 
@@ -4934,7 +5002,7 @@ static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* seco
 }
 
 /// Read a .dirdb file for a directory and return its contents.
-static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true)
+static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true, InodeHashCache* inodeCache = nullptr)
 {
     fs::path dbPath = dirPath / ".dirdb";
     std::string raw = ut1::readFile(dbPath.string());
@@ -5076,6 +5144,18 @@ static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true)
         dirData.files.push_back(std::move(entry));
     }
 
+    if (inodeCache)
+    {
+        ut1::StatInfo dbStat = ut1::getStat(fs::directory_entry(dbPath), false);
+        if (inodeCache->observeDevice(dbStat.getDev()))
+        {
+            for (const auto& file : dirData.files)
+            {
+                inodeCache->hashes[file.inode] = InodeHashCache::Value{file.hash, file.size, file.date};
+            }
+        }
+    }
+
     if (gProgress && reportProgress)
     {
         uint64_t totalBytes = 0;
@@ -5119,7 +5199,10 @@ struct HashReuseKeyHasher
 };
 
 /// Scan a directory and build a new .dirdb file, reusing hashes when possible.
-static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<HashReuseKey, FileEntry, HashReuseKeyHasher>* cache)
+static DirDbData buildDirDb(
+    const fs::path& dirPath,
+    const std::unordered_map<HashReuseKey, FileEntry, HashReuseKeyHasher>* cache,
+    InodeHashCache* inodeCache)
 {
     if (clVerbose > 0)
     {
@@ -5155,16 +5238,27 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
         }
         ut1::StatInfo statInfo = ut1::getStat(entry, false);
         uint64_t date = fileTimeFromTimespec(statInfo.getMTimeSpec());
+        uint64_t inode = static_cast<uint64_t>(statInfo.getIno());
+        bool canReuseInode = inodeCache && inodeCache->observeDevice(statInfo.getDev());
         Hash128 hash{};
         bool reusedHash = false;
         if (cache)
         {
-            HashReuseKey key{static_cast<uint64_t>(statInfo.getIno()), size, date};
+            HashReuseKey key{inode, size, date};
             auto it = cache->find(key);
             if (it != cache->end())
             {
                 const auto& cached = it->second;
                 hash = cached.hash;
+                reusedHash = true;
+            }
+        }
+        if (!reusedHash && canReuseInode)
+        {
+            auto it = inodeCache->hashes.find(inode);
+            if (it != inodeCache->hashes.end() && it->second.size == size && it->second.date == date)
+            {
+                hash = it->second.hash;
                 reusedHash = true;
             }
         }
@@ -5175,11 +5269,15 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
             hashedBytes += size;
             hashSeconds += seconds;
         }
+        if (canReuseInode)
+        {
+            inodeCache->hashes[inode] = InodeHashCache::Value{hash, size, date};
+        }
         FileEntry scan;
         scan.path = entry.path().filename().string();
         scan.size = size;
         scan.hash = hash;
-        scan.inode = static_cast<uint64_t>(statInfo.getIno());
+        scan.inode = inode;
         scan.date = date;
         scan.numLinks = static_cast<uint64_t>(statInfo.statData.st_nlink);
         entries.push_back(std::move(scan));
@@ -5266,6 +5364,15 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
 
     fs::path dbPath = dirPath / ".dirdb";
     std::string raw(reinterpret_cast<const char*>(out.data()), out.size());
+    if (gMakeDirsWritable)
+    {
+        std::error_code permissionEc;
+        fs::permissions(dirPath, fs::perms::owner_write, fs::perm_options::add, permissionEc);
+        if (permissionEc)
+        {
+            throw std::runtime_error("Failed to make directory writable: " + dirPath.string() + ": " + permissionEc.message());
+        }
+    }
     ut1::writeFile(dbPath.string(), raw);
 
     DirDbData dirData;
@@ -5288,41 +5395,86 @@ static DirDbData buildDirDb(const fs::path& dirPath, const std::unordered_map<Ha
 }
 
 /// Create a new .dirdb file for a directory.
-static DirDbData createDirDb(const fs::path& dirPath)
+static DirDbData createDirDb(const fs::path& dirPath, InodeHashCache* inodeCache)
 {
-    return buildDirDb(dirPath, nullptr);
+    return buildDirDb(dirPath, nullptr, inodeCache);
+}
+
+/// Delete a database that failed to parse and rebuild it from directory contents.
+static DirDbData recoverCorruptDirDb(
+    const fs::path& dirPath,
+    InodeHashCache* inodeCache,
+    const std::exception& readError)
+{
+    fs::path dbPath = dirPath / ".dirdb";
+    std::cout << "Warning: Removing corrupt " << dbPath.string() << ": " << readError.what() << "\n";
+    if (gMakeDirsWritable)
+    {
+        std::error_code permissionEc;
+        fs::permissions(dirPath, fs::perms::owner_write, fs::perm_options::add, permissionEc);
+        if (permissionEc)
+        {
+            throw std::runtime_error("Failed to make directory writable: " + dirPath.string() + ": " + permissionEc.message());
+        }
+    }
+    std::error_code removeEc;
+    fs::remove(dbPath, removeEc);
+    if (removeEc)
+    {
+        throw std::runtime_error("Failed to remove corrupt " + dbPath.string() + ": " + removeEc.message());
+    }
+    return createDirDb(dirPath, inodeCache);
 }
 
 /// Update an existing .dirdb by reusing cached hashes where possible.
-static DirDbData updateDirDb(const fs::path& dirPath)
+static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache)
 {
-    DirDbData existing = readDirDb(dirPath, false);
+    DirDbData existing;
+    try
+    {
+        existing = readDirDb(dirPath, false, inodeCache);
+    }
+    catch (const std::exception& e)
+    {
+        if (inodeCache)
+        {
+            return recoverCorruptDirDb(dirPath, inodeCache, e);
+        }
+        throw;
+    }
     std::unordered_map<HashReuseKey, FileEntry, HashReuseKeyHasher> cache;
     for (const auto& entry : existing.files)
     {
         HashReuseKey key{entry.inode, entry.size, entry.date};
         cache.emplace(std::move(key), entry);
     }
-    return buildDirDb(dirPath, &cache);
+    return buildDirDb(dirPath, &cache, inodeCache);
 }
 
 /// Load, create, or update a .dirdb file depending on flags.
-static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update)
+static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update, InodeHashCache* inodeCache)
 {
     fs::path dbPath = dirPath / ".dirdb";
     if (update)
     {
         if (ut1::fsExists(dbPath))
         {
-            return updateDirDb(dirPath);
+            return updateDirDb(dirPath, inodeCache);
         }
-        return createDirDb(dirPath);
+        return createDirDb(dirPath, inodeCache);
     }
     if (!forceCreate && ut1::fsExists(dbPath))
     {
-        return readDirDb(dirPath);
+        try
+        {
+            return readDirDb(dirPath, true, inodeCache);
+        }
+        catch (const std::exception& e)
+        {
+            return recoverCorruptDirDb(dirPath, inodeCache, e);
+        }
     }
-    return createDirDb(dirPath);
+    return createDirDb(dirPath, inodeCache);
 }
 
 /// Remove the .dirdb file in a single directory.
@@ -5352,6 +5504,10 @@ static void removeDirDbInDir(const fs::path& dirPath, bool dryRun)
 static void removeDirDbTree(const fs::path& root, bool dryRun)
 {
     removeDirDbInDir(root, dryRun);
+    if (gMaxDepth && *gMaxDepth == 0)
+    {
+        return;
+    }
 
     std::error_code ec;
     fs::recursive_directory_iterator it(root, fs::directory_options::skip_permission_denied, ec);
@@ -5370,10 +5526,235 @@ static void removeDirDbTree(const fs::path& root, bool dryRun)
         }
         if (ut1::fsIsDirectory(it->path(), false))
         {
-            removeDirDbInDir(it->path(), dryRun);
+            if (includeRecursiveDirectory(it))
+            {
+                removeDirDbInDir(it->path(), dryRun);
+            }
         }
         it.increment(ec);
     }
+}
+
+/// Validate and optionally remove the .dirdb in one directory.
+static uint64_t removeCorruptDirDbInDir(const fs::path& dir, bool dryRun)
+{
+    fs::path dbPath = dir / ".dirdb";
+    if (!ut1::fsExists(dbPath))
+    {
+        return 0;
+    }
+    try
+    {
+        readDirDb(dir, false);
+        if (clVerbose > 1)
+        {
+            std::cout << "Valid " << dbPath.string() << "\n";
+        }
+        return 0;
+    }
+    catch (const std::exception& e)
+    {
+        std::cout << "Corrupt " << dbPath.string() << ": " << e.what() << "\n";
+    }
+
+    if (dryRun)
+    {
+        std::cout << "Would remove " << dbPath.string() << "\n";
+    }
+    else
+    {
+        std::error_code ec;
+        fs::remove(dbPath, ec);
+        if (ec)
+        {
+            throw std::runtime_error("Failed to remove " + dbPath.string() + ": " + ec.message());
+        }
+        if (clVerbose)
+        {
+            std::cout << "Removed " << dbPath.string() << "\n";
+        }
+    }
+    return 1;
+}
+
+/// Recursively remove corrupt .dirdb files without creating replacements.
+static uint64_t removeCorruptDirDbsTree(const fs::path& dir, bool dryRun, uint64_t depth = 0)
+{
+    if (gProgress)
+    {
+        gProgress->onDirStart(dir);
+    }
+    uint64_t removed = removeCorruptDirDbInDir(dir, dryRun);
+    if (gProgress)
+    {
+        gProgress->onDirDone();
+    }
+    if (gMaxDepth && depth >= *gMaxDepth)
+    {
+        return removed;
+    }
+
+    std::vector<fs::path> childDirs;
+    std::error_code ec;
+    for (fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec), end;
+         it != end; it.increment(ec))
+    {
+        if (ec)
+        {
+            if (clVerbose)
+            {
+                std::cout << "Skipping entry in " << dir.string() << ": " << ec.message() << "\n";
+            }
+            ec.clear();
+            continue;
+        }
+        std::error_code statusEc;
+        fs::file_status status = it->symlink_status(statusEc);
+        if (!statusEc && fs::is_directory(status))
+        {
+            childDirs.push_back(it->path());
+        }
+    }
+    std::sort(childDirs.begin(), childDirs.end());
+    for (const auto& child : childDirs)
+    {
+        removed += removeCorruptDirDbsTree(child, dryRun, depth + 1);
+    }
+    return removed;
+}
+
+struct StampDirStats
+{
+    uint64_t removed{};
+};
+
+/// Remove a directory based on its immediate files; otherwise recurse to the configured depth.
+static StampDirStats processStampDirsInDir(
+    const fs::path& dir,
+    const std::string* removePattern,
+    bool dryRun,
+    uint64_t depth)
+{
+    if (!ut1::fsExists(dir))
+    {
+        return {};
+    }
+    if (gProgress)
+    {
+        gProgress->onDirStart(dir);
+    }
+
+    bool containsRemoveFile = false;
+    std::vector<fs::path> childDirs;
+    std::error_code ec;
+    fs::directory_iterator it(dir, fs::directory_options::skip_permission_denied, ec);
+    fs::directory_iterator end;
+    if (ec)
+    {
+        if (clVerbose)
+        {
+            std::cout << "Skipping directory " << dir.string() << ": " << ec.message() << "\n";
+        }
+        if (gProgress)
+        {
+            gProgress->onDirDone();
+        }
+        return {};
+    }
+    while (it != end)
+    {
+        const fs::path path = it->path();
+        std::error_code statusEc;
+        fs::file_status status = it->symlink_status(statusEc);
+        if (statusEc)
+        {
+            if (clVerbose)
+            {
+                std::cout << "Skipping entry " << path.string() << ": " << statusEc.message() << "\n";
+            }
+        }
+        else if (fs::is_directory(status))
+        {
+            childDirs.push_back(path);
+        }
+        else if (path.filename() != ".dirdb" && fs::is_regular_file(status))
+        {
+            if (gProgress)
+            {
+                gProgress->onFileProcessed(0);
+            }
+            std::string filename = path.filename().string();
+            if (removePattern && fnmatch(removePattern->c_str(), filename.c_str(), 0) == 0)
+            {
+                containsRemoveFile = true;
+                break;
+            }
+        }
+        it.increment(ec);
+        if (ec)
+        {
+            if (clVerbose)
+            {
+                std::cout << "Skipping entry in " << dir.string() << ": " << ec.message() << "\n";
+            }
+            ec.clear();
+        }
+    }
+    it = end;
+    if (gProgress)
+    {
+        gProgress->onDirDone();
+    }
+
+    if (containsRemoveFile)
+    {
+        if (dryRun || clVerbose)
+        {
+            std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << dir.string() << "\n";
+        }
+        if (!dryRun)
+        {
+            std::error_code removeEc;
+            fs::remove_all(dir, removeEc);
+            if (removeEc)
+            {
+                throw std::runtime_error("Failed to remove dir " + dir.string() + ": " + removeEc.message());
+            }
+        }
+        return StampDirStats{1};
+    }
+
+    StampDirStats stats;
+    if (gMaxDepth && depth >= *gMaxDepth)
+    {
+        return stats;
+    }
+    std::sort(childDirs.begin(), childDirs.end());
+    for (const auto& child : childDirs)
+    {
+        StampDirStats childStats = processStampDirsInDir(child, removePattern, dryRun, depth + 1);
+        stats.removed += childStats.removed;
+    }
+    return stats;
+}
+
+/// Process all roots without constructing or reading directory databases.
+static StampDirStats processStampDirs(
+    const std::vector<fs::path>& roots,
+    const std::string* removePattern,
+    bool dryRun)
+{
+    StampDirStats stats;
+    for (const auto& root : roots)
+    {
+        StampDirStats rootStats = processStampDirsInDir(root, removePattern, dryRun, 0);
+        stats.removed += rootStats.removed;
+    }
+    if (gProgress)
+    {
+        gProgress->finish();
+    }
+    return stats;
 }
 
 /// Main.
@@ -5441,8 +5822,11 @@ int main(int argc, char *argv[])
     cl.addHeader("\nDatabase and tree maintenance:\n");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
     cl.addOption('u', "update-dirdb", "Update .dirdb files, reusing hashes when inode/size/mtime match.");
+    cl.addOption(' ', "make-dirs-writable", "Add owner-write permission to directories where .dirdb files are written.");
     cl.addOption(' ', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
+    cl.addOption(' ', "remove-corrupt-dirdbs", "Validate existing .dirdb files and remove those that cannot be read.");
     cl.addOption(' ', "remove-empty-dirs", "Remove empty directories (ignoring .dirdb files).");
+    cl.addOption(' ', "remove-dirs-that-contain-file", "Recursively remove directories containing a file matching FILE_PATTERN.", "FILE_PATTERN", "");
 
     cl.addHeader("\nBenchmarks:\n");
     cl.addOption(' ', "readbench", "Read all files to measure filesystem read performance.");
@@ -5454,6 +5838,7 @@ int main(int argc, char *argv[])
     cl.addOption('i', "interactive", "Open an interactive TUI for --remove-copies or --remove-dir-internal-copies.");
     cl.addOption(' ', "get-unique-hash-len", "Calculate the minimum hash length in bits that makes all file contents unique.");
     cl.addOption(' ', "top", "Maximum number of results to print (with --find-overlapping-dirs or --find-redundant-dirs).", "N", "0");
+    cl.addOption(' ', "max-depth", "Maximum directory recursion depth; command-line roots are at depth 0.", "N", "");
     cl.addOption('p', "progress", "Print progress once per second.");
     cl.addOption('W', "width", "Max width for progress line.", "N", "199");
     cl.addOption('v', "verbose", "Increase verbosity. Specify multiple times to be more verbose.");
@@ -5469,6 +5854,7 @@ int main(int argc, char *argv[])
     try
     {
         clVerbose = cl.getCount("verbose");
+        gMakeDirsWritable = cl("make-dirs-writable");
         gBufSize = parseSizeOption(cl, "bufsize");
         fileFilter.minSize = parseSizeOption(cl, "min-size");
         fileFilter.maxSize = parseSizeOption(cl, "max-size");
@@ -5479,6 +5865,10 @@ int main(int argc, char *argv[])
         maxHardlinks = parseSizeOption(cl, "max-hardlinks");
         sizeHistogram = parseSizeOption(cl, "size-histogram");
         top = cl.getUInt("top");
+        if (cl("max-depth"))
+        {
+            gMaxDepth = cl.getUInt("max-depth");
+        }
         if (gBufSize == 0)
         {
             cl.error("--bufsize must be greater than 0.");
@@ -5506,7 +5896,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -5540,6 +5930,43 @@ int main(int argc, char *argv[])
         if (cl.getArgs().empty())
         {
             cl.error("Please specify at least one path.");
+        }
+
+        if (cl("remove-dirs-that-contain-file"))
+        {
+            bool otherMode = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs")
+                || cl("size-histogram") || cl("remove-dirdb") || cl("remove-empty-dirs") || cl("intersect") || cl("containment")
+                || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs")
+                || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first")
+                || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies")
+                || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("hardlink-copies") || cl("break-hardlinks")
+                || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len") || cl("new-dirdb") || cl("update-dirdb")
+                || cl("make-dirs-writable");
+            if (otherMode)
+            {
+                cl.error("Stamp-file directory options cannot be combined with other operations.");
+            }
+
+            std::vector<fs::path> roots;
+            for (const std::string& path : cl.getArgs())
+            {
+                if (!ut1::fsExists(path) || !ut1::fsIsDirectory(path))
+                {
+                    cl.error("Path '" + path + "' is not a directory.");
+                }
+                roots.push_back(normalizePath(path));
+            }
+            std::optional<std::string> removePattern;
+            if (cl("remove-dirs-that-contain-file"))
+            {
+                removePattern = cl.getStr("remove-dirs-that-contain-file");
+            }
+            StampDirStats stats = processStampDirs(
+                roots,
+                removePattern ? &*removePattern : nullptr,
+                cl("dry-run"));
+            std::cout << "removed-dirs: " << stats.removed << "\n";
+            return 0;
         }
 
         std::vector<fs::path> normalizedRoots;
@@ -5605,6 +6032,22 @@ int main(int argc, char *argv[])
         if (cl("new-dirdb") && cl("update-dirdb"))
         {
             cl.error("Cannot combine --new-dirdb with --update-dirdb.");
+        }
+        if (cl("remove-corrupt-dirdbs"))
+        {
+            bool otherMode = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs")
+                || cl("size-histogram") || cl("remove-dirdb") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file")
+                || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files")
+                || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files")
+                || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last")
+                || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies")
+                || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("hardlink-copies")
+                || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")
+                || cl("new-dirdb") || cl("update-dirdb") || cl("make-dirs-writable");
+            if (otherMode)
+            {
+                cl.error("--remove-corrupt-dirdbs cannot be combined with other operations.");
+            }
         }
         if ((cl("list-first") || cl("list-last") || cl("list-both")) && !cl("intersect"))
         {
@@ -5701,6 +6144,26 @@ int main(int argc, char *argv[])
                     removeDirDbInDir(root.path, cl("dry-run"));
                 }
             }
+        }
+        else if (cl("remove-corrupt-dirdbs"))
+        {
+            uint64_t removed = 0;
+            for (const auto& root : inputRoots)
+            {
+                if (!root.recursive)
+                {
+                    removed += removeCorruptDirDbInDir(root.path, cl("dry-run"));
+                }
+                else
+                {
+                    removed += removeCorruptDirDbsTree(root.path, cl("dry-run"));
+                }
+            }
+            if (gProgress)
+            {
+                gProgress->finish();
+            }
+            std::cout << "removed-corrupt-dirdbs: " << removed << "\n";
         }
         else
         {

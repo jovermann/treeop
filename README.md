@@ -6,7 +6,7 @@ Operations on huge directory trees.
 
 `treeop` can remove files (with the `--remove-copies` option for example). Always make a backup before using `treeop`. Removal cannot be undone.
 
-`treeop` automatically creates and maintains a `.dirdb` file in each dir to cache file meta-data and hashes. You can remove these files using `treeop --remove-dirdb DIRS...'.
+`treeop` automatically creates and maintains a `.dirdb` file in each dir to cache file meta-data and hashes. During normal processing, an unreadable or corrupt `.dirdb` is removed and regenerated automatically. You can remove these files using `treeop --remove-dirdb DIRS...`.
 
 ## Features
 
@@ -85,13 +85,19 @@ Options:
   -i --interactive         Open an interactive TUI for --remove-dir-internal-copies.
      --new-dirdb           Force creation of new .dirdb files (overwrite existing).
   -u --update-dirdb        Update .dirdb files, reusing hashes when inode/size/mtime match.
+     --make-dirs-writable  Add owner-write permission to directories where .dirdb files are written.
      --remove-dirdb        Recursively remove all .dirdb files under specified dirs.
+     --remove-corrupt-dirdbs
+                           Validate existing .dirdb files and remove those that cannot be read.
+     --remove-dirs-that-contain-file=FILE_PATTERN
+                           Recursively remove directories containing a file matching FILE_PATTERN.
      --get-unique-hash-len Calculate the minimum hash length in bits that makes all file contents unique.
      --hashrate            Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.
      --size-histogram=N    Print size histogram for all files in all dirs where N in the batch size in
                            bytes. (default=0)
      --top=N               Maximum number of results to print (with --find-overlapping-dirs or
                            --find-redundant-dirs). (default=0)
+     --max-depth=N         Maximum directory recursion depth; command-line roots are at depth 0.
      --min-size=N          Minimum file size for operations that support file filtering. (default=0)
      --max-size=N          Maximum file size for operations that support file filtering. (default=0)
      --only=PATTERNS       Only include filenames matching comma-separated fnmatch patterns.
