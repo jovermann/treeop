@@ -1,5 +1,9 @@
 *~
 *.d
 *.o
-hardshrink
+treeop
+unit_test
+__pycache__
+build-release
+build-unit-test-release
 
