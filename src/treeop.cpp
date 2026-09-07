@@ -513,6 +513,24 @@ static bool inputRootContainsDir(const InputRoot& root, const fs::path& dirPath)
     return root.recursive ? isPathWithinPath(root.path, dirPath) : root.path == dirPath;
 }
 
+static bool inputRootsOverlap(const InputRoot& a, const InputRoot& b)
+{
+    std::error_code ecA;
+    fs::path pathA = fs::weakly_canonical(a.path, ecA);
+    if (ecA)
+    {
+        pathA = a.path;
+    }
+    std::error_code ecB;
+    fs::path pathB = fs::weakly_canonical(b.path, ecB);
+    if (ecB)
+    {
+        pathB = b.path;
+    }
+    return inputRootContainsDir(InputRoot{pathA, a.recursive}, pathB)
+        || inputRootContainsDir(InputRoot{pathB, b.recursive}, pathA);
+}
+
 static std::vector<std::string> parsePatterns(const ut1::CommandLineParser& cl, const std::string& optionName)
 {
     std::vector<std::string> patterns;
@@ -700,25 +718,15 @@ public:
 
         if (roots.size() > 1)
         {
-            std::set<fs::path> seenDirs;
             double elapsedSeconds = 0.0;
             for (const auto& rootData : roots)
             {
                 elapsedSeconds += rootData.elapsedSeconds;
             }
             TreeStats treeStats = collectStats(
-                [&](const DirDbData& dir)
+                [](const DirDbData&)
                 {
-                    bool inAnyRoot = false;
-                    for (const auto& rootData : roots)
-                    {
-                        if (isPathWithin(rootData.path, dir.path))
-                        {
-                            inAnyRoot = true;
-                            break;
-                        }
-                    }
-                    return inAnyRoot && seenDirs.insert(dir.path).second;
+                    return true;
                 },
                 elapsedSeconds,
                 filter);
@@ -1714,6 +1722,7 @@ public:
     {
         HardlinkStats stats;
         std::set<fs::path> touchedDirs;
+        std::unordered_map<uint64_t, uint64_t> dryRunLinksRemaining;
         forEachRedundancyGroup(filter,
             [&](const std::vector<FileEntry>& files, const FileEntry& oldest)
             {
@@ -1750,6 +1759,26 @@ public:
                     {
                         continue;
                     }
+                    uint64_t oldLinkCount = ref.numLinks;
+                    if (dryRun)
+                    {
+                        auto [it, inserted] = dryRunLinksRemaining.emplace(ref.inode, ref.numLinks);
+                        (void)inserted;
+                        oldLinkCount = it->second;
+                        if (it->second > 0)
+                        {
+                            it->second--;
+                        }
+                    }
+                    else
+                    {
+                        std::error_code ec;
+                        uint64_t currentLinks = fs::hard_link_count(fs::path(ref.path), ec);
+                        if (!ec)
+                        {
+                            oldLinkCount = currentLinks;
+                        }
+                    }
                     if (dryRun)
                     {
                         std::cout << "Would hardlink " << ref.path << " -> " << oldest.path << "\n";
@@ -1770,9 +1799,14 @@ public:
                         touchedDirs.insert(fs::path(ref.path).parent_path());
                     }
                     stats.createdLinks++;
-                    stats.removedFiles++;
-                    stats.removedBytes += ref.size;
-                    addExtensionStat(stats.extensions, ref.path, ref.size);
+                    // Replacing a directory entry only removes its old backing file
+                    // when that entry was the inode's final hardlink.
+                    if (oldLinkCount == 1)
+                    {
+                        stats.removedFiles++;
+                        stats.removedBytes += ref.size;
+                        addExtensionStat(stats.extensions, ref.path, ref.size);
+                    }
                 }
             });
 
@@ -5955,7 +5989,16 @@ int main(int argc, char *argv[])
                 {
                     cl.error("Path '" + path + "' is not a directory.");
                 }
-                roots.push_back(normalizePath(path));
+                fs::path rootPath = normalizePath(path);
+                InputRoot newRoot{rootPath, true};
+                for (const auto& existingPath : roots)
+                {
+                    if (inputRootsOverlap(InputRoot{existingPath, true}, newRoot))
+                    {
+                        cl.error("Roots overlap: '" + existingPath.string() + "' and '" + rootPath.string() + "'.");
+                    }
+                }
+                roots.push_back(std::move(rootPath));
             }
             std::optional<std::string> removePattern;
             if (cl("remove-dirs-that-contain-file"))
@@ -5972,22 +6015,26 @@ int main(int argc, char *argv[])
 
         std::vector<fs::path> normalizedRoots;
         std::vector<InputRoot> inputRoots;
-        std::map<fs::path, size_t> inputRootIndexByPath;
         bool hasFileArgs = false;
 
         auto addInputRoot = [&](const fs::path& rootPath, bool recursive)
         {
-            auto [it, inserted] = inputRootIndexByPath.emplace(rootPath, inputRoots.size());
-            if (inserted)
+            InputRoot newRoot{rootPath, recursive};
+            for (const auto& existing : inputRoots)
             {
-                normalizedRoots.push_back(rootPath);
-                inputRoots.push_back(InputRoot{rootPath, recursive});
-                return;
+                // Multiple explicitly selected files may share a parent directory;
+                // they use one non-recursive scan root without overlapping selections.
+                if (!existing.recursive && !newRoot.recursive && existing.path == newRoot.path)
+                {
+                    return;
+                }
+                if (inputRootsOverlap(existing, newRoot))
+                {
+                    cl.error("Roots overlap: '" + existing.path.string() + "' and '" + rootPath.string() + "'.");
+                }
             }
-            if (recursive)
-            {
-                inputRoots[it->second].recursive = true;
-            }
+            normalizedRoots.push_back(rootPath);
+            inputRoots.push_back(std::move(newRoot));
         };
 
         // Normalize input paths. Directory arguments select recursive roots; regular-file

@@ -192,6 +192,37 @@ def test_intersect_file_arg_parent_does_not_include_child_dir_arg(tmp_path: Path
     assert re.search(r"shared-files:\s+0", total_section)
 
 
+@pytest.mark.parametrize("duplicate_root", [False, True])
+def test_overlapping_roots_are_rejected(tmp_path: Path, duplicate_root: bool):
+    root = Path(__file__).resolve().parents[1]
+    parent = tmp_path / "parent"
+    child = parent / "child"
+    child.mkdir(parents=True)
+
+    second_root = parent if duplicate_root else child
+    result = run_treeop_result([str(parent), str(second_root)], root)
+
+    assert result.returncode != 0
+    assert "Error: Roots overlap:" in result.stdout
+    assert str(parent) in result.stdout
+    assert str(second_root) in result.stdout
+
+
+def test_overlapping_roots_through_symlink_are_rejected(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    real_root = tmp_path / "real"
+    real_root.mkdir()
+    alias_root = tmp_path / "alias"
+    alias_root.symlink_to(real_root, target_is_directory=True)
+
+    result = run_treeop_result([str(real_root), str(alias_root)], root)
+
+    assert result.returncode != 0
+    assert "Error: Roots overlap:" in result.stdout
+    assert str(real_root) in result.stdout
+    assert str(alias_root) in result.stdout
+
+
 def test_containment_reports_nested_complete_mostly_and_missing_dirs(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
@@ -1984,6 +2015,37 @@ def test_hardlink_copies(tmp_path: Path):
     st_b = file_b.stat()
     assert st_a.st_ino == st_b.st_ino
     assert re.search(r"hardlinks-created:\s+1", out)
+
+
+def test_hardlink_copies_counts_each_removed_inode_once(tmp_path: Path):
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+
+    source = root_dir / "source.bin"
+    copy_a = root_dir / "copy-a.bin"
+    copy_b = root_dir / "copy-b.bin"
+    source.write_bytes(b"same-content")
+    copy_a.write_bytes(b"same-content")
+    os.link(copy_a, copy_b)
+    now = time.time()
+    os.utime(source, (now - 10, now - 10))
+    os.utime(copy_a, (now, now))
+
+    args = ["--hardlink-copies", "--min-size", "1", str(root_dir)]
+    dry_run_out = run_treeop(["--dry-run", *args], root)
+    assert re.search(r"hardlinks-created:\s+2", dry_run_out)
+    assert re.search(r"removed-files:\s+1", dry_run_out)
+    assert re.search(r"removed-bytes:\s+12 bytes", dry_run_out)
+
+    out = run_treeop(args, root)
+    assert source.stat().st_ino == copy_a.stat().st_ino == copy_b.stat().st_ino
+    assert re.search(r"hardlinks-created:\s+2", out)
+    assert re.search(r"removed-files:\s+1", out)
+    assert re.search(r"removed-bytes:\s+12 bytes", out)
 
 
 def test_hardlink_refresh_reuses_invocation_inode_hash(tmp_path: Path):
