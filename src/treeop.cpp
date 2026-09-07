@@ -1004,7 +1004,7 @@ public:
             const auto it = buckets.find(start);
             const Bucket empty{};
             const Bucket& bucket = (it == buckets.end()) ? empty : it->second;
-            widthCount = std::max(widthCount, ut1::toStr(bucket.count).size());
+            widthCount = std::max(widthCount, formatCountInt(bucket.count).size());
             std::string totalStr = ut1::getApproxSizeStr(bucket.totalSize, 3, true, false);
             auto [numberStr, suffixStr] = splitSizeStr(totalStr);
             totalDecimalPos = std::max(totalDecimalPos, getDecimalPos(numberStr));
@@ -1054,7 +1054,7 @@ public:
                 rangeLabel = padRight(startStr, widthStart) + ":";
             }
             std::cout << padRight(rangeLabel, rangeWidth) << " "
-                      << std::setw(static_cast<int>(widthCount)) << bucket.count << " "
+                      << std::setw(static_cast<int>(widthCount)) << formatCountInt(bucket.count) << " "
                       << totalStr;
             if (showBar && barAvailable > 0)
             {
@@ -4476,7 +4476,7 @@ private:
     /// Format an integer count as a string.
     static std::string formatCountInt(uint64_t count)
     {
-        return ut1::toStr(count);
+        return ut1::formatU64WithUnderscores(count);
     }
 
     /// Return the decimal point column within a numeric string.
@@ -6091,7 +6091,7 @@ int main(int argc, char *argv[])
                 roots,
                 removePattern ? &*removePattern : nullptr,
                 cl("dry-run"));
-            std::cout << "removed-dirs: " << stats.removed << "\n";
+            std::cout << "removed-dirs: " << ut1::formatU64WithUnderscores(stats.removed) << "\n";
             return 0;
         }
 
@@ -6293,7 +6293,7 @@ int main(int argc, char *argv[])
             {
                 gProgress->finish();
             }
-            std::cout << "removed-corrupt-dirdbs: " << removed << "\n";
+            std::cout << "removed-corrupt-dirdbs: " << ut1::formatU64WithUnderscores(removed) << "\n";
         }
         else
         {
@@ -6318,8 +6318,8 @@ int main(int argc, char *argv[])
                     gProgress->finish();
                 }
                 double rate = (stats.elapsed > 0.0) ? (double(stats.bytes) / stats.elapsed) : 0.0;
-                std::cout << "total-files: " << stats.files << "\n";
-                std::cout << "total-dirs: " << stats.dirs << "\n";
+                std::cout << "total-files: " << ut1::formatU64WithUnderscores(stats.files) << "\n";
+                std::cout << "total-dirs: " << ut1::formatU64WithUnderscores(stats.dirs) << "\n";
                 std::cout << "total-size: " << ut1::getApproxSizeStr(stats.bytes, 3, true, false) << "\n";
                 std::cout << "bufsize: " << ut1::getPreciseSizeStr(static_cast<size_t>(gBufSize)) << "\n";
                 std::cout << "read-rate: " << ut1::getApproxSizeStr(rate, 1, true, true) << "/s\n";
@@ -6457,7 +6457,7 @@ int main(int argc, char *argv[])
             {
                 removedDirs += removeEmptyDirsTree(root, true, cl("dry-run"));
             }
-            std::cout << "removed-dirs: " << removedDirs << "\n";
+            std::cout << "removed-dirs: " << ut1::formatU64WithUnderscores(removedDirs) << "\n";
         }
     }
     catch (const std::exception& e)

@@ -1444,6 +1444,23 @@ def test_stats_total_for_multiple_roots(tmp_path: Path):
     assert total_stat_value("redundant-size:") == 4
 
 
+def test_stats_group_plain_counts_with_underscores_and_keep_alignment(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    for i in range(1000):
+        (root_dir / f"file-{i:04d}").touch()
+
+    out = run_treeop(["--stats", str(root_dir)], root)
+    files_line = next(line for line in out.splitlines() if line.startswith("files:"))
+    dirs_line = next(line for line in out.splitlines() if line.startswith("dirs:"))
+
+    assert files_line.split() == ["files:", "1_000"]
+    assert dirs_line.split() == ["dirs:", "1"]
+    assert files_line.index("1_000") + len("1_000") == dirs_line.index("1") + len("1")
+    assert re.search(r"total-size:\s+0 bytes", out)
+
+
 def test_stats_min_size_filters_stats_not_dirdb(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
