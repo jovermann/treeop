@@ -592,8 +592,10 @@ struct InodeHashCache
     }
 };
 
+static InodeHashCache gInodeHashCache;
+
 static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update, InodeHashCache* inodeCache);
-static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache = nullptr);
+static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache = &gInodeHashCache);
 static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool dryRun);
 /// Check whether a directory is empty aside from an optional .dirdb file.
 static bool isDirEmpty(const fs::path& dir, bool& hasDirDb);
@@ -658,17 +660,16 @@ public:
     /// Load or create .dirdb files for all roots and record elapsed time.
     void processRoots(bool forceCreate, bool update)
     {
-        InodeHashCache inodeCache;
         for (auto& rootData : roots)
         {
             double start = ut1::getTimeSec();
             if (rootData.recursive)
             {
-                processDirTree(rootData.path, forceCreate, update, &inodeCache);
+                processDirTree(rootData.path, forceCreate, update, &gInodeHashCache);
             }
             else
             {
-                addDir(loadOrCreateDirDb(rootData.path, forceCreate, update, &inodeCache));
+                addDir(loadOrCreateDirDb(rootData.path, forceCreate, update, &gInodeHashCache));
             }
             rootData.elapsedSeconds = ut1::getTimeSec() - start;
         }

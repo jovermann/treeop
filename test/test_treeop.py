@@ -1986,6 +1986,36 @@ def test_hardlink_copies(tmp_path: Path):
     assert re.search(r"hardlinks-created:\s+1", out)
 
 
+def test_hardlink_refresh_reuses_invocation_inode_hash(tmp_path: Path):
+    if os.geteuid() == 0:
+        pytest.skip("Root bypasses file read permissions")
+    if not supports_hardlinks(tmp_path):
+        pytest.skip("Filesystem does not support hardlinks")
+
+    root = Path(__file__).resolve().parents[1]
+    dir_a = tmp_path / "a"
+    dir_b = tmp_path / "b"
+    dir_a.mkdir()
+    dir_b.mkdir()
+    file_a = dir_a / "same.bin"
+    file_b = dir_b / "same.bin"
+    file_a.write_bytes(b"same content")
+    file_b.write_bytes(b"same content")
+    now = time.time()
+    os.utime(file_a, (now - 10, now - 10))
+    os.utime(file_b, (now, now))
+    run_treeop([str(dir_a), str(dir_b)], root)
+
+    file_a.chmod(0)
+    try:
+        out = run_treeop(["--hardlink-copies", "--min-size", "1", str(dir_a), str(dir_b)], root)
+    finally:
+        file_a.chmod(0o644)
+
+    assert file_a.stat().st_ino == file_b.stat().st_ino
+    assert re.search(r"hardlinks-created:\s+1", out)
+
+
 def test_same_filename_intersect(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
