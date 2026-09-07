@@ -2,6 +2,7 @@ import os
 import pty
 import re
 import select
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -1356,6 +1357,55 @@ def test_scan_seeds_inode_hash_cache_from_dirdb(tmp_path: Path):
 
     assert "hash-size:" not in out
     assert (dir_b / ".dirdb").exists()
+
+
+def test_copied_stale_dirdb_is_updated_with_its_subtree(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    source = tmp_path / "source"
+    source_sub = source / "sub"
+    source_sub.mkdir(parents=True)
+    write_file(source / "root.txt", "root-content")
+    write_file(source_sub / "child.txt", "child-content")
+    run_treeop([str(source)], root)
+
+    copied = tmp_path / "copied"
+    shutil.copytree(source, copied)
+
+    # Make the copied subdirectory database fresh first. The stale root database
+    # must nevertheless force it to be updated again without probing its first file.
+    run_treeop([str(copied / "sub")], root)
+    out = run_treeop(["--list-files", str(copied)], root)
+
+    assert f"Updating stale {copied / '.dirdb'}" in out
+    assert f"Updating stale {copied / 'sub' / '.dirdb'}" in out
+    assert "root.txt" in out
+    assert "child.txt" in out
+
+    fresh_out = run_treeop(["--list-files", str(copied)], root)
+    assert "Updating stale" not in fresh_out
+
+
+@pytest.mark.parametrize("changed_field", ["size", "time"])
+def test_stale_dirdb_first_file_metadata_is_updated(tmp_path: Path, changed_field: str):
+    root = Path(__file__).resolve().parents[1]
+    root_dir = tmp_path / "root"
+    root_dir.mkdir()
+    first_file = root_dir / "first.txt"
+    write_file(first_file, "old")
+    original_stat = first_file.stat()
+    run_treeop([str(root_dir)], root)
+
+    if changed_field == "size":
+        write_file(first_file, "new-size")
+        os.utime(first_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    else:
+        os.utime(first_file, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns + 1_000_000_000))
+
+    out = run_treeop(["--list-files", str(root_dir)], root)
+
+    assert f"Updating stale {root_dir / '.dirdb'}" in out
+    fresh_out = run_treeop(["--list-files", str(root_dir)], root)
+    assert "Updating stale" not in fresh_out
 
 
 def test_stats_total_for_multiple_roots(tmp_path: Path):

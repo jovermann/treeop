@@ -612,7 +612,13 @@ struct InodeHashCache
 
 static InodeHashCache gInodeHashCache;
 
-static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update, InodeHashCache* inodeCache);
+static DirDbData loadOrCreateDirDb(
+    const fs::path& dirPath,
+    bool forceCreate,
+    bool update,
+    bool staleUpdate,
+    InodeHashCache* inodeCache,
+    bool* staleDetected = nullptr);
 static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache = &gInodeHashCache);
 static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool dryRun);
 /// Check whether a directory is empty aside from an optional .dirdb file.
@@ -687,7 +693,7 @@ public:
             }
             else
             {
-                addDir(loadOrCreateDirDb(rootData.path, forceCreate, update, &gInodeHashCache));
+                addDir(loadOrCreateDirDb(rootData.path, forceCreate, update, false, &gInodeHashCache));
             }
             rootData.elapsedSeconds = ut1::getTimeSec() - start;
         }
@@ -4329,7 +4335,13 @@ private:
     /// Walk a directory tree and load or create .dirdb files.
     void processDirTree(const fs::path& root, bool forceCreate, bool update, InodeHashCache* inodeCache)
     {
-        addDir(loadOrCreateDirDb(root, forceCreate, update, inodeCache));
+        std::vector<fs::path> staleDirs;
+        bool rootStale = false;
+        addDir(loadOrCreateDirDb(root, forceCreate, update, false, inodeCache, &rootStale));
+        if (rootStale)
+        {
+            staleDirs.push_back(root);
+        }
         if (gMaxDepth && *gMaxDepth == 0)
         {
             return;
@@ -4357,7 +4369,22 @@ private:
             {
                 if (includeRecursiveDirectory(it))
                 {
-                    addDir(loadOrCreateDirDb(it->path(), forceCreate, update, inodeCache));
+                    bool staleUpdate = false;
+                    for (const auto& staleDir : staleDirs)
+                    {
+                        if (isPathWithinPath(staleDir, it->path()))
+                        {
+                            staleUpdate = true;
+                            break;
+                        }
+                    }
+                    bool staleDetected = false;
+                    addDir(loadOrCreateDirDb(
+                        it->path(), forceCreate, update || staleUpdate, staleUpdate, inodeCache, &staleDetected));
+                    if (staleDetected)
+                    {
+                        staleDirs.push_back(it->path());
+                    }
                 }
             }
             it.increment(ec);
@@ -5037,7 +5064,11 @@ static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* seco
 }
 
 /// Read a .dirdb file for a directory and return its contents.
-static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true, InodeHashCache* inodeCache = nullptr)
+static DirDbData readDirDb(
+    const fs::path& dirPath,
+    bool reportProgress = true,
+    InodeHashCache* inodeCache = nullptr,
+    bool* firstFileCurrent = nullptr)
 {
     fs::path dbPath = dirPath / ".dirdb";
     std::string raw = ut1::readFile(dbPath.string());
@@ -5179,7 +5210,36 @@ static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true, 
         dirData.files.push_back(std::move(entry));
     }
 
-    if (inodeCache)
+    bool current = true;
+    if (firstFileCurrent && !dirData.files.empty())
+    {
+        const FileEntry& first = dirData.files.front();
+        try
+        {
+            fs::path filePath = dirPath / first.path;
+            if (!ut1::fsIsRegular(filePath, false))
+            {
+                current = false;
+            }
+            else
+            {
+                ut1::StatInfo statInfo = ut1::getStat(fs::directory_entry(filePath), false);
+                current = static_cast<uint64_t>(statInfo.getIno()) == first.inode
+                    && static_cast<uint64_t>(statInfo.statData.st_size) == first.size
+                    && fileTimeFromTimespec(statInfo.getMTimeSpec()) == first.date;
+            }
+        }
+        catch (const std::exception&)
+        {
+            current = false;
+        }
+    }
+    if (firstFileCurrent)
+    {
+        *firstFileCurrent = current;
+    }
+
+    if (inodeCache && current)
     {
         ut1::StatInfo dbStat = ut1::getStat(fs::directory_entry(dbPath), false);
         if (inodeCache->observeDevice(dbStat.getDev()))
@@ -5191,7 +5251,7 @@ static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true, 
         }
     }
 
-    if (gProgress && reportProgress)
+    if (gProgress && reportProgress && current)
     {
         uint64_t totalBytes = 0;
         for (const auto& file : dirData.files)
@@ -5467,7 +5527,7 @@ static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache
     DirDbData existing;
     try
     {
-        existing = readDirDb(dirPath, false, inodeCache);
+        existing = readDirDb(dirPath, false);
     }
     catch (const std::exception& e)
     {
@@ -5487,27 +5547,49 @@ static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache
 }
 
 /// Load, create, or update a .dirdb file depending on flags.
-static DirDbData loadOrCreateDirDb(const fs::path& dirPath, bool forceCreate, bool update, InodeHashCache* inodeCache)
+static DirDbData loadOrCreateDirDb(
+    const fs::path& dirPath,
+    bool forceCreate,
+    bool update,
+    bool staleUpdate,
+    InodeHashCache* inodeCache,
+    bool* staleDetected)
 {
     fs::path dbPath = dirPath / ".dirdb";
     if (update)
     {
         if (ut1::fsExists(dbPath))
         {
+            if (staleUpdate)
+            {
+                std::cout << "Updating stale " << dbPath.string() << "\n";
+            }
             return updateDirDb(dirPath, inodeCache);
         }
         return createDirDb(dirPath, inodeCache);
     }
     if (!forceCreate && ut1::fsExists(dbPath))
     {
+        bool firstFileCurrent = true;
+        DirDbData data;
         try
         {
-            return readDirDb(dirPath, true, inodeCache);
+            data = readDirDb(dirPath, true, inodeCache, &firstFileCurrent);
         }
         catch (const std::exception& e)
         {
             return recoverCorruptDirDb(dirPath, inodeCache, e);
         }
+        if (firstFileCurrent)
+        {
+            return data;
+        }
+        if (staleDetected)
+        {
+            *staleDetected = true;
+        }
+        std::cout << "Updating stale " << dbPath.string() << "\n";
+        return updateDirDb(dirPath, inodeCache);
     }
     return createDirDb(dirPath, inodeCache);
 }
