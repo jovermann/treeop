@@ -52,6 +52,9 @@ std::string replaceString(const std::string& s, const std::string& from, const s
 /// Expand unprintable chars to C-style backslash sequences.
 std::string expandUnprintable(const std::string& s, char quotes = 0, char addQuotes = 0);
 
+/// Escape terminal control characters while preserving valid printable UTF-8.
+std::string escapeTerminalText(std::string_view s);
+
 /// Compile C-style backslash sequences back to unprintable chars.
 std::string compileCString(const std::string& s, std::string* errorMessageOut = nullptr);
 

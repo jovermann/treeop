@@ -43,6 +43,17 @@ using DirIndex = size_t;
 using FileIndex = size_t;
 namespace fs = std::filesystem;
 
+/// Render a path without allowing its bytes to issue terminal control sequences.
+static std::string terminalPath(const fs::path& path)
+{
+    return ut1::escapeTerminalText(path.string());
+}
+
+static std::string terminalPath(const std::string& path)
+{
+    return ut1::escapeTerminalText(path);
+}
+
 /// Apply the global depth limit to a directory yielded by a recursive iterator.
 static bool includeRecursiveDirectory(fs::recursive_directory_iterator& it)
 {
@@ -143,7 +154,7 @@ public:
     {
         if (!hashing)
         {
-            currentDir = dirPath.string();
+            currentDir = terminalPath(dirPath);
         }
         tick();
     }
@@ -176,7 +187,7 @@ public:
     void onHashStart(const fs::path& filePath, uint64_t fileSize)
     {
         hashing = true;
-        currentFile = filePath.string();
+        currentFile = terminalPath(filePath);
         currentFileSize = fileSize;
         currentFileDone = 0;
         tick();
@@ -714,7 +725,7 @@ public:
                 rootData.elapsedSeconds,
                 filter);
             printHardlinkOutsideRootWarnings(rootData.path, treeStats.inodeCounts);
-            std::cout << rootData.path.string() << "\n";
+            std::cout << terminalPath(rootData.path) << "\n";
             printStatList(buildStatsLines(treeStats));
             if (roots.size() > 1)
             {
@@ -873,7 +884,7 @@ public:
                 std::cout << " " << std::setw(minSizeWidth) << dbSizeStr
                           << " " << std::setw(minSizeWidth) << avgStr;
             }
-            std::cout << " " << dir->path.string() << "\n";
+            std::cout << " " << terminalPath(dir->path) << "\n";
         }
     }
 
@@ -1156,7 +1167,7 @@ public:
                 {"shared-size:", ut1::getApproxSizeStr(sharedStats.bytes, 3, true, false), std::string()}
             };
 
-            std::cout << rootPaths[i].path.string() << ":\n";
+            std::cout << terminalPath(rootPaths[i].path) << ":\n";
             printStatList(stats);
             printBlockSeparator();
         }
@@ -1292,7 +1303,7 @@ public:
                         }
                         for (const auto& ref : listRefs)
                         {
-                            std::cout << ref.path << "\n";
+                            std::cout << terminalPath(ref.path) << "\n";
                         }
                     }
                 }
@@ -1326,7 +1337,7 @@ public:
                     }
                     for (const auto& ref : listRefs)
                     {
-                        std::cout << ref.path << "\n";
+                        std::cout << terminalPath(ref.path) << "\n";
                     }
                 }
             }
@@ -1382,7 +1393,7 @@ public:
                         }
                         for (const auto& ref : listRefs)
                         {
-                            std::cout << "first: " << ref.path << "\n";
+                            std::cout << "first: " << terminalPath(ref.path) << "\n";
                         }
                     }
                 }
@@ -1394,7 +1405,7 @@ public:
                     }
                     for (const auto& ref : listRefs)
                     {
-                        std::cout << "last: " << ref.path << "\n";
+                        std::cout << "last: " << terminalPath(ref.path) << "\n";
                     }
                 }
             }
@@ -1689,7 +1700,7 @@ public:
                       << formatPercentFixed(percentOf(data.redundantFiles, data.totalFiles)) << ")"
                       << " of " << formatOverlapBytes(data.totalBytes) << " / "
                       << formatCountInt(data.totalFiles) << " files total"
-                      << "  " << data.path.string() << "\n";
+                      << "  " << terminalPath(data.path) << "\n";
         }
     }
 
@@ -1744,13 +1755,13 @@ public:
                     }
                     else if (clVerbose)
                     {
-                        std::cout << "Warning: Failed to read hardlink count for " << oldestPath.string()
+                        std::cout << "Warning: Failed to read hardlink count for " << terminalPath(oldestPath)
                                   << ": " << ec.message() << "\n";
                     }
                 }
                 if (linkCount >= maxHardlinks)
                 {
-                    std::cout << "Warning: " << oldestPath.string() << " has " << linkCount
+                    std::cout << "Warning: " << terminalPath(oldestPath) << " has " << linkCount
                               << " hardlinks (>= " << maxHardlinks << "), skipping.\n";
                     return;
                 }
@@ -1787,19 +1798,19 @@ public:
                     }
                     if (dryRun)
                     {
-                        std::cout << "Would hardlink " << ref.path << " -> " << oldest.path << "\n";
+                        std::cout << "Would hardlink " << terminalPath(ref.path) << " -> " << terminalPath(oldest.path) << "\n";
                     }
                     else
                     {
                         std::string errorMsg;
                         if (!replaceWithHardlink(oldestPath, fs::path(ref.path), &errorMsg))
                         {
-                            std::cout << "Warning: " << errorMsg << "\n";
+                            std::cout << "Warning: " << ut1::escapeTerminalText(errorMsg) << "\n";
                             continue;
                         }
                         if (clVerbose)
                         {
-                            std::cout << "Hardlinked " << ref.path << " -> " << oldest.path << "\n";
+                            std::cout << "Hardlinked " << terminalPath(ref.path) << " -> " << terminalPath(oldest.path) << "\n";
                         }
                         touchedDirs.insert(oldestPath.parent_path());
                         touchedDirs.insert(fs::path(ref.path).parent_path());
@@ -1881,7 +1892,7 @@ public:
                 fs::path target = dir.path / file.path;
                 if (dryRun)
                 {
-                    std::cout << "Would break hardlink " << target.string() << "\n";
+                    std::cout << "Would break hardlink " << terminalPath(target) << "\n";
                     stats.files++;
                     stats.bytes += file.size;
                     addExtensionStat(stats.extensions, target.string(), file.size);
@@ -1890,12 +1901,12 @@ public:
                 std::string errorMsg;
                 if (!replaceWithCopy(target, &errorMsg))
                 {
-                    std::cout << "Warning: " << errorMsg << "\n";
+                    std::cout << "Warning: " << ut1::escapeTerminalText(errorMsg) << "\n";
                     continue;
                 }
                 if (clVerbose)
                 {
-                    std::cout << "Broke hardlink " << target.string() << "\n";
+                    std::cout << "Broke hardlink " << terminalPath(target) << "\n";
                 }
                 stats.files++;
                 stats.bytes += file.size;
@@ -1934,7 +1945,7 @@ public:
                     }
                     if (dryRun || clVerbose)
                     {
-                        std::cout << (dryRun ? "Would remove " : "Removed ") << ref.path << "\n";
+                        std::cout << (dryRun ? "Would remove " : "Removed ") << terminalPath(ref.path) << "\n";
                     }
                     stats.files++;
                     stats.bytes += ref.size;
@@ -2076,8 +2087,8 @@ public:
                         std::string hashHex = key.hash.toHex();
                         size_t hashLen = getUniqueHashHexLen();
                         std::cout << hashHex.substr(0, std::min(hashLen, hashHex.size())) << ": "
-                                  << (dryRun ? "Would remove " : "Removed ") << fullPath.string()
-                                  << " kept " << oldest->path;
+                                  << (dryRun ? "Would remove " : "Removed ") << terminalPath(fullPath)
+                                  << " kept " << terminalPath(oldest->path);
                         if (clVerbose > 1)
                         {
                             std::cout << " removed-date=" << formatFileTime(ref->date)
@@ -2573,7 +2584,7 @@ public:
                 const std::string meta = formatMetaColumns(entry);
                 const size_t visiblePrefix = prefix.size() + meta.size();
                 const size_t filenameWidth = width > visiblePrefix ? width - visiblePrefix : 0;
-                const std::string filename = ut1::tui::fitTerminalLine(entry.fullPath.string(), filenameWidth);
+                const std::string filename = ut1::tui::fitTerminalLine(terminalPath(entry.fullPath), filenameWidth);
                 if (isSelected)
                 {
                     std::cout << ansiSelected << prefix << meta << filename << ut1::tui::ansiReset << "\n";
@@ -2657,7 +2668,7 @@ public:
                 const InteractiveEntry entry = entries[selected];
                 if (dryRun)
                 {
-                    status = "Would remove " + entry.fullPath.string();
+                    status = "Would remove " + terminalPath(entry.fullPath);
                 }
                 else
                 {
@@ -2665,11 +2676,11 @@ public:
                     fs::remove(entry.fullPath, ec);
                     if (ec)
                     {
-                        status = "Warning: failed to remove " + entry.fullPath.string();
+                        status = "Warning: failed to remove " + terminalPath(entry.fullPath);
                         continue;
                     }
                     touchedDirs.insert(dirs[entry.dirIndex].path);
-                    status = "Removed " + entry.fullPath.string();
+                    status = "Removed " + terminalPath(entry.fullPath);
                 }
 
                 stats.files++;
@@ -2907,7 +2918,7 @@ private:
                 if (file.numLinks > countInRoot)
                 {
                     uint64_t outsideLinks = file.numLinks - countInRoot;
-                    std::cout << "Warning: " << (dir.path / file.path).string()
+                    std::cout << "Warning: " << terminalPath(dir.path / file.path)
                               << " has " << outsideLinks << " hardlinks outside root\n";
                 }
             }
@@ -3145,8 +3156,8 @@ private:
 
     static void printOverlapResult(const OverlapResult& result)
     {
-        std::cout << "A: " << result.a.string() << "\n";
-        std::cout << "B: " << result.b.string() << "\n";
+        std::cout << "A: " << terminalPath(result.a) << "\n";
+        std::cout << "B: " << terminalPath(result.b) << "\n";
         if (result.internalDuplicatesA.files > 0)
         {
             std::cout << "warning: A contains internal duplicates: "
@@ -3276,10 +3287,10 @@ private:
                 if (clVerbose)
                 {
                     std::cout << (dryRun ? "Would remove " : "Removed ")
-                              << (inA ? "A " : "B ") << ref->path;
+                              << (inA ? "A " : "B ") << terminalPath(ref->path);
                     if (clVerbose > 1)
                     {
-                        std::cout << " kept " << oldest->path
+                        std::cout << " kept " << terminalPath(oldest->path)
                                   << " removed-date=" << formatFileTime(ref->date)
                                   << " kept-date=" << formatFileTime(oldest->date);
                     }
@@ -3639,7 +3650,7 @@ private:
             {
                 if (clVerbose)
                 {
-                    std::cout << "Skipping entry due to error: " << it->path() << "\n";
+                    std::cout << "Skipping entry due to error: " << terminalPath(it->path()) << "\n";
                 }
                 ec.clear();
                 continue;
@@ -3678,7 +3689,7 @@ private:
 
             if (dryRun || clVerbose)
             {
-                std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << fullPath.string() << "\n";
+                std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << terminalPath(fullPath) << "\n";
             }
 
             stats.dirs += dirCount;
@@ -3740,7 +3751,7 @@ private:
             fs::path fullPath = sourceRoot / fs::path(ref.path);
             if (dryRun || clVerbose)
             {
-                std::cout << (dryRun ? "Would remove " : "Removed ") << fullPath.string() << "\n";
+                std::cout << (dryRun ? "Would remove " : "Removed ") << terminalPath(fullPath) << "\n";
             }
 
             stats.files++;
@@ -3815,7 +3826,7 @@ private:
             }
             any = true;
             printedDirs.push_back(path);
-            std::cout << "  " << formatContainmentPath(path)
+            std::cout << "  " << ut1::escapeTerminalText(formatContainmentPath(path))
                       << " files=" << formatContainmentRatio(stats.matchedFiles, stats.files)
                       << " size=" << formatContainmentSizeRatio(stats.matchedBytes, stats.bytes) << "\n";
         }
@@ -3835,7 +3846,7 @@ private:
         }
         for (const auto& ref : refs)
         {
-            std::cout << ref.path << "\n";
+            std::cout << terminalPath(ref.path) << "\n";
         }
     }
 
@@ -3859,7 +3870,7 @@ private:
         {
             gProgress->finish();
         }
-        std::cout << sourceRoot.string() << " in previous roots";
+        std::cout << terminalPath(sourceRoot) << " in previous roots";
         if (!targetRoots.empty())
         {
             std::cout << " (";
@@ -3869,7 +3880,7 @@ private:
                 {
                     std::cout << ", ";
                 }
-                std::cout << targetRoots[i].string();
+                std::cout << terminalPath(targetRoots[i]);
             }
             std::cout << ")";
         }
@@ -3956,7 +3967,7 @@ private:
             {
                 std::cout << std::setw(static_cast<int>(widths.links)) << linksStr << " ";
             }
-            std::cout << ref.path << "\n";
+            std::cout << terminalPath(ref.path) << "\n";
         }
     }
 
@@ -4028,7 +4039,7 @@ private:
         std::map<std::string, std::string> bytesStrings;
         for (const auto& [extension, stat] : stats)
         {
-            extensionWidth = std::max(extensionWidth, extension.size());
+            extensionWidth = std::max(extensionWidth, ut1::escapeTerminalText(extension).size());
             filesWidth = std::max(filesWidth, formatCountInt(stat.files).size());
             std::string bytes = ut1::getApproxSizeStr(stat.bytes, 3, true, false);
             bytesWidth = std::max(bytesWidth, bytes.size());
@@ -4037,7 +4048,8 @@ private:
 
         for (const auto& [extension, stat] : stats)
         {
-            std::cout << "  " << std::left << std::setw(static_cast<int>(extensionWidth)) << extension
+            std::cout << "  " << std::left << std::setw(static_cast<int>(extensionWidth))
+                      << ut1::escapeTerminalText(extension)
                       << std::right << ": "
                       << std::setw(static_cast<int>(filesWidth)) << formatCountInt(stat.files) << " files, "
                       << std::setw(static_cast<int>(bytesWidth)) << bytesStrings.at(extension) << "\n";
@@ -4138,7 +4150,7 @@ private:
                 fs::path destPath = destRoot / rel;
                 if (dryRun)
                 {
-                    std::cout << "Would copy " << srcPath.string() << " -> " << destPath.string() << "\n";
+                    std::cout << "Would copy " << terminalPath(srcPath) << " -> " << terminalPath(destPath) << "\n";
                     continue;
                 }
                 fs::create_directories(destPath.parent_path());
@@ -4149,7 +4161,7 @@ private:
                 }
                 if (clVerbose)
                 {
-                    std::cout << "Copied " << srcPath.string() << " -> " << destPath.string() << "\n";
+                    std::cout << "Copied " << terminalPath(srcPath) << " -> " << terminalPath(destPath) << "\n";
                 }
             }
         }
@@ -4187,7 +4199,7 @@ private:
                     {
                         if (dryRun || clVerbose)
                         {
-                            std::cout << (dryRun ? "Would remove " : "Removed ") << ref.path << "\n";
+                            std::cout << (dryRun ? "Would remove " : "Removed ") << terminalPath(ref.path) << "\n";
                         }
                         stats.files++;
                         stats.bytes += ref.size;
@@ -4358,7 +4370,7 @@ private:
                 {
                     if (it != end)
                     {
-                        std::cout << "Skipping entry due to error: " << it->path() << "\n";
+                        std::cout << "Skipping entry due to error: " << terminalPath(it->path()) << "\n";
                     }
                 }
                 ec.clear();
@@ -4673,7 +4685,7 @@ static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
                 {
                     if (it != end)
                     {
-                        std::cout << "Skipping entry due to error: " << it->path() << "\n";
+                        std::cout << "Skipping entry due to error: " << terminalPath(it->path()) << "\n";
                     }
                 }
                 ec.clear();
@@ -4717,7 +4729,7 @@ static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
 
             if (clVerbose)
             {
-                std::cout << "Reading " << it->path().string() << "\n";
+                std::cout << "Reading " << terminalPath(it->path()) << "\n";
             }
 
             std::ifstream is(it->path(), std::ios::binary);
@@ -4772,7 +4784,7 @@ static bool isDirEmpty(const fs::path& dir, bool& hasDirDb)
         {
             if (clVerbose)
             {
-                std::cout << "Skipping entry due to error: " << dir.string() << "\n";
+                std::cout << "Skipping entry due to error: " << terminalPath(dir) << "\n";
             }
             return false;
         }
@@ -4804,7 +4816,7 @@ static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool
         {
             if (clVerbose)
             {
-                std::cout << "Skipping entry due to error: " << it->path() << "\n";
+                std::cout << "Skipping entry due to error: " << terminalPath(it->path()) << "\n";
             }
             ec.clear();
             continue;
@@ -4833,7 +4845,7 @@ static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool
         }
         if (dryRun || clVerbose)
         {
-            std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << dir.string() << "\n";
+            std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << terminalPath(dir) << "\n";
         }
         if (!dryRun)
         {
@@ -5301,7 +5313,7 @@ static DirDbData buildDirDb(
 {
     if (clVerbose > 0)
     {
-        std::cout << "Scanning " << dirPath.string() << "\n";
+        std::cout << "Scanning " << terminalPath(dirPath) << "\n";
     }
     if (gProgress)
     {
@@ -5502,7 +5514,8 @@ static DirDbData recoverCorruptDirDb(
     const std::exception& readError)
 {
     fs::path dbPath = dirPath / ".dirdb";
-    std::cout << "Warning: Removing corrupt " << dbPath.string() << ": " << readError.what() << "\n";
+    std::cout << "Warning: Removing corrupt " << terminalPath(dbPath) << ": "
+              << ut1::escapeTerminalText(readError.what()) << "\n";
     if (gMakeDirsWritable)
     {
         std::error_code permissionEc;
@@ -5562,7 +5575,7 @@ static DirDbData loadOrCreateDirDb(
         {
             if (staleUpdate)
             {
-                std::cout << "Updating stale " << dbPath.string() << "\n";
+                std::cout << "Updating stale " << terminalPath(dbPath) << "\n";
             }
             return updateDirDb(dirPath, inodeCache);
         }
@@ -5588,7 +5601,7 @@ static DirDbData loadOrCreateDirDb(
         {
             *staleDetected = true;
         }
-        std::cout << "Updating stale " << dbPath.string() << "\n";
+        std::cout << "Updating stale " << terminalPath(dbPath) << "\n";
         return updateDirDb(dirPath, inodeCache);
     }
     return createDirDb(dirPath, inodeCache);
@@ -5602,7 +5615,7 @@ static void removeDirDbInDir(const fs::path& dirPath, bool dryRun)
     {
         if (dryRun || clVerbose)
         {
-            std::cout << (dryRun ? "Would remove " : "Removed ") << dbPath.string() << "\n";
+            std::cout << (dryRun ? "Would remove " : "Removed ") << terminalPath(dbPath) << "\n";
         }
         if (dryRun)
         {
@@ -5635,7 +5648,7 @@ static void removeDirDbTree(const fs::path& root, bool dryRun)
         {
             if (clVerbose && it != end)
             {
-                std::cout << "Skipping entry due to error: " << it->path() << "\n";
+                std::cout << "Skipping entry due to error: " << terminalPath(it->path()) << "\n";
             }
             ec.clear();
             it.increment(ec);
@@ -5665,18 +5678,18 @@ static uint64_t removeCorruptDirDbInDir(const fs::path& dir, bool dryRun)
         readDirDb(dir, false);
         if (clVerbose > 1)
         {
-            std::cout << "Valid " << dbPath.string() << "\n";
+            std::cout << "Valid " << terminalPath(dbPath) << "\n";
         }
         return 0;
     }
     catch (const std::exception& e)
     {
-        std::cout << "Corrupt " << dbPath.string() << ": " << e.what() << "\n";
+        std::cout << "Corrupt " << terminalPath(dbPath) << ": " << ut1::escapeTerminalText(e.what()) << "\n";
     }
 
     if (dryRun)
     {
-        std::cout << "Would remove " << dbPath.string() << "\n";
+        std::cout << "Would remove " << terminalPath(dbPath) << "\n";
     }
     else
     {
@@ -5688,7 +5701,7 @@ static uint64_t removeCorruptDirDbInDir(const fs::path& dir, bool dryRun)
         }
         if (clVerbose)
         {
-            std::cout << "Removed " << dbPath.string() << "\n";
+            std::cout << "Removed " << terminalPath(dbPath) << "\n";
         }
     }
     return 1;
@@ -5720,7 +5733,7 @@ static uint64_t removeCorruptDirDbsTree(const fs::path& dir, bool dryRun, uint64
         {
             if (clVerbose)
             {
-                std::cout << "Skipping entry in " << dir.string() << ": " << ec.message() << "\n";
+                std::cout << "Skipping entry in " << terminalPath(dir) << ": " << ec.message() << "\n";
             }
             ec.clear();
             continue;
@@ -5770,7 +5783,7 @@ static StampDirStats processStampDirsInDir(
     {
         if (clVerbose)
         {
-            std::cout << "Skipping directory " << dir.string() << ": " << ec.message() << "\n";
+            std::cout << "Skipping directory " << terminalPath(dir) << ": " << ec.message() << "\n";
         }
         if (gProgress)
         {
@@ -5787,7 +5800,7 @@ static StampDirStats processStampDirsInDir(
         {
             if (clVerbose)
             {
-                std::cout << "Skipping entry " << path.string() << ": " << statusEc.message() << "\n";
+                std::cout << "Skipping entry " << terminalPath(path) << ": " << statusEc.message() << "\n";
             }
         }
         else if (fs::is_directory(status))
@@ -5812,7 +5825,7 @@ static StampDirStats processStampDirsInDir(
         {
             if (clVerbose)
             {
-                std::cout << "Skipping entry in " << dir.string() << ": " << ec.message() << "\n";
+                std::cout << "Skipping entry in " << terminalPath(dir) << ": " << ec.message() << "\n";
             }
             ec.clear();
         }
@@ -5827,7 +5840,7 @@ static StampDirStats processStampDirsInDir(
     {
         if (dryRun || clVerbose)
         {
-            std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << dir.string() << "\n";
+            std::cout << (dryRun ? "Would remove dir " : "Removed dir ") << terminalPath(dir) << "\n";
         }
         if (!dryRun)
         {
@@ -6003,7 +6016,7 @@ int main(int argc, char *argv[])
     }
     catch (const std::exception& e)
     {
-        cl.error(e.what());
+        cl.error(ut1::escapeTerminalText(e.what()));
     }
 
     ProgressTracker progress(progressWidth, progressCount > 1);
@@ -6069,7 +6082,7 @@ int main(int argc, char *argv[])
             {
                 if (!ut1::fsExists(path) || !ut1::fsIsDirectory(path))
                 {
-                    cl.error("Path '" + path + "' is not a directory.");
+                    cl.error("Path '" + terminalPath(path) + "' is not a directory.");
                 }
                 fs::path rootPath = normalizePath(path);
                 InputRoot newRoot{rootPath, true};
@@ -6077,7 +6090,7 @@ int main(int argc, char *argv[])
                 {
                     if (inputRootsOverlap(InputRoot{existingPath, true}, newRoot))
                     {
-                        cl.error("Roots overlap: '" + existingPath.string() + "' and '" + rootPath.string() + "'.");
+                        cl.error("Roots overlap: '" + terminalPath(existingPath) + "' and '" + terminalPath(rootPath) + "'.");
                     }
                 }
                 roots.push_back(std::move(rootPath));
@@ -6112,7 +6125,7 @@ int main(int argc, char *argv[])
                 }
                 if (inputRootsOverlap(existing, newRoot))
                 {
-                    cl.error("Roots overlap: '" + existing.path.string() + "' and '" + rootPath.string() + "'.");
+                    cl.error("Roots overlap: '" + terminalPath(existing.path) + "' and '" + terminalPath(rootPath) + "'.");
                 }
             }
             normalizedRoots.push_back(rootPath);
@@ -6125,13 +6138,13 @@ int main(int argc, char *argv[])
         {
             if (!ut1::fsExists(path))
             {
-                cl.error("Path '" + path + "' does not exist.");
+                cl.error("Path '" + terminalPath(path) + "' does not exist.");
             }
             bool isDir = ut1::fsIsDirectory(path);
             bool isRegular = ut1::fsIsRegular(path);
             if (!isDir && !isRegular)
             {
-                cl.error("Path '" + path + "' is neither a directory nor a regular file.");
+                cl.error("Path '" + terminalPath(path) + "' is neither a directory nor a regular file.");
             }
 
             fs::path normalizedPath = normalizePath(path);
@@ -6462,7 +6475,7 @@ int main(int argc, char *argv[])
     }
     catch (const std::exception& e)
     {
-        cl.error(e.what());
+        cl.error(ut1::escapeTerminalText(e.what()));
     }
 
     return 0;

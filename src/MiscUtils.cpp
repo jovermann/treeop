@@ -246,6 +246,108 @@ std::string expandUnprintable(const std::string& s, char quotes, char addQuotes)
     return r;
 }
 
+std::string escapeTerminalText(std::string_view s)
+{
+    std::string result;
+    result.reserve(s.size());
+
+    auto appendHexByte = [&](unsigned char c)
+    {
+        char buf[5];
+        std::snprintf(buf, sizeof(buf), "\\x%02x", c);
+        result += buf;
+    };
+
+    for (size_t i = 0; i < s.size();)
+    {
+        unsigned char c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80)
+        {
+            if (c >= 0x20 && c != 0x7f)
+            {
+                result += static_cast<char>(c);
+            }
+            else
+            {
+                switch (c)
+                {
+                case '\a': result += "\\a"; break;
+                case '\b': result += "\\b"; break;
+                case '\f': result += "\\f"; break;
+                case '\n': result += "\\n"; break;
+                case '\r': result += "\\r"; break;
+                case '\t': result += "\\t"; break;
+                case '\v': result += "\\v"; break;
+                default: appendHexByte(c); break;
+                }
+            }
+            i++;
+            continue;
+        }
+
+        size_t length = 0;
+        uint32_t codePoint = 0;
+        if (c >= 0xc2 && c <= 0xdf)
+        {
+            length = 2;
+            codePoint = c & 0x1f;
+        }
+        else if (c >= 0xe0 && c <= 0xef)
+        {
+            length = 3;
+            codePoint = c & 0x0f;
+        }
+        else if (c >= 0xf0 && c <= 0xf4)
+        {
+            length = 4;
+            codePoint = c & 0x07;
+        }
+
+        bool valid = length != 0 && i + length <= s.size();
+        for (size_t j = 1; valid && j < length; j++)
+        {
+            unsigned char continuation = static_cast<unsigned char>(s[i + j]);
+            valid = (continuation & 0xc0) == 0x80;
+            codePoint = (codePoint << 6) | (continuation & 0x3f);
+        }
+        if (valid)
+        {
+            valid = (length != 3 || codePoint >= 0x800)
+                 && (length != 4 || (codePoint >= 0x10000 && codePoint <= 0x10ffff))
+                 && !(codePoint >= 0xd800 && codePoint <= 0xdfff);
+        }
+
+        if (!valid)
+        {
+            appendHexByte(c);
+            i++;
+        }
+        else if (codePoint >= 0x80 && codePoint <= 0x9f)
+        {
+            char buf[7];
+            std::snprintf(buf, sizeof(buf), "\\u%04x", codePoint);
+            result += buf;
+            i += length;
+        }
+        else
+        {
+            result.append(s.substr(i, length));
+            i += length;
+        }
+    }
+    return result;
+}
+
+UNIT_TEST(escapeTerminalText)
+{
+    ASSERT_EQ(escapeTerminalText("plain filename.txt"), "plain filename.txt");
+    ASSERT_EQ(escapeTerminalText("back\\slash"), "back\\slash");
+    ASSERT_EQ(escapeTerminalText("line\nfeed\x1b[31m"), "line\\nfeed\\x1b[31m");
+    ASSERT_EQ(escapeTerminalText("Mäuse.txt"), "Mäuse.txt");
+    ASSERT_EQ(escapeTerminalText("c1\xc2\x9b"), "c1\\u009b");
+    ASSERT_EQ(escapeTerminalText(std::string("bad\x9b", 4)), "bad\\x9b");
+}
+
 
 UNIT_TEST(expandUnprintable)
 {

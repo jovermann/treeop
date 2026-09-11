@@ -117,6 +117,19 @@ def extract_hash(output: str, filename: str) -> str:
     raise AssertionError(f"hash not found for {filename} in output:\n{output}")
 
 
+def test_filename_control_characters_are_escaped(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    root_dir = tmp_path / "files"
+    root_dir.mkdir()
+    filename = "Mäuse-\x1b[31m-red\nname.txt"
+    write_file(root_dir / filename, "content")
+
+    out = run_treeop(["--list-files", str(root_dir)], root)
+
+    assert "\x1b" not in out
+    assert "Mäuse-\\x1b[31m-red\\nname.txt" in out
+
+
 def test_intersect_stats_two_roots(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()
