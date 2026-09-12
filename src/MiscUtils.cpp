@@ -11,11 +11,19 @@
 #include <sys/stat.h>
 #include <sys/ioctl.h>
 #endif
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 #ifdef __APPLE__
 #include <sys/disk.h> // for DKIOCGETBLOCKCOUNT and DKIOCGETBLOCKSIZE
+#include <sys/mount.h>
 #endif
 #ifdef __linux__
 #include <linux/fs.h> // for BLKGETSIZE64
+#include <sys/vfs.h>
 #endif
 #include "MiscUtils.hpp"
 #include "UnitTest.hpp"
@@ -1421,6 +1429,60 @@ bool fsIsDirectory(const std::filesystem::path& entry, bool followSymlinks)
 bool fsIsRegular(const std::filesystem::path& entry, bool followSymlinks)
 {
     return getFileType(entry, followSymlinks) == FileType::REGULAR;
+}
+
+bool isNetworkFilesystem(const std::filesystem::path& path) noexcept
+{
+#ifdef _WIN32
+    try
+    {
+        std::error_code ec;
+        std::filesystem::path absolutePath = std::filesystem::absolute(path, ec);
+        if (ec)
+        {
+            return false;
+        }
+        std::wstring root = absolutePath.root_path().wstring();
+        return !root.empty() && GetDriveTypeW(root.c_str()) == DRIVE_REMOTE;
+    }
+    catch (...)
+    {
+        return false;
+    }
+#elif defined(__APPLE__)
+    struct statfs info{};
+    if (::statfs(path.c_str(), &info) != 0)
+    {
+        return false;
+    }
+    return (info.f_flags & MNT_LOCAL) == 0;
+#elif defined(__linux__)
+    struct statfs info{};
+    if (::statfs(path.c_str(), &info) != 0)
+    {
+        return false;
+    }
+    // Network filesystem magic values from linux/magic.h. FUSE is included
+    // because common remote filesystems such as sshfs are FUSE-backed.
+    switch (static_cast<unsigned long>(info.f_type))
+    {
+    case 0x00006969UL: // NFS_SUPER_MAGIC
+    case 0xff534d42UL: // CIFS_SUPER_MAGIC
+    case 0xfe534d42UL: // SMB2_SUPER_MAGIC
+    case 0x01021997UL: // V9FS_MAGIC
+    case 0x00c36400UL: // CEPH_SUPER_MAGIC
+    case 0x5346414fUL: // AFS_SUPER_MAGIC
+    case 0x73757245UL: // CODA_SUPER_MAGIC
+    case 0x0000564cUL: // NCP_SUPER_MAGIC
+    case 0x65735546UL: // FUSE_SUPER_MAGIC
+        return true;
+    default:
+        return false;
+    }
+#else
+    (void)path;
+    return false;
+#endif
 }
 
 StatInfo::StatInfo()

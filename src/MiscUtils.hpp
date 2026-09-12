@@ -296,6 +296,9 @@ bool fsIsDirectory(const std::filesystem::path& entry, bool followSymlinks = tru
 /// Return true iff entry is a regular file.
 bool fsIsRegular(const std::filesystem::path& entry, bool followSymlinks = true);
 
+/// Return true when path resides on a known remote/network filesystem.
+bool isNetworkFilesystem(const std::filesystem::path& path) noexcept;
+
 /// File stat() info.
 /// This is only used to access stuff which is not accessible through std::filesystem::file_status (major/minor for block devices and st_dev/st_ino for inode identity (hardlink groups)).
 class StatInfo

@@ -26,6 +26,7 @@
 #include <set>
 #include <span>
 #include <list>
+#include <limits>
 #include <map>
 #include <filesystem>
 #include <fstream>
@@ -622,6 +623,13 @@ struct InodeHashCache
 };
 
 static InodeHashCache gInodeHashCache;
+static uint64_t gNextSyntheticInode = std::numeric_limits<uint64_t>::max();
+
+/// Return an invocation-local identity for a file whose filesystem inode is untrusted.
+static uint64_t nextSyntheticInode()
+{
+    return gNextSyntheticInode--;
+}
 
 static DirDbData loadOrCreateDirDb(
     const fs::path& dirPath,
@@ -5083,6 +5091,7 @@ static DirDbData readDirDb(
     bool* firstFileCurrent = nullptr)
 {
     fs::path dbPath = dirPath / ".dirdb";
+    bool networkFilesystem = ut1::isNetworkFilesystem(dirPath);
     std::string raw = ut1::readFile(dbPath.string());
     const uint8_t* data = reinterpret_cast<const uint8_t*>(raw.data());
     size_t size = raw.size();
@@ -5216,14 +5225,14 @@ static DirDbData readDirDb(
         entry.path = readLengthStringAt(strings, static_cast<size_t>(rawEntry.nameIndex));
         entry.size = sizes[i];
         entry.hash = rawEntry.hash;
-        entry.inode = rawEntry.inode;
+        entry.inode = networkFilesystem ? nextSyntheticInode() : rawEntry.inode;
         entry.date = rawEntry.date;
-        entry.numLinks = rawEntry.numLinks;
+        entry.numLinks = networkFilesystem ? 1 : rawEntry.numLinks;
         dirData.files.push_back(std::move(entry));
     }
 
     bool current = true;
-    if (firstFileCurrent && !dirData.files.empty())
+    if (firstFileCurrent && !networkFilesystem && !dirData.files.empty())
     {
         const FileEntry& first = dirData.files.front();
         try
@@ -5251,7 +5260,7 @@ static DirDbData readDirDb(
         *firstFileCurrent = current;
     }
 
-    if (inodeCache && current)
+    if (inodeCache && current && !networkFilesystem)
     {
         ut1::StatInfo dbStat = ut1::getStat(fs::directory_entry(dbPath), false);
         if (inodeCache->observeDevice(dbStat.getDev()))
@@ -5311,6 +5320,7 @@ static DirDbData buildDirDb(
     const std::unordered_map<HashReuseKey, FileEntry, HashReuseKeyHasher>* cache,
     InodeHashCache* inodeCache)
 {
+    bool networkFilesystem = ut1::isNetworkFilesystem(dirPath);
     if (clVerbose > 0)
     {
         std::cout << "Scanning " << terminalPath(dirPath) << "\n";
@@ -5346,10 +5356,10 @@ static DirDbData buildDirDb(
         ut1::StatInfo statInfo = ut1::getStat(entry, false);
         uint64_t date = fileTimeFromTimespec(statInfo.getMTimeSpec());
         uint64_t inode = static_cast<uint64_t>(statInfo.getIno());
-        bool canReuseInode = inodeCache && inodeCache->observeDevice(statInfo.getDev());
+        bool canReuseInode = !networkFilesystem && inodeCache && inodeCache->observeDevice(statInfo.getDev());
         Hash128 hash{};
         bool reusedHash = false;
-        if (cache)
+        if (cache && !networkFilesystem)
         {
             HashReuseKey key{inode, size, date};
             auto it = cache->find(key);
@@ -5384,9 +5394,9 @@ static DirDbData buildDirDb(
         scan.path = entry.path().filename().string();
         scan.size = size;
         scan.hash = hash;
-        scan.inode = inode;
+        scan.inode = networkFilesystem ? nextSyntheticInode() : inode;
         scan.date = date;
-        scan.numLinks = static_cast<uint64_t>(statInfo.statData.st_nlink);
+        scan.numLinks = networkFilesystem ? 1 : static_cast<uint64_t>(statInfo.statData.st_nlink);
         entries.push_back(std::move(scan));
     }
     if (ec)
@@ -5537,6 +5547,12 @@ static DirDbData recoverCorruptDirDb(
 /// Update an existing .dirdb by reusing cached hashes where possible.
 static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache)
 {
+    if (ut1::isNetworkFilesystem(dirPath))
+    {
+        // Remote inode/link metadata is not stable enough for safe incremental
+        // updates. Keep the existing database untouched.
+        return readDirDb(dirPath, false);
+    }
     DirDbData existing;
     try
     {
@@ -5569,6 +5585,17 @@ static DirDbData loadOrCreateDirDb(
     bool* staleDetected)
 {
     fs::path dbPath = dirPath / ".dirdb";
+    if (!forceCreate && ut1::isNetworkFilesystem(dirPath) && ut1::fsExists(dbPath))
+    {
+        // Existing network databases are snapshots. Do not use volatile remote
+        // metadata to declare them stale, repair them, or update them in place.
+        if (update && !staleUpdate)
+        {
+            std::cout << "Skipping update of " << terminalPath(dbPath)
+                      << " on network filesystem\n";
+        }
+        return readDirDb(dirPath, true);
+    }
     if (update)
     {
         if (ut1::fsExists(dbPath))
