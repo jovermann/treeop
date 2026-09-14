@@ -9,6 +9,7 @@
 #include "UnitTest.hpp"
 #include "CommandLineParser.hpp"
 #include "Tui.hpp"
+#include "RemoveInteractive.hpp"
 #include "Hash.hpp"
 #include "HashSha3.hpp"
 #include <exception>
@@ -5945,6 +5946,9 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "list-hardlinks", "List hardlinked files grouped by inode.");
     cl.addOption(' ', "list-dirs", "List all directories with file counts and total size.");
 
+    cl.addHeader("\nInteractive explorer:\n");
+    cl.addOption('X', "explore-interactive", "Explore directory trees with sizes, statistics, file previews, and recoverable per-root trash.");
+
     cl.addHeader("\nContainment options:\n");
     cl.addOption(' ', "show-contained-files", "List files in the last dir that are contained in the previous dirs (with --containment).");
     cl.addOption(' ', "show-not-contained-files", "List files in the last dir that are not contained in the previous dirs (with --containment).");
@@ -6053,7 +6057,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("explore-interactive") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -6097,7 +6101,7 @@ int main(int argc, char *argv[])
                 || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first")
                 || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies")
                 || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("hardlink-copies") || cl("break-hardlinks")
-                || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len") || cl("new-dirdb") || cl("update-dirdb")
+                || cl("explore-interactive") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len") || cl("new-dirdb") || cl("update-dirdb")
                 || cl("make-dirs-writable");
             if (otherMode)
             {
@@ -6197,6 +6201,30 @@ int main(int argc, char *argv[])
                     fileFilter.selectedDirRoots.push_back(root.path);
                 }
             }
+        }
+
+        if (cl("explore-interactive"))
+        {
+            bool otherMode = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks")
+                || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs")
+                || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("intersect") || cl("containment")
+                || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained")
+                || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs")
+                || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both")
+                || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last")
+                || cl("remove-dir-internal-copies") || cl("hardlink-copies") || cl("break-hardlinks")
+                || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len") || cl("new-dirdb")
+                || cl("update-dirdb") || cl("make-dirs-writable") || cl("dry-run");
+            if (otherMode)
+            {
+                cl.error("--explore-interactive cannot be combined with other operations or --dry-run.");
+            }
+            if (hasFileArgs)
+            {
+                cl.error("--explore-interactive requires directory arguments.");
+            }
+            treeop::runRemoveInteractive(normalizedRoots);
+            return 0;
         }
 
         if (cl("new-dirdb") && cl("update-dirdb"))

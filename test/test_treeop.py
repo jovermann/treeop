@@ -1,10 +1,14 @@
 import os
+import fcntl
 import pty
 import re
 import select
 import shutil
 import subprocess
+import struct
+import termios
 import time
+import unicodedata
 from pathlib import Path
 import pytest
 
@@ -50,7 +54,7 @@ def run_treeop_result(args, cwd: Path):
     )
 
 
-def run_treeop_pty(args, cwd: Path, input_after_title: bytes):
+def run_treeop_pty(args, cwd: Path, input_after_title: bytes, columns: int = 240):
     bin_path = treeop_bin()
     if "TREEOP_BIN" not in os.environ:
         subprocess.run(["make"], cwd=cwd, check=True, capture_output=True, text=True)
@@ -60,6 +64,8 @@ def run_treeop_pty(args, cwd: Path, input_after_title: bytes):
             raise FileNotFoundError(f"treeop binary not found after make: {bin_path}")
 
     master_fd, slave_fd = pty.openpty()
+    original_termios = termios.tcgetattr(master_fd)
+    fcntl.ioctl(slave_fd, termios.TIOCSWINSZ, struct.pack("HHHH", 24, columns, 0, 0))
     proc = subprocess.Popen(
         [str(bin_path)] + args,
         cwd=cwd,
@@ -83,21 +89,25 @@ def run_treeop_pty(args, cwd: Path, input_after_title: bytes):
                 if not chunk:
                     break
                 out.extend(chunk)
-                if (not sent) and b"treeop interactive" in out:
+                if (not sent) and (b"treeop interactive" in out or b"treeop explore-interactive" in out):
                     os.write(master_fd, input_after_title)
                     sent = True
             if proc.poll() is not None:
                 break
         if proc.poll() is None:
-            proc.kill()
-            proc.wait()
-            raise TimeoutError(bytes(out).decode("utf-8", errors="replace"))
+            try:
+                proc.wait(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+                raise TimeoutError(bytes(out).decode("utf-8", errors="replace"))
         if proc.returncode != 0:
             raise subprocess.CalledProcessError(
                 proc.returncode,
                 [str(bin_path)] + args,
                 output=bytes(out).decode("utf-8", errors="replace"),
             )
+        assert termios.tcgetattr(master_fd) == original_termios
         return bytes(out).decode("utf-8", errors="replace")
     finally:
         os.close(master_fd)
@@ -128,6 +138,200 @@ def test_filename_control_characters_are_escaped(tmp_path: Path):
 
     assert "\x1b" not in out
     assert "Mäuse-\\x1b[31m-red\\nname.txt" in out
+
+
+@pytest.mark.parametrize("option", ["-X", "--explore-interactive"])
+def test_remove_interactive_trash_persistent_undo_and_empty(tmp_path: Path, option: str):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    item = tree / "folder" / "item.txt"
+    write_file(item, "discard me")
+
+    out = run_treeop_pty([option, str(tree)], root, b"\033[B\r\033[Bdq")
+    assert "TREE EXPLORER" in out
+    assert "trash:" in out
+    assert not item.exists()
+    entries = tree / ".treeop_trash" / "entries"
+    assert len(list(entries.iterdir())) == 1
+
+    out = run_treeop_pty(["--explore-interactive", str(tree)], root, b"2uq")
+    assert "UNDO STACK" in out
+    assert "item.txt" in out
+    assert item.read_text(encoding="utf-8") == "discard me"
+    assert list(entries.iterdir()) == []
+
+    out = run_treeop_pty(["--explore-interactive", str(tree)], root, b"\033[Bd3q")
+    assert "TRASH EXPLORER" in out
+    assert "folder" in out
+    assert not (tree / "folder").exists()
+
+    run_treeop_pty(["--explore-interactive", str(tree)], root, b"EEq")
+    assert not entries.exists()
+    assert not (tree / "folder").exists()
+
+
+def test_remove_interactive_hidden_sizes_help_and_home_end(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / ".hidden", "x" * 20)
+    write_file(tree / "visible.txt", "x" * 10)
+    out = run_treeop_pty(["--explore-interactive", str(tree)], root,
+                        b"h\033[4~hH\033[H\033[Fdq")
+    assert "Return   Same as *" in out
+    assert "h        Alias for ?" in out
+    assert "d        Delete: move the selected item to its root's .treeop_trash; roots are protected." in out
+    assert "d: delete" in out
+    assert "d: delete  u: undo  ?: help" not in out
+    assert "Path: " in out
+    assert out.count("30 bytes") >= 2
+    assert "Hidden files hidden (sizes unchanged)" in out
+    assert (tree / ".hidden").exists()
+    assert not (tree / "visible.txt").exists()
+
+
+def test_remove_interactive_statistics_and_recursive_return(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "nested" / "deeper" / "big.bin", "x" * 80)
+    write_file(tree / "small.txt", "x" * 10)
+    write_file(tree / ".hidden" / "secret.txt", "x" * 20)
+    out = run_treeop_pty(["--explore-interactive", str(tree)], root, b"Hi\033[F i\riq")
+    assert "DIRECTORY STATISTICS" in out
+    assert re.search(r"TOTAL\s+3 files\s+110 bytes", out)
+    assert re.search(r"Hidden files \(subtotal\)\s+1 files\s+20 bytes", out)
+    assert re.search(r"\.txt\s+2 files\s+30 bytes", out)
+    stats = out.split("DIRECTORY STATISTICS", 1)[1]
+    assert stats.index(".bin") < stats.index(".txt")
+    # Root started expanded: Return collapses recursively, another Return expands all.
+    out = run_treeop_pty(["--explore-interactive", str(tree)], root, b"\r\rq")
+    assert "big.bin" in out
+
+
+def test_explorer_statistics_human_sizes_and_grouped_counts(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    for index in range(1000):
+        (tree / f"empty-{index}.dat").touch()
+    with (tree / "large.dat").open("wb") as stream:
+        stream.truncate(5_043_814)
+    out = run_treeop_pty(["-X", str(tree)], root, b"iq")
+    assert re.search(r"TOTAL\s+1_001 files\s+4\.81 MB", out)
+    assert re.search(r"\.dat\s+1_001 files\s+4\.81 MB", out)
+    assert "5043814 bytes" not in out
+
+
+def test_explorer_statistics_groups_long_extensions(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / ("one." + "a" * 21), "x" * 20)
+    write_file(tree / ("two." + "b" * 30), "x" * 30)
+    write_file(tree / ("boundary." + "c" * 20), "x" * 10)
+    out = run_treeop_pty(["-X", str(tree)], root, b"iq")
+    stats = out.split("DIRECTORY STATISTICS", 1)[1]
+    assert re.search(r"long extensions\s+2 files\s+50 bytes", stats)
+    assert re.search(r"\." + "c" * 20 + r"\s+1 files\s+10 bytes", stats)
+    assert "." + "a" * 21 not in stats
+    assert "." + "b" * 30 not in stats
+
+
+@pytest.mark.parametrize("keys", [b"\x03", b"/\x03", b"h\x03", b"i\x03"])
+def test_explorer_ctrl_c_restores_terminal(tmp_path: Path, keys: bytes):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "file.txt", "hello")
+    out = run_treeop_pty(["-X", str(tree)], root, keys)
+    assert "\033[?1049l" in out
+    assert "\033[?25h" in out
+    assert (tree / "file.txt").exists()
+
+
+def test_explorer_symlink_labels_and_trash(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "target.txt", "hello")
+    (tree / "link").symlink_to("target.txt")
+    (tree / "broken").symlink_to("missing\x1b(0")
+    out = run_treeop_pty(["-X", str(tree)], root, b"\033[Bd23q")
+    assert re.search(r"link -> target\.txt\s+symlink", out)
+    assert "symlink (OK)" in out
+    assert "symlink (broken)" in out
+    assert re.search(r"broken -> missing\\x1b\(0\s+symlink", out)
+    assert "\x1b(0" not in out
+    assert "UNDO STACK" in out
+    assert "TRASH EXPLORER" in out
+    run_treeop_pty(["-X", str(tree)], root, b"2uq")
+    assert (tree / "broken").is_symlink()
+    assert os.readlink(tree / "broken") == "missing\x1b(0"
+
+
+@pytest.mark.parametrize("columns", [60, 240])
+def test_explorer_unicode_symlink_alignment(tmp_path: Path, columns: int):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    target = "äöüß_漢字_e\u0301.txt"
+    write_file(tree / target, "hello")
+    (tree / "link").symlink_to(target)
+    (tree / "missing").symlink_to("ö" * 100 + ".txt")
+    out = run_treeop_pty(["-X", str(tree)], root, b"q", columns=columns)
+    plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", out)
+    rows = [line for line in plain.splitlines() if "symlink (" in line]
+    assert len(rows) == 2
+    for line in rows:
+        width = sum(0 if unicodedata.combining(c) else
+                    2 if unicodedata.east_asian_width(c) in ("W", "F") else 1
+                    for c in line)
+        assert width == columns
+        assert "\ufffd" not in line
+        assert re.search(r"\d{4}-\d{2}-\d{2} \d{2}:\d{2}$", line)
+    if columns == 240:
+        assert "link -> " + target in plain
+    else:
+        assert "..." in rows[1]
+
+
+def test_explorer_sort_and_open(tmp_path: Path, monkeypatch):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    name = "document $(echo unsafe); file.txt"
+    write_file(tree / name, "hello")
+    mock_bin = tmp_path / "bin"
+    log = tmp_path / "opened"
+    for command in ("open", "xdg-open"):
+        script = mock_bin / command
+        write_file(script, '#!/bin/sh\nprintf "%s\\n" "$#" "$1" > "$TREEOP_OPEN_LOG"\n')
+        script.chmod(0o755)
+    monkeypatch.setenv("PATH", str(mock_bin) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("TREEOP_OPEN_LOG", str(log))
+    out = run_treeop_pty(["-X", str(tree)], root, b"sso\033[Boq")
+    assert "Sorted by size" in out
+    assert "Sorted by date" in out
+    assert "Select a regular file to open" in out
+    assert "Opening " in out
+    deadline = time.monotonic() + 2
+    while not log.exists() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert log.read_text().splitlines() == ["1", str(tree / name)]
+
+
+def test_remove_interactive_safe_file_previews(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    (tree / "text.txt").write_bytes(b"hello\nterminal\x1b(0 safe\t\xc3\xa4\n")
+    out = run_treeop_pty(["--explore-interactive", str(tree)], root, b"\033[Biq")
+    assert "TEXT PREVIEW (SAFE ASCII)" in out
+    assert "non-ASCII/control bytes never sent to terminal" not in out
+    assert "terminal\\x1b(0 safe\\t\\xc3\\xa4" in out
+    assert "\x1b(0" not in out
+    (tree / "text.txt").write_bytes(b"\x00\x01ABC\xff\x1b")
+    out = run_treeop_pty(["--explore-interactive", str(tree)], root, b"\033[Biq")
+    assert "HEX PREVIEW" in out
+    assert "00000000  00 01 41 42 43 ff 1b" in out
+    assert "|..ABC..|" in out
+    (tree / "text.txt").write_bytes(b"x" * 70000)
+    out = run_treeop_pty(["--explore-interactive", str(tree)], root, b"\033[Biq")
+    assert "truncated at 64 KiB" in out
 
 
 def test_intersect_stats_two_roots(tmp_path: Path):

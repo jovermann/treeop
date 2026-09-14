@@ -4,7 +4,7 @@ Operations on huge directory trees.
 
 ## Warnings
 
-`treeop` can remove files (with the `--remove-copies` option for example). Always make a backup before using `treeop`. Removal cannot be undone.
+`treeop` can remove files (with the `--remove-copies` option for example). Always make a backup before using `treeop`. Most removal operations cannot be undone; `--explore-interactive` is the exception and uses a persistent per-root trash directory.
 
 `treeop` automatically creates and maintains a `.dirdb` file in each dir to cache file meta-data and hashes. During normal processing, an unreadable or corrupt `.dirdb` is removed and regenerated automatically. You can remove these files using `treeop --remove-dirdb DIRS...`.
 
@@ -14,6 +14,7 @@ Operations on huge directory trees.
 - Remove redundant copies across trees (keep files in earliest root)
 - Extract unique files of a root of an intersection into a new destination
 - Fast operation by caching directory contents and hashes in .dirdb files
+- Interactive file-explorer mode with directory sizes, recoverable removal, persistent undo, and trash browsing
 
 ## Examples
 
@@ -36,6 +37,37 @@ Intersection and redundancy are especially useful for photo backups from mobile 
   ```sh
   treeop --intersect --remove-copies 2025-07-01_Photos 2025-10-19_Photos 2026-01-12_Photos
   ```
+
+- Groom one or more old trees interactively. Removed items are moved to
+  `<root>/.treeop_trash` and remain undoable after restarting `treeop`:
+
+  ```sh
+  treeop --explore-interactive OLD_TREE ANOTHER_TREE
+  ```
+
+## Interactive file explorer
+
+Use `-X` or `--explore-interactive` with one or more directory roots.
+
+The explorer shows recursively calculated sizes and modification dates for files and directories. Directories and files have different colors, and the top line always shows the combined trash size.
+
+- `↑`/`↓`, Page Up/Page Down: move the selection
+- `Home` (Pos 1)/`End`: jump to the first/last visible entry
+- `Space`: toggle expansion; `→` expands; `←` collapses or moves to the parent
+- `*`/Return: recursively expand/collapse the selected directory
+- `i`: show recursive file-extension counts (with underscore grouping) and human-readable approximate sizes, largest first, plus a hidden-file subtotal (including files in hidden directories). On files, show a safe ASCII text preview or a hex dump with ASCII. Previews read at most 64 KiB; arrow/page keys and Home/End scroll, `i`/Escape returns to browsing. Symlinks and special files are not read.
+- `+`/`-`: expand/collapse every directory
+- `d`: delete—move the selected file or directory to its root's `.treeop_trash`
+- `u`: restore the selected trash entry, or the newest entry from tree view
+- `1`/`2`/`3` or Tab: tree, persistent undo stack, and trash explorer views
+- `s`: cycle name, size, and date sorting
+- `o`: open the selected file in its default application using `open` on macOS or `xdg-open` on Linux
+- `H`: show/hide dotfiles without rescanning. Recursive sizes always include hidden files.
+- `/`: filter by name; `r`: rescan
+- `E` twice: permanently empty all per-root trash directories
+- `?`/`h`: show the detailed, scrollable key reference; `q`: quit without emptying trash
+
+The current selected path is shown directly below the title; short key help is on the bottom status bar. Undo history is persisted in each root's `.treeop_trash/entries/<unique-id>/`: `payload` contains the moved item and `original` stores its original root-relative path. History is reconstructed from these entries on startup, rather than kept in a separate stack file.
 
 
 ## Command line options
