@@ -6,6 +6,7 @@
 // (See accompanying file LICENSE or copy at https://www.boost.org/LICENSE_1_0.txt)
 
 #include "Tui.hpp"
+#include <cstdint>
 #include <iomanip>
 #include <iostream>
 #include <cwchar>
