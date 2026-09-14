@@ -34,6 +34,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cerrno>
+#include <sys/stat.h>
 #include <unistd.h>
 #include <fnmatch.h>
 
@@ -5466,6 +5467,9 @@ static std::string serializeDirDb(const std::vector<FileEntry>& entries)
 /// tags/lengths, overlapping/gapped images, duplicate names and unsafe paths.
 /// The outer file is written through a unique temporary file and atomic rename
 /// so an interrupted regeneration does not overwrite a working snapshot.
+/// Published snapshots use 0666 masked by the generating process's umask, just
+/// like a newly created .dirdb. Regeneration reapplies this policy, correcting
+/// legacy mkstemp-created 0600 snapshots; custom modes are not preserved.
 static void writeTreeDb(const fs::path& root, const std::vector<DirDbData>& dirs)
 {
     std::vector<const DirDbData*> tree;
@@ -5520,6 +5524,13 @@ static void writeTreeDb(const fs::path& root, const std::vector<DirDbData>& dirs
             if (count <= 0) throw std::runtime_error("Failed writing .treedb");
             offset += static_cast<size_t>(count);
         }
+        // mkstemp deliberately starts private (0600). Once the contents are
+        // complete, give the published snapshot ordinary file permissions.
+        // Generation is single-threaded; restore umask immediately after reading.
+        mode_t mask = umask(0);
+        umask(mask);
+        if (fchmod(fd, static_cast<mode_t>(0666 & ~mask)) != 0)
+            throw std::runtime_error("Failed setting .treedb permissions: " + std::error_code(errno, std::generic_category()).message());
         if (fsync(fd) != 0) throw std::runtime_error("Failed syncing .treedb");
         int closed = close(fd);
         fd = -1;

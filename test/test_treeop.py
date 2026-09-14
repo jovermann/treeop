@@ -6,6 +6,7 @@ import select
 import shutil
 import subprocess
 import struct
+import stat
 import termios
 import time
 import unicodedata
@@ -363,6 +364,24 @@ def treedb_images(path: Path):
         name = names[start:start + name_length].decode("utf-8")
         result[name] = images[offset:offset + length]
     return result
+
+
+@pytest.mark.parametrize("creation_mask, expected_mode", [(0o022, 0o644), (0o002, 0o664), (0o077, 0o600)])
+def test_treedb_permissions_follow_umask_on_creation_and_regeneration(tmp_path: Path, creation_mask, expected_mode):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "file.txt", "safe")
+    previous_mask = os.umask(creation_mask)
+    try:
+        run_treeop(["--generate-treedb", str(tree)], root)
+        assert stat.S_IMODE((tree / ".treedb").stat().st_mode) == expected_mode
+        assert stat.S_IMODE((tree / ".dirdb").stat().st_mode) == expected_mode
+        (tree / ".treedb").chmod(0o600)
+        run_treeop(["--generate-treedb", str(tree)], root)
+        assert stat.S_IMODE((tree / ".treedb").stat().st_mode) == expected_mode
+        assert treedb_images(tree / ".treedb")[""] == (tree / ".dirdb").read_bytes()
+    finally:
+        os.umask(previous_mask)
 
 
 def test_generate_treedb_format_and_snapshot_loading(tmp_path: Path):

@@ -59,6 +59,8 @@ Read-only operations automatically prefer a root's `.treedb`, loading the entire
 
 Snapshots contain all regular files, including hidden files, and preserve empty directories. Symlinks, special files, and `.dirdb`/`.treedb` metadata are excluded. Paths are root-relative, so snapshots can move with their tree. The hunk-based container embeds the same DirDB format used by `.dirdb`; the full binary layout is documented in `src/treeop.cpp`.
 
+Generated and regenerated snapshots use ordinary file permissions (`0666` filtered by your umask, typically `0644`). Regeneration corrects older owner-only snapshots and reapplies this policy rather than preserving manually changed permissions.
+
 A `.treedb` is an explicit snapshot, not a live index: loading it does not check file freshness or discover changes made by other tools. Run `--generate-treedb` again after changes. Generation refreshes local `.dirdb` data, reusing cached hashes; existing network `.dirdb` files remain unchanged and supply their cached snapshot data. `--new-dirdb`/`--update-dirdb` bypass aggregate snapshots. Generation cannot be combined with filters, `--max-depth`, dry-run, or other operations. A corrupt aggregate snapshot produces an error rather than silently falling back to thousands of network reads.
 
 ## Interactive file explorer
