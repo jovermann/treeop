@@ -334,6 +334,203 @@ def test_remove_interactive_safe_file_previews(tmp_path: Path):
     assert "truncated at 64 KiB" in out
 
 
+def treedb_images(path: Path):
+    raw = path.read_bytes()
+    assert raw[:8] == b"TreeDB\0\0"
+    assert struct.unpack_from("<Q", raw, 8)[0] == 1
+    assert raw[16:24] == b"DIRS\0\0\0\0"
+    count, stride = struct.unpack_from("<QQ", raw, 24)
+    assert stride == 24
+    entries = [struct.unpack_from("<QQQ", raw, 40 + i * stride) for i in range(count)]
+    pos = 40 + count * stride
+    assert raw[pos:pos + 8] == b"STRINGS\0"
+    name_bytes = struct.unpack_from("<Q", raw, pos + 8)[0]
+    names = raw[pos + 16:pos + 16 + name_bytes]
+    pos += 16 + name_bytes
+    assert raw[pos:pos + 8] == b"DIRDATA\0"
+    image_bytes = struct.unpack_from("<Q", raw, pos + 8)[0]
+    images = raw[pos + 16:]
+    assert len(images) == image_bytes
+    result = {}
+    for index, offset, length in entries:
+        prefix = names[index]
+        if prefix <= 0xfc:
+            name_length, start = prefix, index + 1
+        else:
+            width = {0xff: 2, 0xfe: 4, 0xfd: 8}[prefix]
+            name_length = int.from_bytes(names[index + 1:index + 1 + width], "little")
+            start = index + 1 + width
+        name = names[start:start + name_length].decode("utf-8")
+        result[name] = images[offset:offset + length]
+    return result
+
+
+def test_generate_treedb_format_and_snapshot_loading(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "root.txt", "root data")
+    write_file(tree / "nested" / "ümlaut.txt", "nested data")
+    write_file(tree / ".hidden" / "secret.txt", "secret")
+    (tree / "empty").mkdir()
+    out = run_treeop(["--generate-treedb", str(tree)], root)
+    assert f"Generated {tree / '.treedb'}" in out
+    images = treedb_images(tree / ".treedb")
+    assert set(images) == {"", "nested", ".hidden", "empty"}
+    for relative, image in images.items():
+        assert image == (tree / relative / ".dirdb").read_bytes()
+    first = (tree / ".treedb").read_bytes()
+    run_treeop(["--generate-treedb", str(tree)], root)
+    assert (tree / ".treedb").read_bytes() == first
+    assert not list(tree.glob(".treedb.tmp.*"))
+    # Prove loading doesn't read dirdbs OR discover descendants on the drive.
+    (tree / ".dirdb").write_bytes(b"not a database")
+    shutil.rmtree(tree / "nested")
+    out = run_treeop(["-v", "--list-files", str(tree)], root)
+    assert "Loaded snapshot" in out
+    assert "ümlaut.txt" in out
+    assert "secret.txt" in out
+    assert "root.txt" in out
+    assert (tree / ".dirdb").read_bytes() == b"not a database"
+    assert not (tree / "nested").exists()
+    out = run_treeop(["--list-files", "--max-depth", "0", str(tree)], root)
+    assert "root.txt" in out and "ümlaut.txt" not in out and "secret.txt" not in out
+
+
+def test_treedb_loads_30_directories_without_tree_traversal(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    run_treeop(["--generate-treedb", str(tree)], root)
+    image = treedb_images(tree / ".treedb")[""]
+    directory_count = 30
+    names, entries = bytearray(), bytearray()
+    for index in range(directory_count):
+        name = b"" if index == 0 else f"directory-{index:05}".encode()
+        entries.extend(struct.pack("<QQQ", len(names), index * len(image), len(image)))
+        names.extend(bytes([len(name)]) + name)
+    raw = (b"TreeDB\0\0" + struct.pack("<Q", 1) + b"DIRS\0\0\0\0"
+           + struct.pack("<QQ", directory_count, 24) + entries
+           + b"STRINGS\0" + struct.pack("<Q", len(names)) + names
+           + b"DIRDATA\0" + struct.pack("<Q", directory_count * len(image))
+           + image * directory_count)
+    (tree / ".treedb").write_bytes(raw)
+    (tree / ".dirdb").write_bytes(b"must not be read")
+    out = run_treeop(["--stats", str(tree)], root)
+    assert re.search(r"dirs:\s+30\b", out)
+    assert (tree / ".dirdb").read_bytes() == b"must not be read"
+    assert len(list(tree.iterdir())) == 2  # No descendant directories were visited/created.
+
+
+def test_treedb_intersection_and_safe_deletion_target(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    first, last = tmp_path / "first", tmp_path / "last"
+    write_file(first / "nested" / "shared.txt", "shared")
+    write_file(first / "only-first.txt", "only first")
+    write_file(last / "shared.txt", "shared")
+    write_file(last / "keep.txt", "unique last")
+    baseline = run_treeop(["--intersect", str(first), str(last)], root)
+    run_treeop(["--generate-treedb", str(first), str(last)], root)
+    out = run_treeop(["--intersect", str(first), str(last)], root)
+    # Intersection counts/sizes must match independently of elapsed-time output.
+    fields = lambda text: re.findall(r"(?:unique-files|shared-files|total-files):[^\n]*", text)
+    assert fields(out) == fields(baseline)
+    shutil.rmtree(first / "nested")
+    (first / ".dirdb").write_bytes(b"unreadable reference dirdb")
+    write_file(last / "new-shared.txt", "shared")
+    dry = run_treeop(["-v", "--intersect", "--remove-copies-from-last", "--dry-run", str(first), str(last)], root)
+    assert f"Loaded snapshot {first / '.treedb'}" in dry
+    assert f"Loaded snapshot {last / '.treedb'}" not in dry
+    assert (last / ".treedb").exists()
+    run_treeop(["--intersect", "--remove-copies-from-last", str(first), str(last)], root)
+    assert not (last / "shared.txt").exists()
+    assert not (last / "new-shared.txt").exists()
+    assert (last / "keep.txt").exists()
+    assert not (last / ".treedb").exists()
+    assert (first / ".treedb").exists()
+    assert (first / ".dirdb").read_bytes() == b"unreadable reference dirdb"
+
+
+def test_treedb_relocation_and_explicit_regeneration(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "old.txt", "old")
+    run_treeop(["--generate-treedb", str(tree)], root)
+    relocated = tmp_path / "relocated"
+    tree.rename(relocated)
+    write_file(relocated / "new.txt", "new")
+    out = run_treeop(["--list-files", str(relocated)], root)
+    assert str(relocated) in out and "new.txt" not in out
+    run_treeop(["--generate-treedb", str(relocated)], root)
+    out = run_treeop(["--list-files", str(relocated)], root)
+    assert "new.txt" in out
+    assert re.search(r"files:\s+2", run_treeop(["--stats", str(relocated)], root))
+
+
+@pytest.mark.parametrize("damage", ["tag", "version", "count", "stride", "offset", "truncated", "traversal"])
+def test_treedb_rejects_corruption_without_remote_fallback(tmp_path: Path, damage: str):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "file.txt", "safe")
+    run_treeop(["--generate-treedb", str(tree)], root)
+    db = tree / ".treedb"
+    raw = bytearray(db.read_bytes())
+    if damage == "tag": raw[0] = ord("!")
+    elif damage == "version": struct.pack_into("<Q", raw, 8, 999)
+    elif damage == "count": struct.pack_into("<Q", raw, 24, 2**64 - 1)
+    elif damage == "stride": struct.pack_into("<Q", raw, 32, 0)
+    elif damage == "offset": struct.pack_into("<Q", raw, 48, 2**64 - 1)
+    elif damage == "truncated": raw = raw[:-1]
+    else:
+        name_size = struct.unpack_from("<Q", raw, 72)[0]
+        raw[80:81] = b"\x02.."
+        struct.pack_into("<Q", raw, 72, name_size + 2)
+    db.write_bytes(raw)
+    dirdb = (tree / ".dirdb").read_bytes()
+    result = run_treeop_result(["--list-files", str(tree)], root)
+    assert result.returncode != 0
+    assert ".treedb" in result.stderr + result.stdout
+    assert db.read_bytes() == raw
+    assert (tree / ".dirdb").read_bytes() == dirdb
+    assert (tree / "file.txt").read_text() == "safe"
+    run_treeop(["--generate-treedb", str(tree)], root)
+    assert treedb_images(db)[""] == (tree / ".dirdb").read_bytes()
+
+
+@pytest.mark.parametrize("extra", [["--max-depth", "0"], ["--intersect"], ["--dry-run"], ["--only", "*.txt"]])
+def test_generate_treedb_rejects_partial_or_conflicting_operations(tmp_path: Path, extra):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "file.txt", "safe")
+    result = run_treeop_result(["--generate-treedb", *extra, str(tree)], root)
+    assert result.returncode != 0
+    assert not (tree / ".treedb").exists()
+    assert not (tree / ".dirdb").exists()
+
+
+def test_generate_treedb_requires_directory_roots(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    file = tmp_path / "file.txt"
+    write_file(file, "safe")
+    result = run_treeop_result(["--generate-treedb", str(file)], root)
+    assert result.returncode != 0
+    assert "requires directory arguments" in result.stdout + result.stderr
+    assert not (tmp_path / ".treedb").exists()
+    assert run_treeop_result(["--generate-treedb"], root).returncode != 0
+
+
+def test_treedb_explorer_mutations_invalidate_snapshot(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "folder" / "file.txt", "safe")
+    run_treeop(["--generate-treedb", str(tree)], root)
+    run_treeop_pty(["-X", str(tree)], root, b"\033[Bdq")
+    assert not (tree / ".treedb").exists()
+    run_treeop(["--generate-treedb", str(tree)], root)
+    run_treeop_pty(["-X", str(tree)], root, b"uq")
+    assert not (tree / ".treedb").exists()
+    assert (tree / "folder" / "file.txt").read_text() == "safe"
+
+
 def test_intersect_stats_two_roots(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()

@@ -14,6 +14,7 @@ Operations on huge directory trees.
 - Remove redundant copies across trees (keep files in earliest root)
 - Extract unique files of a root of an intersection into a new destination
 - Fast operation by caching directory contents and hashes in .dirdb files
+- Aggregate `.treedb` snapshots for fast loading of large trees on slow/network drives
 - Interactive file-explorer mode with directory sizes, recoverable removal, persistent undo, and trash browsing
 
 ## Examples
@@ -44,6 +45,21 @@ Intersection and redundancy are especially useful for photo backups from mobile 
   ```sh
   treeop --explore-interactive OLD_TREE ANOTHER_TREE
   ```
+
+## Aggregate tree snapshots
+
+Generate one `.treedb` in each given directory root:
+
+```sh
+treeop --generate-treedb ARCHIVE ANOTHER_ARCHIVE
+treeop --intersect --remove-copies-from-last ARCHIVE RECENT_BACKUP
+```
+
+Read-only operations automatically prefer a root's `.treedb`, loading the entire snapshot with one file read instead of walking the tree and opening every `.dirdb`. With `--intersect --remove-copies-from-last`, earlier reference trees can use snapshots; the last, mutable tree uses ordinary directory loading. Local mutation targets with snapshots are refreshed and their aggregate snapshots invalidated before modifying files (not during dry-run). Reference snapshots are left untouched.
+
+Snapshots contain all regular files, including hidden files, and preserve empty directories. Symlinks, special files, and `.dirdb`/`.treedb` metadata are excluded. Paths are root-relative, so snapshots can move with their tree. The hunk-based container embeds the same DirDB format used by `.dirdb`; the full binary layout is documented in `src/treeop.cpp`.
+
+A `.treedb` is an explicit snapshot, not a live index: loading it does not check file freshness or discover changes made by other tools. Run `--generate-treedb` again after changes. Generation refreshes local `.dirdb` data, reusing cached hashes; existing network `.dirdb` files remain unchanged and supply their cached snapshot data. `--new-dirdb`/`--update-dirdb` bypass aggregate snapshots. Generation cannot be combined with filters, `--max-depth`, dry-run, or other operations. A corrupt aggregate snapshot produces an error rather than silently falling back to thousands of network reads.
 
 ## Interactive file explorer
 

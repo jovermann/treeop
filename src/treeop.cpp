@@ -33,6 +33,8 @@
 #include <fstream>
 #include <algorithm>
 #include <cstdint>
+#include <cerrno>
+#include <unistd.h>
 #include <fnmatch.h>
 
 static unsigned clVerbose = 0;
@@ -640,6 +642,8 @@ static DirDbData loadOrCreateDirDb(
     InodeHashCache* inodeCache,
     bool* staleDetected = nullptr);
 static DirDbData updateDirDb(const fs::path& dirPath, InodeHashCache* inodeCache = &gInodeHashCache);
+static std::vector<DirDbData> readTreeDb(const fs::path& root);
+static void writeTreeDb(const fs::path& root, const std::vector<DirDbData>& dirs);
 static uint64_t removeEmptyDirsTree(const fs::path& root, bool includeRoot, bool dryRun);
 /// Check whether a directory is empty aside from an optional .dirdb file.
 static bool isDirEmpty(const fs::path& dir, bool& hasDirDb);
@@ -702,22 +706,54 @@ public:
     }
 
     /// Load or create .dirdb files for all roots and record elapsed time.
-    void processRoots(bool forceCreate, bool update)
+    void processRoots(bool forceCreate, bool update, size_t snapshotRootLimit = 0, bool refreshSnapshotTargets = false)
     {
-        for (auto& rootData : roots)
+        for (size_t rootIndex = 0; rootIndex < roots.size(); rootIndex++)
         {
+            auto& rootData = roots[rootIndex];
             double start = ut1::getTimeSec();
-            if (rootData.recursive)
+            bool hasSnapshot = rootData.recursive && ut1::fsExists(rootData.path / ".treedb");
+            bool updateRoot = update || (refreshSnapshotTargets && rootIndex >= snapshotRootLimit && hasSnapshot);
+            if (rootData.recursive && rootIndex < snapshotRootLimit && !forceCreate && !update
+                && hasSnapshot)
             {
-                processDirTree(rootData.path, forceCreate, update, &gInodeHashCache);
+                // A snapshot must not trigger directory traversal, per-file stats,
+                // hash-cache reuse, or automatic remote database updates.
+                auto snapshot = readTreeDb(rootData.path);
+                if (clVerbose) std::cout << "Loaded snapshot " << terminalPath(rootData.path / ".treedb") << "\n";
+                for (auto& dir : snapshot) addDir(std::move(dir));
+            }
+            else if (rootData.recursive)
+            {
+                processDirTree(rootData.path, forceCreate, updateRoot, &gInodeHashCache);
             }
             else
             {
-                addDir(loadOrCreateDirDb(rootData.path, forceCreate, update, false, &gInodeHashCache));
+                addDir(loadOrCreateDirDb(rootData.path, forceCreate, updateRoot, false, &gInodeHashCache));
             }
             rootData.elapsedSeconds = ut1::getTimeSec() - start;
         }
         uniqueHashHexLen = computeUniqueHashHexLen();
+    }
+
+    void generateTreeDbs() const
+    {
+        for (const auto& root : roots)
+        {
+            writeTreeDb(root.path, dirs);
+            std::cout << "Generated " << terminalPath(root.path / ".treedb") << "\n";
+        }
+    }
+
+    /// Mutations must not leave an aggregate cache claiming removed files exist.
+    /// Only invalidate live mutation targets; reference-tree snapshots stay intact.
+    void invalidateTreeSnapshots(size_t referenceRoots) const
+    {
+        for (size_t i = referenceRoots; i < roots.size(); i++)
+        {
+            if (fs::remove(roots[i].path / ".treedb") && clVerbose)
+                std::cout << "Invalidated snapshot " << terminalPath(roots[i].path / ".treedb") << "\n";
+        }
     }
 
     /// Print per-root statistics.
@@ -4701,7 +4737,7 @@ static ReadBenchStats runReadBench(const std::vector<fs::path>& roots)
                 it.increment(ec);
                 continue;
             }
-            if (it->path().filename() == ".dirdb")
+            if (it->path().filename() == ".dirdb" || it->path().filename() == ".treedb")
             {
                 it.increment(ec);
                 continue;
@@ -5084,16 +5120,17 @@ static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* seco
     return Hash128::fromBytes(digest);
 }
 
-/// Read a .dirdb file for a directory and return its contents.
-static DirDbData readDirDb(
+/// Parse an ordinary DirDB image or an identical embedded image from TreeDB.
+/// Embedded snapshots never inspect directory/file metadata or populate inode caches.
+static DirDbData parseDirDb(
     const fs::path& dirPath,
-    bool reportProgress = true,
-    InodeHashCache* inodeCache = nullptr,
-    bool* firstFileCurrent = nullptr)
+    std::string_view raw,
+    bool networkFilesystem,
+    bool reportProgress,
+    InodeHashCache* inodeCache,
+    bool* firstFileCurrent)
 {
     fs::path dbPath = dirPath / ".dirdb";
-    bool networkFilesystem = ut1::isNetworkFilesystem(dirPath);
-    std::string raw = ut1::readFile(dbPath.string());
     const uint8_t* data = reinterpret_cast<const uint8_t*>(raw.data());
     size_t size = raw.size();
     size_t pos = 0;
@@ -5120,6 +5157,7 @@ static DirDbData readDirDb(
     {
         throw std::runtime_error("Unsupported TOC entry size in " + dbPath.string());
     }
+    if (tocCount > (size - pos) / tocEntrySize) throw std::runtime_error("Invalid TOC count in " + dbPath.string());
     struct TocEntry { uint64_t size; uint64_t fileIndex; };
     std::vector<TocEntry> tocEntries;
     for (uint64_t i = 0; i < tocCount; i++)
@@ -5148,6 +5186,7 @@ static DirDbData readDirDb(
     {
         throw std::runtime_error("Unsupported file entry size in " + dbPath.string());
     }
+    if (fileCount > (size - pos) / fileEntrySize) throw std::runtime_error("Invalid FILES count in " + dbPath.string());
     struct RawFileEntry
     {
         uint64_t nameIndex;
@@ -5182,7 +5221,7 @@ static DirDbData readDirDb(
         throw std::runtime_error("Missing STRINGS tag in " + dbPath.string());
     }
     uint64_t stringsSize = readU64Le(data, size, pos, "strings size");
-    if (pos + stringsSize > size)
+    if (stringsSize > size - pos)
     {
         throw std::runtime_error("Invalid STRINGS size in " + dbPath.string());
     }
@@ -5212,7 +5251,7 @@ static DirDbData readDirDb(
 
     DirDbData dirData;
     dirData.path = normalizePath(dirPath);
-    dirData.dbSize = static_cast<uint64_t>(ut1::getFileSize(dbPath.string()));
+    dirData.dbSize = raw.size();
     dirData.hashedBytes = 0;
     dirData.hashSeconds = 0.0;
     for (size_t i = 0; i < rawEntries.size(); i++)
@@ -5224,6 +5263,8 @@ static DirDbData readDirDb(
         }
         FileEntry entry;
         entry.path = readLengthStringAt(strings, static_cast<size_t>(rawEntry.nameIndex));
+        // Database metadata is never user content, even in older cached images.
+        if (entry.path == ".dirdb" || entry.path == ".treedb") continue;
         entry.size = sizes[i];
         entry.hash = rawEntry.hash;
         entry.inode = networkFilesystem ? nextSyntheticInode() : rawEntry.inode;
@@ -5287,6 +5328,14 @@ static DirDbData readDirDb(
     return dirData;
 }
 
+/// Read a .dirdb from disk, preserving the normal local stale/inode-cache checks.
+static DirDbData readDirDb(const fs::path& dirPath, bool reportProgress = true,
+    InodeHashCache* inodeCache = nullptr, bool* firstFileCurrent = nullptr)
+{
+    std::string raw = ut1::readFile((dirPath / ".dirdb").string());
+    return parseDirDb(dirPath, raw, ut1::isNetworkFilesystem(dirPath), reportProgress, inodeCache, firstFileCurrent);
+}
+
 struct HashReuseKey
 {
     uint64_t inode{};
@@ -5315,6 +5364,259 @@ struct HashReuseKeyHasher
     }
 };
 
+/// Serialize size/name-sorted file entries using the exact DirDB hunk format.
+static std::string serializeDirDb(const std::vector<FileEntry>& entries)
+{
+    struct TocEntry { uint64_t size; uint64_t fileIndex; };
+    std::vector<TocEntry> tocEntries;
+    for (size_t i = 0; i < entries.size(); i++)
+    {
+        if (i == 0 || entries[i].size != entries[i - 1].size)
+        {
+            TocEntry tocEntry{};
+            tocEntry.size = entries[i].size;
+            tocEntry.fileIndex = i;
+            tocEntries.push_back(tocEntry);
+        }
+    }
+
+    std::vector<uint8_t> stringData;
+    struct RawFileEntry
+    {
+        uint64_t nameIndex;
+        Hash128 hash;
+        uint64_t inode;
+        uint64_t date; // FILETIME ticks (100ns since 1601-01-01 UTC).
+        uint64_t numLinks;
+    };
+    std::vector<RawFileEntry> rawEntries;
+    for (const auto& entry : entries)
+    {
+        RawFileEntry raw{};
+        raw.nameIndex = stringData.size();
+        appendLengthString(stringData, entry.path);
+        raw.hash = entry.hash;
+        raw.inode = entry.inode;
+        raw.date = entry.date;
+        raw.numLinks = entry.numLinks;
+        rawEntries.push_back(raw);
+    }
+
+    std::vector<uint8_t> out;
+    appendU64Le(out, makeTag("DirDB"));
+    appendU64Le(out, kDirDbVersion);
+    appendU64Le(out, makeTag("TOC"));
+    appendU64Le(out, tocEntries.size());
+    appendU64Le(out, 16);
+    for (const auto& toc : tocEntries)
+    {
+        appendU64Le(out, toc.size);
+        appendU64Le(out, toc.fileIndex);
+    }
+    appendU64Le(out, makeTag("FILES"));
+    appendU64Le(out, rawEntries.size());
+    appendU64Le(out, 48);
+    for (const auto& raw : rawEntries)
+    {
+        appendU64Le(out, raw.nameIndex);
+        appendU64Le(out, raw.hash.lo);
+        appendU64Le(out, raw.hash.hi);
+        appendU64Le(out, raw.inode);
+        appendU64Le(out, raw.date);
+        appendU64Le(out, raw.numLinks);
+    }
+    appendU64Le(out, makeTag("STRINGS"));
+    appendU64Le(out, stringData.size());
+    out.insert(out.end(), stringData.begin(), stringData.end());
+    return std::string(reinterpret_cast<const char*>(out.data()), out.size());
+}
+
+/// TreeDB v1 file format (.treedb): one explicit, relocatable snapshot per
+/// command-line directory root. It contains the unfiltered regular files from
+/// every directory, including hidden files and empty directories, but excludes
+/// .dirdb/.treedb metadata. As with DirDB, symlinks/special files are not recorded.
+/// No absolute root path is stored: directory names are root-relative and file
+/// names inside embedded DirDB images are single basenames. The reader neither
+/// traverses the tree nor checks per-file metadata. Regenerate explicitly after
+/// changes; force-new/update operations bypass snapshots, and mutation targets
+/// must use ordinary loading. Network inode/link data is ignored on reading.
+///
+/// All uint64 fields are little-endian; tags are ASCII padded with zero bytes
+/// to exactly eight bytes. Hunks are sequential with no alignment padding:
+///   uint64 "TreeDB"; uint64 version (=1);
+///   uint64 "DIRS"; uint64 directoryCount; uint64 directoryEntryBytes (=24);
+///   DirectoryEntry directories[directoryCount];
+///   uint64 "STRINGS"; uint64 stringBytes; uint8 strings[stringBytes];
+///   uint64 "DIRDATA"; uint64 imageBytes; uint8 images[imageBytes];
+/// A DirectoryEntry is {uint64 nameIndex, uint64 imageOffset, uint64 imageSize}.
+/// nameIndex is a BYTE offset into STRINGS. Strings use precisely the DirDB
+/// LeadingLengthString encoding documented above (not NUL-terminated; names
+/// contain native filesystem bytes, not necessarily UTF-8). The root has the
+/// empty string; remaining names have no absolute prefix, '.'/'..' components,
+/// trailing separator or embedded NUL. Entries are sorted by relative path.
+/// imageOffset is a BYTE offset into DIRDATA, imageSize the full embedded image
+/// length. Images are contiguous in directory-entry order, with no unused data.
+/// Each image is an IDENTICAL standalone DirDB image: DirDB/version header,
+/// TOC/FILES/STRINGS hunks, 16-byte size/index TOC entries, 48-byte file records
+/// (nameIndex/hashLo/hashHi/inode/date/numLinks), size/name ordering, FILETIME
+/// dates, and the same length-prefixed basename strings. Thus parsing and
+/// serialization of file records are shared, not duplicated. Empty directories
+/// have ordinary empty DirDB images. Readers support larger directory records
+/// by skipping extra bytes, but reject unsupported TreeDB versions, bad hunk
+/// tags/lengths, overlapping/gapped images, duplicate names and unsafe paths.
+/// The outer file is written through a unique temporary file and atomic rename
+/// so an interrupted regeneration does not overwrite a working snapshot.
+static void writeTreeDb(const fs::path& root, const std::vector<DirDbData>& dirs)
+{
+    std::vector<const DirDbData*> tree;
+    for (const auto& dir : dirs) if (isPathWithinPath(root, dir.path)) tree.push_back(&dir);
+    std::sort(tree.begin(), tree.end(), [](const auto* a, const auto* b) { return a->path < b->path; });
+    std::vector<uint8_t> names, images, out;
+    struct DirectoryEntry { uint64_t nameIndex, imageOffset, imageSize; };
+    std::vector<DirectoryEntry> entries;
+    for (const auto* dir : tree)
+    {
+        fs::path relative = dir->path.lexically_relative(root);
+        std::string name = relative == "." ? "" : relative.string();
+        auto files = dir->files;
+        std::erase_if(files, [](const auto& file) { return file.path == ".dirdb" || file.path == ".treedb"; });
+        std::string image = serializeDirDb(files);
+        entries.push_back({names.size(), images.size(), image.size()});
+        appendLengthString(names, name);
+        images.insert(images.end(), image.begin(), image.end());
+    }
+    appendU64Le(out, makeTag("TreeDB"));
+    appendU64Le(out, 1);
+    appendU64Le(out, makeTag("DIRS"));
+    appendU64Le(out, entries.size());
+    appendU64Le(out, 24);
+    for (const auto& entry : entries)
+    {
+        appendU64Le(out, entry.nameIndex);
+        appendU64Le(out, entry.imageOffset);
+        appendU64Le(out, entry.imageSize);
+    }
+    appendU64Le(out, makeTag("STRINGS"));
+    appendU64Le(out, names.size());
+    out.insert(out.end(), names.begin(), names.end());
+    appendU64Le(out, makeTag("DIRDATA"));
+    appendU64Le(out, images.size());
+    out.insert(out.end(), images.begin(), images.end());
+
+    if (gMakeDirsWritable) fs::permissions(root, fs::perms::owner_write, fs::perm_options::add);
+    std::string pattern = (root / ".treedb.tmp.XXXXXX").string();
+    std::vector<char> temporary(pattern.begin(), pattern.end());
+    temporary.push_back('\0');
+    int fd = mkstemp(temporary.data());
+    if (fd < 0) throw std::runtime_error("Cannot create temporary .treedb: " + std::error_code(errno, std::generic_category()).message());
+    fs::path tempPath(temporary.data());
+    try
+    {
+        size_t offset = 0;
+        while (offset < out.size())
+        {
+            ssize_t count = ::write(fd, out.data() + offset, std::min<size_t>(out.size() - offset, 1024 * 1024));
+            if (count < 0 && errno == EINTR) continue;
+            if (count <= 0) throw std::runtime_error("Failed writing .treedb");
+            offset += static_cast<size_t>(count);
+        }
+        if (fsync(fd) != 0) throw std::runtime_error("Failed syncing .treedb");
+        int closed = close(fd);
+        fd = -1;
+        if (closed != 0) throw std::runtime_error("Failed closing .treedb");
+        fs::rename(tempPath, root / ".treedb");
+    }
+    catch (...)
+    {
+        if (fd >= 0) close(fd);
+        std::error_code ec;
+        fs::remove(tempPath, ec);
+        throw;
+    }
+}
+
+static std::vector<DirDbData> readTreeDb(const fs::path& root)
+{
+    std::string raw = ut1::readFile((root / ".treedb").string());
+    const auto* data = reinterpret_cast<const uint8_t*>(raw.data());
+    size_t pos = 0, size = raw.size();
+    auto read = [&](const char* what) { return readU64Le(data, size, pos, what); };
+    auto require = [&](bool condition)
+    {
+        if (!condition) throw std::runtime_error("Invalid .treedb in " + root.string() + "; regenerate with --generate-treedb");
+    };
+    require(read("TreeDB tag") == makeTag("TreeDB"));
+    require(read("TreeDB version") == 1);
+    require(read("DIRS tag") == makeTag("DIRS"));
+    uint64_t count = read("directory count"), stride = read("directory entry size");
+    require(stride >= 24 && count > 0 && count <= (size - pos) / stride);
+    struct DirectoryEntry { uint64_t nameIndex, imageOffset, imageSize; };
+    std::vector<DirectoryEntry> entries;
+    for (uint64_t i = 0; i < count; i++)
+    {
+        size_t start = pos;
+        entries.push_back({read("directory name"), read("image offset"), read("image size")});
+        pos = start + static_cast<size_t>(stride);
+    }
+    require(read("STRINGS tag") == makeTag("STRINGS"));
+    uint64_t nameBytes = read("string bytes");
+    require(nameBytes <= size - pos);
+    std::vector<uint8_t> names(data + pos, data + pos + nameBytes);
+    pos += static_cast<size_t>(nameBytes);
+    require(read("DIRDATA tag") == makeTag("DIRDATA"));
+    uint64_t imageBytes = read("image bytes");
+    require(imageBytes == size - pos);
+    size_t imageStart = pos, imageEnd = 0;
+    bool network = ut1::isNetworkFilesystem(root);
+    std::set<std::string> seen;
+    std::vector<DirDbData> result;
+    for (const auto& entry : entries)
+    {
+        require(entry.nameIndex < names.size());
+        std::string name = readLengthStringAt(names, entry.nameIndex);
+        fs::path relative(name);
+        require(name.find('\0') == std::string::npos && !relative.is_absolute()
+            && !relative.has_root_path() && (name.empty() || relative.lexically_normal().string() == name)
+            && seen.insert(name).second);
+        size_t depth = 0;
+        for (const auto& component : relative)
+        {
+            require(!component.empty() && component != "." && component != "..");
+            depth++;
+        }
+        require(entry.imageOffset == imageEnd && entry.imageOffset <= imageBytes
+            && entry.imageSize <= imageBytes - entry.imageOffset);
+        imageEnd += static_cast<size_t>(entry.imageSize);
+        // Parse from the one in-memory file; no per-directory opens or stats.
+        DirDbData dir = parseDirDb(root / relative,
+            std::string_view(raw).substr(imageStart + entry.imageOffset, entry.imageSize),
+            network, false, nullptr, nullptr);
+        std::set<std::string> files;
+        for (const auto& file : dir.files)
+        {
+            fs::path basename(file.path);
+            require(!file.path.empty() && file.path.find('\0') == std::string::npos
+                && basename == basename.filename() && basename != "." && basename != ".."
+                && files.insert(file.path).second);
+        }
+        if (!gMaxDepth || depth <= *gMaxDepth)
+        {
+            if (gProgress)
+            {
+                uint64_t bytes = 0;
+                for (const auto& file : dir.files) bytes += file.size;
+                gProgress->onDirStart(dir.path);
+                gProgress->addDirSummary(dir.files.size(), bytes);
+            }
+            result.push_back(std::move(dir));
+        }
+    }
+    require(imageEnd == imageBytes && seen.contains(""));
+    // Attribute outer container overhead to the root, not 30,000 separate files.
+    for (auto& dir : result) if (dir.path == root) dir.dbSize += raw.size() - imageBytes;
+    return result;
+}
+
 /// Scan a directory and build a new .dirdb file, reusing hashes when possible.
 static DirDbData buildDirDb(
     const fs::path& dirPath,
@@ -5341,7 +5643,7 @@ static DirDbData buildDirDb(
         {
             throw std::runtime_error("Error while scanning directory: " + dirPath.string());
         }
-        if (entry.path().filename() == ".dirdb")
+        if (entry.path().filename() == ".dirdb" || entry.path().filename() == ".treedb")
         {
             continue;
         }
@@ -5418,70 +5720,8 @@ static DirDbData buildDirDb(
         return a.path < b.path;
     });
 
-    struct TocEntry { uint64_t size; uint64_t fileIndex; };
-    std::vector<TocEntry> tocEntries;
-    for (size_t i = 0; i < entries.size(); i++)
-    {
-        if (i == 0 || entries[i].size != entries[i - 1].size)
-        {
-            TocEntry tocEntry{};
-            tocEntry.size = entries[i].size;
-            tocEntry.fileIndex = i;
-            tocEntries.push_back(tocEntry);
-        }
-    }
-
-    std::vector<uint8_t> stringData;
-    struct RawFileEntry
-    {
-        uint64_t nameIndex;
-        Hash128 hash;
-        uint64_t inode;
-        uint64_t date; // FILETIME ticks (100ns since 1601-01-01 UTC).
-        uint64_t numLinks;
-    };
-    std::vector<RawFileEntry> rawEntries;
-    for (const auto& entry : entries)
-    {
-        RawFileEntry raw{};
-        raw.nameIndex = stringData.size();
-        appendLengthString(stringData, entry.path);
-        raw.hash = entry.hash;
-        raw.inode = entry.inode;
-        raw.date = entry.date;
-        raw.numLinks = entry.numLinks;
-        rawEntries.push_back(raw);
-    }
-
-    std::vector<uint8_t> out;
-    appendU64Le(out, makeTag("DirDB"));
-    appendU64Le(out, kDirDbVersion);
-    appendU64Le(out, makeTag("TOC"));
-    appendU64Le(out, tocEntries.size());
-    appendU64Le(out, 16);
-    for (const auto& toc : tocEntries)
-    {
-        appendU64Le(out, toc.size);
-        appendU64Le(out, toc.fileIndex);
-    }
-    appendU64Le(out, makeTag("FILES"));
-    appendU64Le(out, rawEntries.size());
-    appendU64Le(out, 48);
-    for (const auto& raw : rawEntries)
-    {
-        appendU64Le(out, raw.nameIndex);
-        appendU64Le(out, raw.hash.lo);
-        appendU64Le(out, raw.hash.hi);
-        appendU64Le(out, raw.inode);
-        appendU64Le(out, raw.date);
-        appendU64Le(out, raw.numLinks);
-    }
-    appendU64Le(out, makeTag("STRINGS"));
-    appendU64Le(out, stringData.size());
-    out.insert(out.end(), stringData.begin(), stringData.end());
-
     fs::path dbPath = dirPath / ".dirdb";
-    std::string raw(reinterpret_cast<const char*>(out.data()), out.size());
+    std::string raw = serializeDirDb(entries);
     if (gMakeDirsWritable)
     {
         std::error_code permissionEc;
@@ -5835,7 +6075,7 @@ static StampDirStats processStampDirsInDir(
         {
             childDirs.push_back(path);
         }
-        else if (path.filename() != ".dirdb" && fs::is_regular_file(status))
+        else if (path.filename() != ".dirdb" && path.filename() != ".treedb" && fs::is_regular_file(status))
         {
             if (gProgress)
             {
@@ -5982,6 +6222,7 @@ int main(int argc, char *argv[])
 
     cl.addHeader("\nDatabase and tree maintenance:\n");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
+    cl.addOption(' ', "generate-treedb", "Generate one aggregate .treedb snapshot per tree, loading all directories without filters.");
     cl.addOption('u', "update-dirdb", "Update .dirdb files, reusing hashes when inode/size/mtime match.");
     cl.addOption(' ', "make-dirs-writable", "Add owner-write permission to directories where .dirdb files are written.");
     cl.addOption(' ', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
@@ -6057,13 +6298,27 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("explore-interactive") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("explore-interactive") || cl("generate-treedb") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
 
     try
     {
+        if (cl("generate-treedb"))
+        {
+            for (const char* operation : {"stats", "list-files", "list-redundant", "list-hardlinks", "list-dirs",
+                "size-histogram", "remove-dirdb", "remove-corrupt-dirdbs", "intersect", "containment",
+                "show-contained-files", "show-not-contained-files", "show-not-contained", "remove-contained-dirs",
+                "remove-contained-files", "find-overlapping-dirs", "find-redundant-dirs", "list-first", "list-last",
+                "list-both", "extract-first", "extract-last", "remove-copies", "remove-copies-from-last",
+                "remove-dir-internal-copies", "remove-empty-dirs", "remove-dirs-that-contain-file", "hardlink-copies",
+                "break-hardlinks", "explore-interactive", "readbench", "hashrate", "get-unique-hash-len",
+                "interactive", "dry-run", "max-depth", "min-size", "max-size", "only", "ionly", "exclude", "iexclude"})
+            {
+                if (cl(operation)) cl.error(std::string("--generate-treedb cannot be combined with --") + operation + ".");
+            }
+        }
         if (cl("hashrate"))
         {
             bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
@@ -6131,6 +6386,7 @@ int main(int argc, char *argv[])
             {
                 removePattern = cl.getStr("remove-dirs-that-contain-file");
             }
+            if (!cl("dry-run")) for (const auto& root : roots) fs::remove(root / ".treedb");
             StampDirStats stats = processStampDirs(
                 roots,
                 removePattern ? &*removePattern : nullptr,
@@ -6231,6 +6487,8 @@ int main(int argc, char *argv[])
         {
             cl.error("Cannot combine --new-dirdb with --update-dirdb.");
         }
+        if (cl("generate-treedb") && hasFileArgs)
+            cl.error("--generate-treedb requires directory arguments.");
         if (cl("remove-corrupt-dirdbs"))
         {
             bool otherMode = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs")
@@ -6397,12 +6655,26 @@ int main(int argc, char *argv[])
 
             MainDb mainDb(inputRoots, cl("same-filename"));
 
-            // Recursively walk all dirs specified on the command line and either read existing .dirdb files or create missing .dirdb files.
-            mainDb.processRoots(cl("new-dirdb"), cl("update-dirdb"));
+            bool mutatesTrees = cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies")
+                || cl("hardlink-copies") || cl("break-hardlinks") || cl("remove-contained-dirs")
+                || cl("remove-contained-files") || cl("remove-empty-dirs");
+            bool onlyLastMutates = cl("remove-copies-from-last") && !cl("remove-dir-internal-copies")
+                && !cl("hardlink-copies") && !cl("break-hardlinks") && !cl("remove-contained-dirs")
+                && !cl("remove-contained-files") && !cl("remove-empty-dirs");
+            size_t referenceRoots = onlyLastMutates ? inputRoots.size() - 1 : 0;
+            size_t snapshotRoots = cl("generate-treedb") ? 0 : mutatesTrees ? referenceRoots : inputRoots.size();
+            mainDb.processRoots(cl("new-dirdb"), cl("update-dirdb") || (cl("generate-treedb") && !cl("new-dirdb")),
+                snapshotRoots, mutatesTrees);
             if (gProgress)
             {
                 gProgress->finish();
             }
+            if (cl("generate-treedb"))
+            {
+                mainDb.generateTreeDbs();
+                return 0;
+            }
+            if (mutatesTrees && !cl("dry-run")) mainDb.invalidateTreeSnapshots(referenceRoots);
 
             if (cl("remove-dir-internal-copies"))
             {

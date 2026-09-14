@@ -998,6 +998,15 @@ private:
             status = e.what();
             return;
         }
+        // A live edit must not leave an aggregate snapshot claiming old content.
+        fs::path snapshot = roots[node->rootIndex] / ".treedb";
+        if (node->path != snapshot) fs::remove(snapshot, ec);
+        if (ec)
+        {
+            fs::remove_all(entryDir);
+            status = "Cannot invalidate .treedb before deletion: " + ec.message();
+            return;
+        }
         fs::rename(node->path, entryDir / "payload", ec);
         if (ec)
         {
@@ -1054,6 +1063,12 @@ private:
         if (ec)
         {
             status = "Cannot create restore directory: " + ec.message();
+            return;
+        }
+        fs::remove(roots[record.rootIndex] / ".treedb", ec);
+        if (ec)
+        {
+            status = "Cannot invalidate .treedb before restore: " + ec.message();
             return;
         }
         fs::rename(record.payload, destination, ec);
