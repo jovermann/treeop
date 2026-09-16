@@ -504,6 +504,16 @@ struct FileFilter
         return true;
     }
 
+    /// Apply only the explicit filename patterns, for directory removal.
+    bool matchesName(const std::string& name) const
+    {
+        if ((!onlyPatterns.empty() || !iOnlyPatterns.empty())
+            && !matchesAny(onlyPatterns, name, 0)
+            && !matchesAny(iOnlyPatterns, name, FNM_CASEFOLD)) return false;
+        return !matchesAny(excludePatterns, name, 0)
+            && !matchesAny(iExcludePatterns, name, FNM_CASEFOLD);
+    }
+
 private:
     static bool matchesAny(const std::vector<std::string>& patterns, const std::string& filename, int flags)
     {
@@ -582,6 +592,13 @@ struct RemoveCopyStats
     uint64_t files{};
     uint64_t bytes{};
     ExtensionStats extensions;
+};
+
+struct RemoveFilteredStats
+{
+    uint64_t files{};
+    uint64_t dirs{};
+    uint64_t bytes{};
 };
 
 struct RemoveContainedDirStats
@@ -2752,6 +2769,130 @@ public:
         }
 
         return stats;
+    }
+
+    /// Remove every regular file selected by the standard filters.
+    RemoveFilteredStats removeFilteredFiles(const FileFilter& filter, bool dryRun)
+    {
+        RemoveFilteredStats stats;
+        std::set<fs::path> touchedDirs;
+        for (const auto& dir : dirs)
+        {
+            for (const auto& file : dir.files)
+            {
+                if (!filter.matches(file, dir.path)) continue;
+                fs::path target = dir.path / file.path;
+                if (dryRun)
+                {
+                    std::cout << "Would remove file " << terminalPath(target) << "\n";
+                }
+                else
+                {
+                    std::error_code ec;
+                    fs::file_status status = fs::symlink_status(target, ec);
+                    if (ec || !fs::is_regular_file(status))
+                    {
+                        std::cout << "Warning: not a regular file, skipping " << terminalPath(target) << "\n";
+                        continue;
+                    }
+                    if (!fs::remove(target, ec) || ec)
+                        throw std::runtime_error("Failed to remove " + target.string() + (ec ? ": " + ec.message() : ""));
+                    touchedDirs.insert(dir.path);
+                    if (clVerbose) std::cout << "Removed file " << terminalPath(target) << "\n";
+                }
+                stats.files++;
+                stats.bytes += file.size;
+            }
+        }
+        if (!dryRun)
+        {
+            for (const auto& dir : touchedDirs)
+            {
+                // Existing network .dirdb files are immutable snapshots.
+                if (!ut1::isNetworkFilesystem(dir) && ut1::fsExists(dir / ".dirdb")) updateDirDb(dir);
+            }
+        }
+        return stats;
+    }
+
+    /// Remove topmost matching directories recursively; command-line roots are protected.
+    RemoveFilteredStats removeFilteredDirs(const FileFilter& filter, bool dryRun) const
+    {
+        struct Total { uint64_t files{}, dirs{}, bytes{}; };
+        std::map<fs::path, Total> totals;
+        std::set<fs::path> protectedRoots;
+        for (const auto& root : roots) protectedRoots.insert(root.path);
+        for (const auto& dir : dirs) totals.try_emplace(dir.path);
+        for (const auto& dir : dirs)
+        {
+            Total direct{static_cast<uint64_t>(dir.files.size()), 1, 0};
+            for (const auto& file : dir.files) direct.bytes += file.size;
+            fs::path current = dir.path;
+            while (true)
+            {
+                auto it = totals.find(current);
+                if (it == totals.end()) break;
+                it->second.files += direct.files;
+                it->second.dirs += direct.dirs;
+                it->second.bytes += direct.bytes;
+                fs::path parent = current.parent_path();
+                if (parent == current) break;
+                current = std::move(parent);
+            }
+        }
+
+        std::vector<fs::path> candidates;
+        for (const auto& [path, total] : totals)
+        {
+            if (!protectedRoots.contains(path) && filter.matchesName(path.filename().string())) candidates.push_back(path);
+        }
+        auto depth = [](const fs::path& path) { return static_cast<size_t>(std::distance(path.begin(), path.end())); };
+        std::sort(candidates.begin(), candidates.end(), [&](const fs::path& a, const fs::path& b)
+        {
+            size_t ad = depth(a), bd = depth(b);
+            return ad != bd ? ad < bd : a < b;
+        });
+        std::vector<fs::path> targets;
+        for (const auto& candidate : candidates)
+        {
+            bool covered = std::any_of(targets.begin(), targets.end(),
+                [&](const fs::path& parent) { return isPathWithinPath(parent, candidate); });
+            if (!covered) targets.push_back(candidate);
+        }
+
+        RemoveFilteredStats stats;
+        for (const auto& target : targets)
+        {
+            const Total& total = totals.at(target);
+            if (dryRun)
+            {
+                std::cout << "Would remove directory recursively " << terminalPath(target) << "\n";
+            }
+            else
+            {
+                std::error_code ec;
+                fs::file_status status = fs::symlink_status(target, ec);
+                if (ec || !fs::is_directory(status))
+                {
+                    std::cout << "Warning: not a directory, skipping " << terminalPath(target) << "\n";
+                    continue;
+                }
+                fs::remove_all(target, ec);
+                if (ec) throw std::runtime_error("Failed to remove " + target.string() + ": " + ec.message());
+                if (clVerbose) std::cout << "Removed directory recursively " << terminalPath(target) << "\n";
+            }
+            stats.files += total.files;
+            stats.dirs += total.dirs;
+            stats.bytes += total.bytes;
+        }
+        return stats;
+    }
+
+    static void printRemoveFilteredStats(const RemoveFilteredStats& stats)
+    {
+        std::cout << "removed-files: " << ut1::formatU64WithUnderscores(stats.files) << "\n"
+                  << "removed-dirs: " << ut1::formatU64WithUnderscores(stats.dirs) << "\n"
+                  << "removed-size: " << ut1::getApproxSizeStr(stats.bytes, 3, true, false) << "\n";
     }
 
 private:
@@ -6223,13 +6364,17 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "break-hardlinks", "Break all hardlinks by replacing files with private copies.");
     cl.addOption(' ', "max-hardlinks", "Maximum allowed hardlink count for the oldest file (with --hardlink-copies).", "N", "60000");
 
-    cl.addHeader("\nFilters:\n");
+    cl.addHeader("\nFilters:\n"
+                 "  --only and --ionly form one inclusion set: a basename matching ANY inclusion pattern is included.\n"
+                 "  Without an inclusion pattern, every basename starts included. --exclude and --iexclude are then\n"
+                 "  applied as overrides: matching ANY exclusion pattern always excludes the entry, even if it also\n"
+                 "  matches an inclusion pattern. Size filters are combined with the resulting name match using AND.\n");
     cl.addOption(' ', "min-size", "Minimum file size for operations that support file filtering.", "N", "0");
     cl.addOption(' ', "max-size", "Maximum file size for operations that support file filtering.", "N", "0");
-    cl.addOption(' ', "only", "Only include filenames matching comma-separated fnmatch patterns.", "PATTERNS", "");
-    cl.addOption(' ', "ionly", "Only include filenames matching comma-separated fnmatch patterns, case-insensitively.", "PATTERNS", "");
-    cl.addOption(' ', "exclude", "Exclude filenames matching comma-separated fnmatch patterns.", "PATTERNS", "");
-    cl.addOption(' ', "iexclude", "Exclude filenames matching comma-separated fnmatch patterns, case-insensitively.", "PATTERNS", "");
+    cl.addOption(' ', "only", "Include basenames matching any comma-separated fnmatch pattern; --only/--ionly are ORed and exclusions override.", "PATTERNS", "");
+    cl.addOption(' ', "ionly", "Case-insensitive inclusion patterns; ORed with --only, with exclusions taking precedence.", "PATTERNS", "");
+    cl.addOption(' ', "exclude", "Exclude basenames matching any comma-separated fnmatch pattern; exclusion always overrides inclusion.", "PATTERNS", "");
+    cl.addOption(' ', "iexclude", "Case-insensitive exclusion patterns; any match overrides --only/--ionly.", "PATTERNS", "");
 
     cl.addHeader("\nDatabase and tree maintenance:\n");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
@@ -6238,6 +6383,8 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "make-dirs-writable", "Add owner-write permission to directories where .dirdb files are written.");
     cl.addOption(' ', "remove-dirdb", "Recursively remove all .dirdb files under specified dirs.");
     cl.addOption(' ', "remove-corrupt-dirdbs", "Validate existing .dirdb files and remove those that cannot be read.");
+    cl.addOption(' ', "remove-files", "Remove all regular files matching the explicit filters.");
+    cl.addOption(' ', "remove-dirs", "Recursively remove directories matching name filters; size filters are not supported and roots are protected.");
     cl.addOption(' ', "remove-empty-dirs", "Remove empty directories (ignoring .dirdb files).");
     cl.addOption(' ', "remove-dirs-that-contain-file", "Recursively remove directories containing a file matching FILE_PATTERN.", "FILE_PATTERN", "");
 
@@ -6309,7 +6456,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("explore-interactive") || cl("generate-treedb") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("remove-files") || cl("remove-dirs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("explore-interactive") || cl("generate-treedb") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -6319,7 +6466,7 @@ int main(int argc, char *argv[])
         if (cl("generate-treedb"))
         {
             for (const char* operation : {"stats", "list-files", "list-redundant", "list-hardlinks", "list-dirs",
-                "size-histogram", "remove-dirdb", "remove-corrupt-dirdbs", "intersect", "containment",
+                "size-histogram", "remove-dirdb", "remove-corrupt-dirdbs", "remove-files", "remove-dirs", "intersect", "containment",
                 "show-contained-files", "show-not-contained-files", "show-not-contained", "remove-contained-dirs",
                 "remove-contained-files", "find-overlapping-dirs", "find-redundant-dirs", "list-first", "list-last",
                 "list-both", "extract-first", "extract-last", "remove-copies", "remove-copies-from-last",
@@ -6329,6 +6476,28 @@ int main(int argc, char *argv[])
             {
                 if (cl(operation)) cl.error(std::string("--generate-treedb cannot be combined with --") + operation + ".");
             }
+        }
+        if (cl("remove-files") || cl("remove-dirs"))
+        {
+            bool hasNameFilter = !fileFilter.onlyPatterns.empty() || !fileFilter.iOnlyPatterns.empty()
+                || !fileFilter.excludePatterns.empty() || !fileFilter.iExcludePatterns.empty();
+            if (cl("remove-dirs") && (cl("min-size") || cl("max-size")))
+                cl.error("--remove-dirs does not support --min-size or --max-size; use a name filter.");
+            bool hasFilter = hasNameFilter || (cl("remove-files") && (fileFilter.minSize != 0 || fileFilter.maxSize != 0));
+            if (!hasFilter) cl.error("--remove-files/--remove-dirs require at least one non-empty filter option.");
+            for (const char* operation : {"stats", "list-files", "list-redundant", "list-hardlinks", "list-dirs",
+                "size-histogram", "remove-dirdb", "remove-corrupt-dirdbs", "intersect", "containment",
+                "show-contained-files", "show-not-contained-files", "show-not-contained", "remove-contained-dirs",
+                "remove-contained-files", "find-overlapping-dirs", "find-redundant-dirs", "list-first", "list-last",
+                "list-both", "extract-first", "extract-last", "remove-copies", "remove-copies-from-last",
+                "remove-dir-internal-copies", "remove-empty-dirs", "remove-dirs-that-contain-file", "hardlink-copies",
+                "break-hardlinks", "explore-interactive", "generate-treedb", "readbench", "hashrate",
+                "get-unique-hash-len", "interactive", "new-dirdb", "update-dirdb"})
+            {
+                if (cl(operation)) cl.error(std::string("--remove-files/--remove-dirs cannot be combined with --") + operation + ".");
+            }
+            if (cl("remove-files") && cl("remove-dirs"))
+                cl.error("--remove-files and --remove-dirs cannot be combined.");
         }
         if (cl("hashrate"))
         {
@@ -6500,6 +6669,8 @@ int main(int argc, char *argv[])
         }
         if (cl("generate-treedb") && hasFileArgs)
             cl.error("--generate-treedb requires directory arguments.");
+        if (cl("remove-dirs") && hasFileArgs)
+            cl.error("--remove-dirs requires directory arguments.");
         if (cl("remove-corrupt-dirdbs"))
         {
             bool otherMode = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs")
@@ -6666,7 +6837,7 @@ int main(int argc, char *argv[])
 
             MainDb mainDb(inputRoots, cl("same-filename"));
 
-            bool mutatesTrees = cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies")
+            bool mutatesTrees = cl("remove-files") || cl("remove-dirs") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies")
                 || cl("hardlink-copies") || cl("break-hardlinks") || cl("remove-contained-dirs")
                 || cl("remove-contained-files") || cl("remove-empty-dirs");
             bool onlyLastMutates = cl("remove-copies-from-last") && !cl("remove-dir-internal-copies")
@@ -6674,7 +6845,8 @@ int main(int argc, char *argv[])
                 && !cl("remove-contained-files") && !cl("remove-empty-dirs");
             size_t referenceRoots = onlyLastMutates ? inputRoots.size() - 1 : 0;
             size_t snapshotRoots = cl("generate-treedb") ? 0 : mutatesTrees ? referenceRoots : inputRoots.size();
-            mainDb.processRoots(cl("new-dirdb"), cl("update-dirdb") || (cl("generate-treedb") && !cl("new-dirdb")),
+            mainDb.processRoots(cl("new-dirdb"), cl("update-dirdb") || cl("remove-files") || cl("remove-dirs")
+                || (cl("generate-treedb") && !cl("new-dirdb")),
                 snapshotRoots, mutatesTrees);
             if (gProgress)
             {
@@ -6686,6 +6858,17 @@ int main(int argc, char *argv[])
                 return 0;
             }
             if (mutatesTrees && !cl("dry-run")) mainDb.invalidateTreeSnapshots(referenceRoots);
+
+            if (cl("remove-files"))
+            {
+                std::cout << "remove-files:\n";
+                MainDb::printRemoveFilteredStats(mainDb.removeFilteredFiles(fileFilter, cl("dry-run")));
+            }
+            else if (cl("remove-dirs"))
+            {
+                std::cout << "remove-dirs:\n";
+                MainDb::printRemoveFilteredStats(mainDb.removeFilteredDirs(fileFilter, cl("dry-run")));
+            }
 
             if (cl("remove-dir-internal-copies"))
             {

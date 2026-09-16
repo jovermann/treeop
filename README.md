@@ -63,6 +63,27 @@ Generated and regenerated snapshots use ordinary file permissions (`0666` filter
 
 A `.treedb` is an explicit snapshot, not a live index: loading it does not check file freshness or discover changes made by other tools. Run `--generate-treedb` again after changes. Generation refreshes local `.dirdb` data, reusing cached hashes; existing network `.dirdb` files remain unchanged and supply their cached snapshot data. `--new-dirdb`/`--update-dirdb` bypass aggregate snapshots. Generation cannot be combined with filters, `--max-depth`, dry-run, or other operations. A corrupt aggregate snapshot produces an error rather than silently falling back to thousands of network reads.
 
+## Filtered removal
+
+Remove files selected by the standard name and size filters:
+
+```sh
+treeop --remove-files --only '*.tmp,*.bak' OLD_TREE
+treeop --remove-files --ionly '*.jpg' --min-size 10M --dry-run PHOTOS
+```
+
+Remove matching directories recursively:
+
+```sh
+treeop --remove-dirs --only 'cache-*' OLD_TREE
+```
+
+`--remove-files` and `--remove-dirs` are standalone operations and require an effective filter. Name patterns match basenames. File removal accepts `--min-size`, `--max-size`, `--only`, `--ionly`, `--exclude`, and `--iexclude`. Directory removal accepts only the four name filters; combining it with either size filter is an error. Command-line roots are always protected. If matching directories are nested, only the topmost one is processed and its entire subtree is removed. Use `--dry-run` to review every target first.
+
+`--only` and `--ionly` form one inclusion set: matching any inclusion pattern is sufficient. If neither is supplied, every basename starts included. `--exclude` and `--iexclude` are applied afterward and always win, even when the same basename matched an inclusion pattern. Size filters are ANDed with the final name-filter result.
+
+Local `.dirdb` files are refreshed before filtering, and directories touched by file removal are updated afterward. Aggregate `.treedb` snapshots on mutation targets are bypassed and invalidated. Existing `.dirdb` files on network drives remain read-only snapshots.
+
 ## Interactive file explorer
 
 Use `-X` or `--explore-interactive` with one or more directory roots.

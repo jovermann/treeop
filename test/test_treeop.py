@@ -537,6 +537,133 @@ def test_generate_treedb_requires_directory_roots(tmp_path: Path):
     assert run_treeop_result(["--generate-treedb"], root).returncode != 0
 
 
+@pytest.mark.parametrize("operation", ["--remove-files", "--remove-dirs"])
+def test_filtered_remove_requires_an_effective_filter(tmp_path: Path, operation: str):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "keep.txt", "safe")
+    argument_lists = [[operation, str(tree)], [operation, "--only", "", str(tree)]]
+    if operation == "--remove-files":
+        argument_lists += [[operation, "--min-size", "0", str(tree)],
+                           [operation, "--max-size", "0", str(tree)]]
+    for args in argument_lists:
+        result = run_treeop_result(args, root)
+        assert result.returncode != 0
+        assert "require at least one non-empty filter" in result.stdout + result.stderr
+    assert (tree / "keep.txt").read_text() == "safe"
+    assert not (tree / ".dirdb").exists()
+
+
+def test_help_documents_filter_precedence():
+    root = Path(__file__).resolve().parents[1]
+    result = run_treeop_result(["--help"], root)
+    assert result.returncode == 0
+    help_text = result.stdout + result.stderr
+    assert "--only and --ionly form one inclusion set" in help_text
+    assert "matching ANY exclusion pattern always excludes" in help_text
+    assert "even if it also" in help_text
+    assert "matches an inclusion pattern" in help_text
+    assert "Size filters are combined with the resulting name match using AND" in help_text
+
+
+@pytest.mark.parametrize("option", ["--min-size", "--max-size"])
+def test_remove_dirs_rejects_size_filters(tmp_path: Path, option: str):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    file = tree / "delete-me" / "file.txt"
+    write_file(file, "safe")
+    result = run_treeop_result(["--remove-dirs", "--only", "delete*", option, "10", str(tree)], root)
+    assert result.returncode != 0
+    assert "does not support --min-size or --max-size" in result.stdout + result.stderr
+    assert file.read_text() == "safe"
+    assert not (tree / ".dirdb").exists()
+
+
+def test_remove_files_filters_dry_run_and_updates_dirdbs(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "small.tmp", "x" * 5)
+    write_file(tree / "large.TMP", "x" * 20)
+    write_file(tree / "keep.tmp", "x" * 30)
+    write_file(tree / "nested" / "match.tmp", "x" * 15)
+    write_file(tree / "nested" / "keep.txt", "x" * 15)
+    dry = run_treeop(["--remove-files", "--ionly", "*.tmp", "--min-size", "10",
+                      "--exclude", "keep.*", "--dry-run", str(tree)], root)
+    assert "Would remove file" in dry
+    assert re.search(r"removed-files:\s+2", dry)
+    assert re.search(r"removed-dirs:\s+0", dry)
+    assert all(path.exists() for path in [tree / "large.TMP", tree / "nested" / "match.tmp"])
+
+    # Add this after the first database scan: removal must refresh and discover it.
+    write_file(tree / "late.tmp", "x" * 25)
+    run_treeop(["--generate-treedb", str(tree)], root)
+    write_file(tree / "after-snapshot.tmp", "x" * 25)
+    out = run_treeop(["--remove-files", "--ionly", "*.tmp", "--min-size", "10",
+                      "--exclude", "keep.*", str(tree)], root)
+    assert re.search(r"removed-files:\s+4", out)
+    assert (tree / "small.tmp").exists()
+    assert (tree / "keep.tmp").exists()
+    assert (tree / "nested" / "keep.txt").exists()
+    for name in ["large.TMP", "late.tmp", "after-snapshot.tmp"]:
+        assert not (tree / name).exists()
+    assert not (tree / "nested" / "match.tmp").exists()
+    assert not (tree / ".treedb").exists()
+    listed = run_treeop(["--list-files", str(tree)], root)
+    assert "large.TMP" not in listed and "match.tmp" not in listed
+    assert "small.tmp" in listed and "keep.tmp" in listed
+
+
+def test_remove_files_supports_explicit_file_arguments_with_filter(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    selected = tree / "selected.log"
+    other = tree / "other.log"
+    write_file(selected, "selected")
+    write_file(other, "other")
+    run_treeop(["--remove-files", "--only", "*.log", str(selected)], root)
+    assert not selected.exists()
+    assert other.exists()
+
+
+def test_remove_dirs_name_filters_and_suppresses_nested_matches(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "delete-parent" / "delete-child" / "large.bin", "x" * 30)
+    write_file(tree / "skip-small" / "small.bin", "x" * 5)
+    write_file(tree / "KEEP-UPPER" / "large.bin", "x" * 40)
+    write_file(tree / "keep" / "large.bin", "x" * 40)
+    dry = run_treeop(["--remove-dirs", "--ionly", "delete*",
+                      "--dry-run", str(tree)], root)
+    assert dry.count("Would remove directory recursively") == 1
+    assert "delete-parent" in dry and "delete-child" not in dry.split("Would remove directory recursively", 1)[1]
+    assert re.search(r"removed-dirs:\s+2", dry)
+    assert re.search(r"removed-files:\s+1", dry)
+
+    run_treeop(["--generate-treedb", str(tree)], root)
+    out = run_treeop(["--remove-dirs", "--ionly", "delete*", str(tree)], root)
+    assert re.search(r"removed-dirs:\s+2", out)
+    assert not (tree / "delete-parent").exists()
+    assert (tree / "skip-small").exists()
+    assert (tree / "KEEP-UPPER").exists()
+    assert (tree / "keep").exists()
+    assert not (tree / ".treedb").exists()
+    assert (tree / ".dirdb").exists()
+
+
+def test_remove_dirs_protects_roots_and_rejects_file_roots(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "delete-root"
+    file = tree / "file.txt"
+    write_file(file, "safe")
+    out = run_treeop(["--remove-dirs", "--only", "delete*", str(tree)], root)
+    assert re.search(r"removed-dirs:\s+0", out)
+    assert file.exists()
+    result = run_treeop_result(["--remove-dirs", "--only", "*.txt", str(file)], root)
+    assert result.returncode != 0
+    assert "requires directory arguments" in result.stdout + result.stderr
+    assert file.exists()
+
+
 def test_treedb_explorer_mutations_invalidate_snapshot(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     tree = tmp_path / "tree"
