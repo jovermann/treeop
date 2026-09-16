@@ -2058,6 +2058,18 @@ def test_stats_max_size_filter(tmp_path: Path):
     assert re.search(r"total-size:\s+2 bytes", out)
 
 
+def test_list_files_groups_size_digits_with_underscores(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    file = tree / "large.bin"
+    with file.open("wb") as stream:
+        stream.truncate(1_234_567)
+    out = run_treeop(["--list-files", str(tree)], root)
+    row = next(line for line in out.splitlines() if line.endswith("large.bin"))
+    assert row.split()[0] == "1_234_567"
+
+
 def test_list_files_only_and_exclude_filters_filename(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()

@@ -843,7 +843,7 @@ public:
             {
                 return a.path < b.path;
         });
-        printListRows(refs, clVerbose > 1, hashLen);
+        printListRows(refs, clVerbose > 1, hashLen, true);
         printExtensionStats(collectExtensionStats(refs));
     }
 
@@ -4112,9 +4112,10 @@ private:
     };
 
     /// Update width tracking for aligned file list columns.
-    static void updateListRowWidths(const FileEntry& ref, bool showInodeLinks, size_t hashLen, ListRowWidths& widths)
+    static void updateListRowWidths(const FileEntry& ref, bool showInodeLinks, size_t hashLen, ListRowWidths& widths,
+        bool groupSize = false)
     {
-        std::string sizeStr = ut1::toStr(ref.size);
+        std::string sizeStr = groupSize ? ut1::formatU64WithUnderscores(ref.size) : ut1::toStr(ref.size);
         std::string hex = ref.hash.toHex();
         std::string hashStr = hex.substr(0, std::min(hashLen, hex.size()));
         std::string inodeStr = ut1::toStr(ref.inode);
@@ -4132,11 +4133,12 @@ private:
     }
 
     /// Print rows for file listings with aligned columns using precomputed widths.
-    static void printListRowsWithWidths(const std::vector<FileEntry>& refs, bool showInodeLinks, size_t hashLen, const ListRowWidths& widths)
+    static void printListRowsWithWidths(const std::vector<FileEntry>& refs, bool showInodeLinks, size_t hashLen,
+        const ListRowWidths& widths, bool groupSize = false)
     {
         for (const auto& ref : refs)
         {
-            std::string sizeStr = ut1::toStr(ref.size);
+            std::string sizeStr = groupSize ? ut1::formatU64WithUnderscores(ref.size) : ut1::toStr(ref.size);
             std::string hex = ref.hash.toHex();
             std::string hashStr = hex.substr(0, std::min(hashLen, hex.size()));
             std::string inodeStr = ut1::toStr(ref.inode);
@@ -4159,14 +4161,15 @@ private:
     }
 
     /// Print rows for file listings with aligned columns.
-    static void printListRows(const std::vector<FileEntry>& refs, bool showInodeLinks, size_t hashLen)
+    static void printListRows(const std::vector<FileEntry>& refs, bool showInodeLinks, size_t hashLen,
+        bool groupSize = false)
     {
         ListRowWidths widths;
         for (const auto& ref : refs)
         {
-            updateListRowWidths(ref, showInodeLinks, hashLen, widths);
+            updateListRowWidths(ref, showInodeLinks, hashLen, widths, groupSize);
         }
-        printListRowsWithWidths(refs, showInodeLinks, hashLen, widths);
+        printListRowsWithWidths(refs, showInodeLinks, hashLen, widths, groupSize);
     }
 
     static std::string extensionLabelForPath(const std::string& path)
