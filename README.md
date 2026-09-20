@@ -80,7 +80,7 @@ treeop --remove-dirs --only 'cache-*' OLD_TREE
 
 `--remove-files` and `--remove-dirs` are standalone operations and require an effective filter. Name patterns match basenames. File removal accepts `--min-size`, `--max-size`, `--only`, `--ionly`, `--exclude`, and `--iexclude`. Directory removal accepts only the four name filters; combining it with either size filter is an error. Command-line roots are always protected. If matching directories are nested, only the topmost one is processed and its entire subtree is removed. Use `--dry-run` to review every target first.
 
-`--only` and `--ionly` form one inclusion set: matching any inclusion pattern is sufficient. If neither is supplied, every basename starts included. `--exclude` and `--iexclude` are applied afterward and always win, even when the same basename matched an inclusion pattern. Size filters are ANDed with the final name-filter result.
+`--only` and `--ionly` form one inclusion set: matching any inclusion pattern is sufficient. If neither is supplied, every basename starts included. `--exclude` and `--iexclude` are applied afterward and always win, even when the same basename matched an inclusion pattern. A directory whose basename matches an exclusion is pruned with its entire subtree before any `.dirdb` there is read, updated, or created; the same pruning is applied when loading a `.treedb`. Inclusion patterns do not prune directory traversal. Size filters are ANDed with the final name-filter result.
 
 Local `.dirdb` files are refreshed before filtering, and directories touched by file removal are updated afterward. Aggregate `.treedb` snapshots on mutation targets are bypassed and invalidated. Existing `.dirdb` files on network drives remain read-only snapshots.
 

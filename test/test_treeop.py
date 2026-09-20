@@ -563,7 +563,49 @@ def test_help_documents_filter_precedence():
     assert "matching ANY exclusion pattern always excludes" in help_text
     assert "even if it also" in help_text
     assert "matches an inclusion pattern" in help_text
-    assert "Size filters are combined with the resulting name match using AND" in help_text
+    assert "matching directory is pruned with its whole subtree" in help_text
+    assert ".dirdb there is read or created" in help_text
+    assert "Size filters are combined with the name match using AND" in help_text
+
+
+@pytest.mark.parametrize("option,pattern", [("--exclude", "Lib*"), ("--iexclude", "library")])
+def test_exclude_prunes_directory_before_dirdb_processing(tmp_path: Path, option: str, pattern: str):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "Library" / "top.txt", "excluded")
+    write_file(tree / "Library" / "nested" / "deep.txt", "excluded")
+    write_file(tree / "other" / "keep.txt", "included")
+    out = run_treeop(["-p", option, pattern, str(tree)], root)
+    assert (tree / ".dirdb").exists()
+    assert (tree / "other" / ".dirdb").exists()
+    assert not (tree / "Library" / ".dirdb").exists()
+    assert not (tree / "Library" / "nested" / ".dirdb").exists()
+    assert re.search(r"files:\s+1", out)
+
+
+def test_only_does_not_prune_directories_but_exclude_does_for_treedb(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    write_file(tree / "Library" / "inside.txt", "included by only")
+    write_file(tree / "other" / "outside.txt", "outside")
+    out = run_treeop(["--list-files", "--only", "*.txt", str(tree)], root)
+    assert "inside.txt" in out
+    assert (tree / "Library" / ".dirdb").exists()
+    run_treeop(["--generate-treedb", str(tree)], root)
+    (tree / "Library" / ".dirdb").write_bytes(b"must remain untouched")
+    out = run_treeop(["--list-files", "--exclude", "Library", str(tree)], root)
+    assert "inside.txt" not in out
+    assert "outside.txt" in out
+    assert (tree / "Library" / ".dirdb").read_bytes() == b"must remain untouched"
+
+
+def test_exclusion_does_not_prune_explicit_root_itself(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "Library"
+    write_file(tree / "file.txt", "explicit root")
+    out = run_treeop(["--list-files", "--exclude", "Library", str(tree)], root)
+    assert "file.txt" in out
+    assert (tree / ".dirdb").exists()
 
 
 @pytest.mark.parametrize("option", ["--min-size", "--max-size"])

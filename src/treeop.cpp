@@ -514,6 +514,13 @@ struct FileFilter
             && !matchesAny(iExcludePatterns, name, FNM_CASEFOLD);
     }
 
+    /// Exclusion patterns also prune matching directory subtrees before scan.
+    bool excludesName(const std::string& name) const
+    {
+        return matchesAny(excludePatterns, name, 0)
+            || matchesAny(iExcludePatterns, name, FNM_CASEFOLD);
+    }
+
 private:
     static bool matchesAny(const std::vector<std::string>& patterns, const std::string& filename, int flags)
     {
@@ -724,7 +731,8 @@ public:
     }
 
     /// Load or create .dirdb files for all roots and record elapsed time.
-    void processRoots(bool forceCreate, bool update, size_t snapshotRootLimit = 0, bool refreshSnapshotTargets = false)
+    void processRoots(bool forceCreate, bool update, size_t snapshotRootLimit = 0,
+        bool refreshSnapshotTargets = false, const FileFilter* traversalFilter = nullptr)
     {
         for (size_t rootIndex = 0; rootIndex < roots.size(); rootIndex++)
         {
@@ -739,11 +747,25 @@ public:
                 // hash-cache reuse, or automatic remote database updates.
                 auto snapshot = readTreeDb(rootData.path);
                 if (clVerbose) std::cout << "Loaded snapshot " << terminalPath(rootData.path / ".treedb") << "\n";
-                for (auto& dir : snapshot) addDir(std::move(dir));
+                for (auto& dir : snapshot)
+                {
+                    bool excluded = false;
+                    fs::path relative = dir.path.lexically_relative(rootData.path);
+                    for (const auto& component : relative)
+                    {
+                        if (component != "." && traversalFilter
+                            && traversalFilter->excludesName(component.string()))
+                        {
+                            excluded = true;
+                            break;
+                        }
+                    }
+                    if (!excluded) addDir(std::move(dir));
+                }
             }
             else if (rootData.recursive)
             {
-                processDirTree(rootData.path, forceCreate, updateRoot, &gInodeHashCache);
+                processDirTree(rootData.path, forceCreate, updateRoot, &gInodeHashCache, traversalFilter);
             }
             else
             {
@@ -4535,7 +4557,8 @@ private:
     }
 
     /// Walk a directory tree and load or create .dirdb files.
-    void processDirTree(const fs::path& root, bool forceCreate, bool update, InodeHashCache* inodeCache)
+    void processDirTree(const fs::path& root, bool forceCreate, bool update, InodeHashCache* inodeCache,
+        const FileFilter* traversalFilter)
     {
         std::vector<fs::path> staleDirs;
         bool rootStale = false;
@@ -4569,7 +4592,12 @@ private:
             }
             if (ut1::fsIsDirectory(it->path(), false))
             {
-                if (includeRecursiveDirectory(it))
+                if (traversalFilter && traversalFilter->excludesName(it->path().filename().string()))
+                {
+                    it.disable_recursion_pending();
+                    if (clVerbose > 1) std::cout << "Excluded directory subtree " << terminalPath(it->path()) << "\n";
+                }
+                else if (includeRecursiveDirectory(it))
                 {
                     bool staleUpdate = false;
                     for (const auto& staleDir : staleDirs)
@@ -6371,13 +6399,14 @@ int main(int argc, char *argv[])
                  "  --only and --ionly form one inclusion set: a basename matching ANY inclusion pattern is included.\n"
                  "  Without an inclusion pattern, every basename starts included. --exclude and --iexclude are then\n"
                  "  applied as overrides: matching ANY exclusion pattern always excludes the entry, even if it also\n"
-                 "  matches an inclusion pattern. Size filters are combined with the resulting name match using AND.\n");
+                 "  matches an inclusion pattern. A matching directory is pruned with its whole subtree before any\n"
+                 "  .dirdb there is read or created. Size filters are combined with the name match using AND.\n");
     cl.addOption(' ', "min-size", "Minimum file size for operations that support file filtering.", "N", "0");
     cl.addOption(' ', "max-size", "Maximum file size for operations that support file filtering.", "N", "0");
     cl.addOption(' ', "only", "Include basenames matching any comma-separated fnmatch pattern; --only/--ionly are ORed and exclusions override.", "PATTERNS", "");
     cl.addOption(' ', "ionly", "Case-insensitive inclusion patterns; ORed with --only, with exclusions taking precedence.", "PATTERNS", "");
-    cl.addOption(' ', "exclude", "Exclude basenames matching any comma-separated fnmatch pattern; exclusion always overrides inclusion.", "PATTERNS", "");
-    cl.addOption(' ', "iexclude", "Case-insensitive exclusion patterns; any match overrides --only/--ionly.", "PATTERNS", "");
+    cl.addOption(' ', "exclude", "Exclude matching basenames; directory matches prune the entire subtree before .dirdb processing.", "PATTERNS", "");
+    cl.addOption(' ', "iexclude", "Case-insensitive exclusions; override inclusion and prune matching directory subtrees.", "PATTERNS", "");
 
     cl.addHeader("\nDatabase and tree maintenance:\n");
     cl.addOption(' ', "new-dirdb", "Force creation of new .dirdb files (overwrite existing).");
@@ -6850,7 +6879,7 @@ int main(int argc, char *argv[])
             size_t snapshotRoots = cl("generate-treedb") ? 0 : mutatesTrees ? referenceRoots : inputRoots.size();
             mainDb.processRoots(cl("new-dirdb"), cl("update-dirdb") || cl("remove-files") || cl("remove-dirs")
                 || (cl("generate-treedb") && !cl("new-dirdb")),
-                snapshotRoots, mutatesTrees);
+                snapshotRoots, mutatesTrees, &fileFilter);
             if (gProgress)
             {
                 gProgress->finish();
