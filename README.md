@@ -15,6 +15,7 @@ Operations on huge directory trees.
 - Extract unique files of a root of an intersection into a new destination
 - Fast operation by caching directory contents and hashes in .dirdb files
 - Aggregate `.treedb` snapshots for fast loading of large trees on slow/network drives
+- Per-root day, month, or year histograms for comparing the age of backup contents
 - Interactive file-explorer mode with directory sizes, recoverable removal, persistent undo, and trash browsing
 
 ## Examples
@@ -62,6 +63,18 @@ Snapshots contain all regular files, including hidden files, and preserve empty 
 Generated and regenerated snapshots use ordinary file permissions (`0666` filtered by your umask, typically `0644`). Regeneration corrects older owner-only snapshots and reapplies this policy rather than preserving manually changed permissions.
 
 A `.treedb` is an explicit snapshot, not a live index: loading it does not check file freshness or discover changes made by other tools. Run `--generate-treedb` again after changes. Generation refreshes local `.dirdb` data, reusing cached hashes; existing network `.dirdb` files remain unchanged and supply their cached snapshot data. `--new-dirdb`/`--update-dirdb` bypass aggregate snapshots. Generation cannot be combined with filters, `--max-depth`, dry-run, or other operations. A corrupt aggregate snapshot produces an error rather than silently falling back to thousands of network reads.
+
+## Date histograms
+
+Compare the ages and active periods of backup trees with day (`d`), month (`m`), or year (`y`) buckets:
+
+```sh
+treeop --date-histogram=y OLD_BACKUP NEW_BACKUP
+```
+
+Each root gets a separate chronological histogram with one line per populated interval, including the file count, total size, and a scaled bar. The exact oldest and newest matching file are printed before it, with their UTC modification timestamps, sizes, and paths. This makes the roots directly comparable even when their histograms have very different ranges.
+
+The dates are stored file modification times, not directory-creation times. `.dirdb` and `.treedb` metadata are excluded, so their recently updated timestamps cannot distort the result. Standard file filters such as `--only`, `--exclude`, `--min-size`, and `--max-size` are honored. Existing `.treedb` snapshots are used automatically for fast reads, subject to their normal snapshot semantics.
 
 ## Filtered removal
 
@@ -166,6 +179,9 @@ Options:
      --hashrate            Hash memory for 2 seconds to measure CPU hashing performance without filesystem IO.
      --size-histogram=N    Print size histogram for all files in all dirs where N in the batch size in
                            bytes. (default=0)
+     --date-histogram=INTERVAL
+                           Print per-root UTC file-date histogram and oldest/newest files; INTERVAL is d,
+                           m, or y.
      --top=N               Maximum number of results to print (with --find-overlapping-dirs or
                            --find-redundant-dirs). (default=0)
      --max-depth=N         Maximum directory recursion depth; command-line roots are at depth 0.

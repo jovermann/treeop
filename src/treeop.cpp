@@ -1171,6 +1171,99 @@ public:
         }
     }
 
+    /// Print one chronological histogram per command-line root. File dates are
+    /// stored as UTC FILETIME values in DirDB, so calendar buckets are UTC too.
+    void printDateHistogram(char interval, const FileFilter& filter) const
+    {
+        struct Bucket { uint64_t files{}, bytes{}; };
+        struct Extreme { uint64_t date{}; uint64_t size{}; fs::path path; bool valid{}; };
+        auto intervalName = [interval]() -> const char*
+        {
+            if (interval == 'd') return "day";
+            if (interval == 'm') return "month";
+            return "year";
+        };
+        for (size_t rootIndex = 0; rootIndex < roots.size(); rootIndex++)
+        {
+            const auto& root = roots[rootIndex];
+            std::map<std::string, Bucket> buckets;
+            Extreme oldest, newest;
+            uint64_t invalidDates = 0;
+            for (const auto& dir : dirs)
+            {
+                if (!isPathWithinPath(root.path, dir.path)) continue;
+                for (const auto& file : dir.files)
+                {
+                    if (!filter.matches(file, dir.path)) continue;
+                    fs::path fullPath = dir.path / file.path;
+                    uint64_t seconds = file.date / 10000000ULL;
+                    if (file.date == 0 || seconds < kWindowsToUnixEpoch)
+                    {
+                        invalidDates++;
+                        continue;
+                    }
+                    time_t unixSeconds = static_cast<time_t>(seconds - kWindowsToUnixEpoch);
+                    std::tm tm{};
+#ifdef _WIN32
+                    if (gmtime_s(&tm, &unixSeconds) != 0) { invalidDates++; continue; }
+#else
+                    if (!gmtime_r(&unixSeconds, &tm)) { invalidDates++; continue; }
+#endif
+                    char label[11]{};
+                    const char* format = interval == 'd' ? "%Y-%m-%d" : interval == 'm' ? "%Y-%m" : "%Y";
+                    if (std::strftime(label, sizeof(label), format, &tm) == 0)
+                    {
+                        invalidDates++;
+                        continue;
+                    }
+                    Bucket& bucket = buckets[label];
+                    bucket.files++;
+                    bucket.bytes += file.size;
+                    if (!oldest.valid || file.date < oldest.date
+                        || (file.date == oldest.date && fullPath < oldest.path))
+                        oldest = Extreme{file.date, file.size, fullPath, true};
+                    if (!newest.valid || file.date > newest.date
+                        || (file.date == newest.date && fullPath < newest.path))
+                        newest = Extreme{file.date, file.size, fullPath, true};
+                }
+            }
+
+            std::cout << terminalPath(root.path) << ":\n";
+            auto printExtreme = [](const char* name, const Extreme& extreme)
+            {
+                std::cout << name << ": ";
+                if (!extreme.valid) std::cout << "(none)\n";
+                else std::cout << formatFileTime(extreme.date) << "  "
+                               << ut1::formatU64WithUnderscores(extreme.size) << " bytes  "
+                               << terminalPath(extreme.path) << "\n";
+            };
+            printExtreme("oldest-file", oldest);
+            printExtreme("newest-file", newest);
+            std::cout << "date-histogram: " << intervalName() << " (UTC)\n";
+            if (buckets.empty()) std::cout << "  (no files with valid dates)\n";
+            else
+            {
+                uint64_t maxFiles = 0;
+                size_t countWidth = 0;
+                for (const auto& [label, bucket] : buckets)
+                {
+                    maxFiles = std::max(maxFiles, bucket.files);
+                    countWidth = std::max(countWidth, ut1::formatU64WithUnderscores(bucket.files).size());
+                }
+                for (const auto& [label, bucket] : buckets)
+                {
+                    size_t barLength = maxFiles ? std::max<size_t>(1, static_cast<size_t>((bucket.files * 40 + maxFiles - 1) / maxFiles)) : 0;
+                    std::cout << "  " << std::left << std::setw(10) << label << std::right
+                              << "  " << std::setw(static_cast<int>(countWidth)) << ut1::formatU64WithUnderscores(bucket.files)
+                              << " files  " << std::setw(12) << ut1::getApproxSizeStr(bucket.bytes, 2, true, false)
+                              << "  " << std::string(barLength, '#') << "\n";
+                }
+            }
+            if (invalidDates) std::cout << "files-without-valid-date: " << ut1::formatU64WithUnderscores(invalidDates) << "\n";
+            if (rootIndex + 1 < roots.size()) printBlockSeparator();
+        }
+    }
+
     /// Print intersect stats and optional file lists/extractions.
     void printIntersectStats(const std::vector<InputRoot>& rootPaths, bool listFirst, bool listLast, bool listBoth,
         const fs::path* extractFirst, const fs::path* extractLast, bool removeCopies, bool removeCopiesFromLast, bool dryRun, const FileFilter& filter) const
@@ -6362,6 +6455,7 @@ int main(int argc, char *argv[])
     cl.addOption(' ', "find-redundant-dirs", "Find and rank dirs by bytes whose content appears elsewhere.");
     cl.addOption('s', "stats", "Print statistics about each dir (number of files and total size etc).");
     cl.addOption(' ', "size-histogram", "Print size histogram for all files in all dirs where N in the batch size in bytes.", "N", "0");
+    cl.addOption(' ', "date-histogram", "Print per-root UTC file-date histogram and oldest/newest files; INTERVAL is d, m, or y.", "INTERVAL", "");
 
     cl.addHeader("\nListing operations:\n");
     cl.addOption('l', "list-files", "List all files with stored meta-data.");
@@ -6439,6 +6533,7 @@ int main(int argc, char *argv[])
     cl.parse(argc, argv);
     uint64_t maxHardlinks = 0;
     uint64_t sizeHistogram = 0;
+    char dateHistogramInterval = 0;
     uint64_t top = 0;
     unsigned progressCount = 0;
     uint64_t progressWidth = 0;
@@ -6456,6 +6551,13 @@ int main(int argc, char *argv[])
         fileFilter.iExcludePatterns = parsePatterns(cl, "iexclude");
         maxHardlinks = parseSizeOption(cl, "max-hardlinks");
         sizeHistogram = parseSizeOption(cl, "size-histogram");
+        if (cl("date-histogram"))
+        {
+            std::string interval = cl.getStr("date-histogram");
+            if (interval.size() != 1 || (interval[0] != 'd' && interval[0] != 'm' && interval[0] != 'y'))
+                cl.error("--date-histogram interval must be exactly d, m, or y.");
+            dateHistogramInterval = interval[0];
+        }
         top = cl.getUInt("top");
         if (cl("max-depth"))
         {
@@ -6488,7 +6590,7 @@ int main(int argc, char *argv[])
     }
 
     // Implicit options.
-    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("remove-files") || cl("remove-dirs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("explore-interactive") || cl("generate-treedb") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
+    if (!(cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("date-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs") || cl("remove-files") || cl("remove-dirs") || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("hardlink-copies") || cl("break-hardlinks") || cl("explore-interactive") || cl("generate-treedb") || cl("readbench") || cl("hashrate") || cl("get-unique-hash-len")))
     {
         cl.setOption("stats");
     }
@@ -6498,7 +6600,7 @@ int main(int argc, char *argv[])
         if (cl("generate-treedb"))
         {
             for (const char* operation : {"stats", "list-files", "list-redundant", "list-hardlinks", "list-dirs",
-                "size-histogram", "remove-dirdb", "remove-corrupt-dirdbs", "remove-files", "remove-dirs", "intersect", "containment",
+                "size-histogram", "date-histogram", "remove-dirdb", "remove-corrupt-dirdbs", "remove-files", "remove-dirs", "intersect", "containment",
                 "show-contained-files", "show-not-contained-files", "show-not-contained", "remove-contained-dirs",
                 "remove-contained-files", "find-overlapping-dirs", "find-redundant-dirs", "list-first", "list-last",
                 "list-both", "extract-first", "extract-last", "remove-copies", "remove-copies-from-last",
@@ -6518,7 +6620,7 @@ int main(int argc, char *argv[])
             bool hasFilter = hasNameFilter || (cl("remove-files") && (fileFilter.minSize != 0 || fileFilter.maxSize != 0));
             if (!hasFilter) cl.error("--remove-files/--remove-dirs require at least one non-empty filter option.");
             for (const char* operation : {"stats", "list-files", "list-redundant", "list-hardlinks", "list-dirs",
-                "size-histogram", "remove-dirdb", "remove-corrupt-dirdbs", "intersect", "containment",
+                "size-histogram", "date-histogram", "remove-dirdb", "remove-corrupt-dirdbs", "intersect", "containment",
                 "show-contained-files", "show-not-contained-files", "show-not-contained", "remove-contained-dirs",
                 "remove-contained-files", "find-overlapping-dirs", "find-redundant-dirs", "list-first", "list-last",
                 "list-both", "extract-first", "extract-last", "remove-copies", "remove-copies-from-last",
@@ -6533,7 +6635,7 @@ int main(int argc, char *argv[])
         }
         if (cl("hashrate"))
         {
-            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("date-histogram") || cl("remove-dirdb")
                 || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
                 || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("readbench");
@@ -6563,7 +6665,7 @@ int main(int argc, char *argv[])
         if (cl("remove-dirs-that-contain-file"))
         {
             bool otherMode = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs")
-                || cl("size-histogram") || cl("remove-dirdb") || cl("remove-empty-dirs") || cl("intersect") || cl("containment")
+                || cl("size-histogram") || cl("date-histogram") || cl("remove-dirdb") || cl("remove-empty-dirs") || cl("intersect") || cl("containment")
                 || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs")
                 || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first")
                 || cl("list-last") || cl("list-both") || cl("extract-first") || cl("extract-last") || cl("remove-copies")
@@ -6674,7 +6776,7 @@ int main(int argc, char *argv[])
         if (cl("explore-interactive"))
         {
             bool otherMode = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks")
-                || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs")
+                || cl("list-dirs") || cl("size-histogram") || cl("date-histogram") || cl("remove-dirdb") || cl("remove-corrupt-dirdbs")
                 || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file") || cl("intersect") || cl("containment")
                 || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained")
                 || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs")
@@ -6706,7 +6808,7 @@ int main(int argc, char *argv[])
         if (cl("remove-corrupt-dirdbs"))
         {
             bool otherMode = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs")
-                || cl("size-histogram") || cl("remove-dirdb") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file")
+                || cl("size-histogram") || cl("date-histogram") || cl("remove-dirdb") || cl("remove-empty-dirs") || cl("remove-dirs-that-contain-file")
                 || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files")
                 || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files")
                 || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("list-first") || cl("list-last")
@@ -6773,7 +6875,7 @@ int main(int argc, char *argv[])
         }
         if (cl("find-overlapping-dirs"))
         {
-            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("date-histogram") || cl("remove-dirdb")
                 || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained")
                 || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies-from-last") || cl("hardlink-copies") || cl("break-hardlinks")
@@ -6785,7 +6887,7 @@ int main(int argc, char *argv[])
         }
         if (cl("find-redundant-dirs"))
         {
-            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+            bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("date-histogram") || cl("remove-dirdb")
                 || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained")
                 || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies")
@@ -6839,7 +6941,7 @@ int main(int argc, char *argv[])
         {
             if (cl("readbench"))
             {
-                bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("remove-dirdb")
+                bool otherOps = cl("stats") || cl("list-files") || cl("list-redundant") || cl("list-hardlinks") || cl("list-dirs") || cl("size-histogram") || cl("date-histogram") || cl("remove-dirdb")
                     || cl("intersect") || cl("containment") || cl("show-contained-files") || cl("show-not-contained-files") || cl("show-not-contained") || cl("remove-contained-dirs") || cl("remove-contained-files") || cl("find-overlapping-dirs") || cl("find-redundant-dirs") || cl("update-dirdb") || cl("list-first") || cl("list-last") || cl("list-both")
                 || cl("extract-first") || cl("extract-last") || cl("remove-copies") || cl("remove-copies-from-last") || cl("remove-dir-internal-copies") || cl("hardlink-copies") || cl("break-hardlinks")
                     || cl("get-unique-hash-len") || cl("new-dirdb") || cl("remove-empty-dirs") || cl("hashrate");
@@ -6991,6 +7093,10 @@ int main(int argc, char *argv[])
                 if (cl("size-histogram"))
                 {
                     mainDb.printSizeHistogram(sizeHistogram, fileFilter);
+                }
+                if (cl("date-histogram"))
+                {
+                    mainDb.printDateHistogram(dateHistogramInterval, fileFilter);
                 }
 
                 if (cl("list-files"))

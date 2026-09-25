@@ -10,6 +10,7 @@ import stat
 import termios
 import time
 import unicodedata
+from datetime import datetime
 from pathlib import Path
 import pytest
 
@@ -2457,6 +2458,81 @@ def test_invalid_size_histogram_fails_before_processing_dirs(tmp_path: Path):
     assert result.returncode != 0
     assert "--size-histogram must be greater than 0." in result.stdout
     assert not (dir_a / ".dirdb").exists()
+
+
+@pytest.mark.parametrize("interval, heading, expected_bins", [
+    ("d", "day", [("2019-12-31", 1), ("2020-01-15", 1), ("2020-01-20", 1), ("2021-02-01", 1)]),
+    ("m", "month", [("2019-12", 1), ("2020-01", 2), ("2021-02", 1)]),
+    ("y", "year", [("2019", 1), ("2020", 2), ("2021", 1)]),
+])
+def test_date_histogram_intervals_and_extremes(tmp_path: Path, interval: str, heading: str, expected_bins):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "backup"
+    dated = [
+        ("oldest.txt", "2019-12-31T23:00:00+00:00", 5),
+        ("january-a.txt", "2020-01-15T12:00:00+00:00", 10),
+        ("january-b.txt", "2020-01-20T12:00:00+00:00", 15),
+        ("newest.txt", "2021-02-01T01:02:03+00:00", 20),
+    ]
+    for name, timestamp, size in dated:
+        path = tree / name
+        write_file(path, "x" * size)
+        seconds = datetime.fromisoformat(timestamp).timestamp()
+        os.utime(path, (seconds, seconds))
+    run_treeop(["--stats", str(tree)], root)
+    metadata_seconds = datetime.fromisoformat("2035-06-07T08:09:10+00:00").timestamp()
+    os.utime(tree / ".dirdb", (metadata_seconds, metadata_seconds))
+    out = run_treeop(["--date-histogram", interval, str(tree)], root)
+    assert f"date-histogram: {heading} (UTC)" in out
+    assert re.search(rf"oldest-file: 2019-12-31 23:00:00\s+5 bytes\s+{re.escape(str(tree / 'oldest.txt'))}", out)
+    assert re.search(rf"newest-file: 2021-02-01 01:02:03\s+20 bytes\s+{re.escape(str(tree / 'newest.txt'))}", out)
+    for label, count in expected_bins:
+        assert re.search(rf"^\s*{re.escape(label)}\s+{count} files\s+", out, re.MULTILINE)
+    histogram = out.split(f"date-histogram: {heading} (UTC)\n", 1)[1]
+    assert "2035" not in histogram  # .dirdb's mtime is not included.
+    assert "#" in histogram
+
+
+def test_date_histogram_compares_roots_and_honors_filters_and_treedb(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    older, newer = tmp_path / "older", tmp_path / "newer"
+    old_file = older / "photo.jpg"
+    excluded = older / "ignore.txt"
+    new_file = newer / "photo.jpg"
+    for path, date in [(old_file, "2010-03-04T05:06:07+00:00"),
+                       (excluded, "2030-01-01T00:00:00+00:00"),
+                       (new_file, "2020-03-04T05:06:07+00:00")]:
+        write_file(path, path.name)
+        seconds = datetime.fromisoformat(date).timestamp()
+        os.utime(path, (seconds, seconds))
+    run_treeop(["--generate-treedb", str(older), str(newer)], root)
+    out = run_treeop(["--date-histogram", "y", "--only", "*.jpg", str(older), str(newer)], root)
+    sections = out.split("----------------------------------------")
+    assert str(older) in sections[0] and "2010-03-04 05:06:07" in sections[0]
+    assert "2030" not in sections[0]
+    assert str(newer) in sections[1] and "2020-03-04 05:06:07" in sections[1]
+    assert "2010" not in sections[1]
+
+
+@pytest.mark.parametrize("interval", ["D", "week", "", "dm"])
+def test_invalid_date_histogram_interval_fails_before_processing(tmp_path: Path, interval: str):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "backup"
+    write_file(tree / "file.txt", "safe")
+    result = run_treeop_result(["--date-histogram", interval, str(tree)], root)
+    assert result.returncode != 0
+    assert "interval must be exactly d, m, or y" in result.stdout + result.stderr
+    assert not (tree / ".dirdb").exists()
+
+
+def test_date_histogram_empty_tree(tmp_path: Path):
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "empty"
+    tree.mkdir()
+    out = run_treeop(["--date-histogram", "m", str(tree)], root)
+    assert "oldest-file: (none)" in out
+    assert "newest-file: (none)" in out
+    assert "(no files with valid dates)" in out
 
 
 def test_bufsize_readbench(tmp_path: Path):
