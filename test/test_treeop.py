@@ -2925,6 +2925,26 @@ def test_update_dirdb(tmp_path: Path):
     assert second_hash != first_hash
 
 
+def test_zero_permission_empty_file_uses_empty_hash(tmp_path: Path):
+    if os.geteuid() == 0:
+        pytest.skip("Root bypasses file read permissions")
+
+    root = Path(__file__).resolve().parents[1]
+    tree = tmp_path / "tree"
+    tree.mkdir()
+    readable = tree / "readable-empty"
+    unreadable = tree / "unreadable-empty"
+    readable.touch()
+    unreadable.touch()
+    unreadable.chmod(0)
+    try:
+        out = run_treeop(["--list-files", str(tree)], root)
+    finally:
+        unreadable.chmod(0o600)
+
+    assert extract_hash(out, "unreadable-empty") == extract_hash(out, "readable-empty")
+
+
 def test_new_dirdb(tmp_path: Path):
     root = Path(__file__).resolve().parents[1]
     bin_path = treeop_bin()

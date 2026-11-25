@@ -5345,27 +5345,34 @@ static uint64_t fileTimeFromTimespec(const timespec& ts)
 static Hash128 hashFile128(const fs::path& path, uint64_t fileSize, double* secondsOut)
 {
     HashSha3_128 hasher;
-    std::ifstream is(path, std::ios::binary);
-    if (!is)
+    std::ifstream is;
+    if (fileSize != 0)
     {
-        throw std::runtime_error("Error while opening file for hashing: " + path.string());
+        is.open(path, std::ios::binary);
+        if (!is)
+        {
+            throw std::runtime_error("Error while opening file for hashing: " + path.string());
+        }
     }
     if (gProgress)
     {
         gProgress->onHashStart(path, fileSize);
     }
-    std::vector<uint8_t> buffer(gBufSize);
     double start = ut1::getTimeSec();
-    while (is)
+    if (fileSize != 0)
     {
-        is.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
-        std::streamsize count = is.gcount();
-        if (count > 0)
+        std::vector<uint8_t> buffer(gBufSize);
+        while (is)
         {
-            hasher.update(buffer.data(), static_cast<size_t>(count));
-            if (gProgress)
+            is.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(buffer.size()));
+            std::streamsize count = is.gcount();
+            if (count > 0)
             {
-                gProgress->onHashProgress(static_cast<uint64_t>(count));
+                hasher.update(buffer.data(), static_cast<size_t>(count));
+                if (gProgress)
+                {
+                    gProgress->onHashProgress(static_cast<uint64_t>(count));
+                }
             }
         }
     }
